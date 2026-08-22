@@ -19,9 +19,18 @@ const PORT = Number(process.env.DAGMATE_SERVICE_PORT || 8910);
 const HOST = process.env.DAGMATE_SERVICE_HOST || '127.0.0.1';
 // Dev-only convenience routes (throwaway keypair generation, so the site can
 // be clicked through without a real Kasware/Kastle extension installed).
-// On by default for local testing; set DAGMATE_DEV_ROUTES=0 in any real
-// deployment — these routes have no place on a production sidecar.
-const DEV_ROUTES = process.env.DAGMATE_DEV_ROUTES !== '0';
+//
+// OFF unless explicitly switched on. Opt-in rather than opt-out because the
+// failure modes are asymmetric: forgetting to set this on costs a developer
+// two minutes, forgetting to set it OFF puts key-minting on a public host.
+// A deployment that silently inherits a dev default is the whole problem.
+//
+// And never on mainnet, whatever the env says. A "demo wallet" there is a
+// throwaway key holding real money, handed to someone who has been told it's
+// for testing — there is no legitimate reason to want that, so an env var
+// isn't allowed to ask for it.
+const NETWORK = process.env.DAGMATE_NETWORK_ID || 'mainnet';
+const DEV_ROUTES = process.env.DAGMATE_DEV_ROUTES === '1' && !NETWORK.startsWith('mainnet');
 
 const app = express();
 app.use(express.json());
@@ -59,7 +68,9 @@ app.get('/escrow/daa', wrap(() => escrow.daaScore()));
 // from "the sidecar is broken".
 app.post('/auth/verify-message', wrap((req) => auth.verifyOwnership(req.body)));
 
-app.get('/health', (req, res) => res.json({ ok: true, network: process.env.DAGMATE_NETWORK_ID || 'mainnet' }));
+// `devRoutes` is reported so the backend (and through it the UI) can derive
+// what's available instead of keeping its own guess in sync with this one.
+app.get('/health', (req, res) => res.json({ ok: true, network: NETWORK, devRoutes: DEV_ROUTES }));
 
 if (DEV_ROUTES) {
   // Throwaway keypair — NEVER a substitute for real wallet-connect signing,
@@ -81,5 +92,6 @@ if (DEV_ROUTES) {
 }
 
 app.listen(PORT, HOST, () => {
-  console.log(`DAGmate service listening on http://${HOST}:${PORT}`);
+  console.log(`DAGmate service listening on http://${HOST}:${PORT} (${NETWORK})`);
+  if (DEV_ROUTES) console.warn('⚠️  DEV ROUTES ENABLED — /dev/* is live. Never do this on a public host.');
 });

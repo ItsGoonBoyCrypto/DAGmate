@@ -118,8 +118,18 @@ KNS_API_URL = os.getenv("DAGMATE_KNS_API_URL", "https://api.knsdomains.org/mainn
 KNS_TIMEOUT = float(os.getenv("DAGMATE_KNS_TIMEOUT", "6"))
 KNS_CACHE_TTL = int(os.getenv("DAGMATE_KNS_CACHE_TTL", "21600"))  # 6h
 
-# Local dev/testing convenience ONLY (see frontend "demo wallet" fallback) —
-# never used in the real wallet-connect signing path. Off by default; the
-# site backend itself doesn't gate on this (the demo-wallet route is always
-# available), but it's flagged here so it's easy to find and rip out.
-DEMO_WALLET_ENABLED = os.getenv("DAGMATE_DEMO_WALLET", "1") == "1"
+# ── dev routes ──────────────────────────────────────────────────────────
+# ONE switch for every testing affordance on this process: the demo wallet,
+# its message-signing helper, and `dev-mark-funded` (which flips a match to
+# live without anybody paying — i.e. it prints a pot).
+#
+# OFF unless explicitly switched on, and deliberately opt-in rather than
+# opt-out: forgetting to turn it on costs a developer two minutes, forgetting
+# to turn it off hands a public site a free-money button. Anything that reads
+# "convenient by default" here is a deployment waiting to inherit it.
+#
+# Also hard-off on mainnet regardless of the env var, mirroring the same guard
+# in service/server.js. A "demo wallet" on mainnet is a throwaway key holding
+# real funds, handed to someone told it's for testing.
+NETWORK_ID = os.getenv("DAGMATE_NETWORK_ID", "mainnet")
+DEV_ROUTES = os.getenv("DAGMATE_DEV_ROUTES") == "1" and not NETWORK_ID.startswith("mainnet")

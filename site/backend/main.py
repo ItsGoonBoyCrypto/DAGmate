@@ -15,10 +15,11 @@ supported way to name a different player.
 Known, deliberate gaps in this pass (see docs/DAGMATE_SPEC.md and the
 project memory for the full picture) — flagged here rather than silently
 faked:
-  - `/api/matches/{id}/dev-mark-funded` still exists and skips the on-chain
-    deposit check entirely. Real deposits are now watched (deposits.py), so
-    this route is only for clicking through locally without a reachable Kaspa
-    node — it MUST be off before any public deployment.
+  - `/api/matches/{id}/dev-mark-funded` skips the on-chain deposit check
+    entirely — it conjures a pot. It now 404s unless DAGMATE_DEV_ROUTES=1,
+    which is off by default and refused outright on mainnet, but the route
+    still exists in the file. Don't "tidy" it into something gated on being a
+    player in the match; making it look safe is how it survives to production.
   - Settlement is wired (settlement.py) but its signature round-trip has never
     run against a real wallet extension — `signPskt()` needs Kasware/Kastle,
     which a headless preview doesn't have. The orchestration is unit-tested;
@@ -66,6 +67,9 @@ async def _startup():
         asyncio.create_task(deposits.watch_loop())
     else:
         log.warning("deposit watcher DISABLED — matches will never go live on their own")
+    if config.DEV_ROUTES:
+        log.warning("⚠️  DEV ROUTES ENABLED (%s) — /api/dev/* and dev-mark-funded are live. "
+                    "dev-mark-funded starts a match nobody paid for.", config.NETWORK_ID)
     asyncio.create_task(clocks.watch_loop())
 
 
@@ -83,6 +87,16 @@ def _account_public(a: dict) -> dict:
         # there, and a pubkey is one lookup away from a balance.
         "hasPubkey": bool(a["pubkey"]),
     }
+
+
+def _require_dev_routes() -> None:
+    """Gate for every testing affordance on this process (config.DEV_ROUTES).
+
+    404 rather than 403 on purpose: a disabled dev route should be
+    indistinguishable from a route that was never built, so probing a
+    deployment tells an attacker nothing about what's switched off."""
+    if not config.DEV_ROUTES:
+        raise HTTPException(404, "not found")
 
 
 # ── who's calling ───────────────────────────────────────────────────────
@@ -345,11 +359,20 @@ def get_match(match_id: str):
 
 @app.post("/api/matches/{match_id}/dev-mark-funded")
 def dev_mark_funded(match_id: str):
-    """Dev/testing convenience only — see module docstring. Flips a match
-    from awaiting_deposit to live without any real on-chain check. Goes
-    through the same guarded transition as the deposit watcher so the clock
-    still starts: a live match with no running clock is precisely the
+    """Flips a match from awaiting_deposit to live with no on-chain check —
+    i.e. it conjures a pot out of nothing. The single most dangerous route in
+    the project, and it exists only so the site can be clicked through without
+    a funded node.
+
+    ⚠️ It takes no account and never should get one: gating it on "are you a
+    player in this match" would make it look safe enough to leave on. It is
+    only ever acceptable when DEV_ROUTES is on, which is off by default and
+    impossible on mainnet.
+
+    Goes through the same guarded transition as the deposit watcher so the
+    clock still starts — a live match with no running clock is precisely the
     abandonment hole clocks exist to close."""
+    _require_dev_routes()
     m = db.get_match(match_id)
     if not m:
         raise HTTPException(404, "match not found")
@@ -625,8 +648,7 @@ def practice_bot_move(body: PracticeBotBody):
 # path nobody has tested, and this is the one that guards the pot.
 @app.post("/api/dev/demo-wallet")
 async def demo_wallet():
-    if not config.DEMO_WALLET_ENABLED:
-        raise HTTPException(404, "demo wallet disabled")
+    _require_dev_routes()
     try:
         kp = await service_client.generate_demo_keypair()
     except ServiceError as e:
@@ -643,9 +665,8 @@ class DemoSignBody(BaseModel):
 async def demo_sign(body: DemoSignBody):
     """Sign a login challenge with a demo-wallet key. Harmless by
     construction — it can only sign with a key the caller already holds — but
-    it still disappears with DAGMATE_DEMO_WALLET=0."""
-    if not config.DEMO_WALLET_ENABLED:
-        raise HTTPException(404, "demo wallet disabled")
+    it still disappears with the rest of the dev surface."""
+    _require_dev_routes()
     try:
         sig = await service_client.demo_sign_message(
             private_key_hex=body.privateKeyHex, message=body.message)
@@ -669,6 +690,11 @@ def meta():
         },
         "gasOnlyKas": config.GAS_ONLY_STAKE_SOMPI / config.SOMPI_PER_KAS,
         "reclaimDays": config.RECLAIM_DAA_WINDOW // (24 * 3600 * 10),
+        # Same reasoning as the fee copy: the UI asks what's available rather
+        # than keeping its own guess about it. The demo-wallet fallback and the
+        # "mark funded" button vanish on their own in a real deployment.
+        "devRoutes": config.DEV_ROUTES,
+        "network": config.NETWORK_ID,
     }
 
 

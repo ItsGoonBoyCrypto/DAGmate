@@ -202,7 +202,33 @@ POST /escrow/settle-broadcast  { matchId, txJson, sigWinner, sigArbiter }
 POST /escrow/anchor  { matchId, payloadHex, feeSompi }
      → { txid }
 GET  /escrow/daa      → { daaScore }
+POST /auth/verify-message  { address, pubkey, message, signature }
+     → { ok, reason }                     // always 200; a rejected login is a
+                                          // normal outcome, not an error
 ```
+
+### 3.1 Dev routes — opt-in, and refused on mainnet
+
+`DAGMATE_DEV_ROUTES=1` adds `/dev/demo-keypair` and `/dev/sign-message` here,
+and `/api/dev/*` plus `/api/matches/{id}/dev-mark-funded` on the backend. That
+last one flips a match to live with no on-chain check — it conjures a pot.
+
+Two rules, both deliberate:
+
+- **Opt-in, never opt-out.** Forgetting to switch it on costs a developer two
+  minutes; forgetting to switch it off puts a free-money button on a public
+  host. Anything that reads "convenient by default" gets inherited by a
+  deployment.
+- **Ignored on mainnet whatever the env says.** A demo wallet on mainnet is a
+  throwaway key holding real money handed to someone who was told it's for
+  testing. There's no legitimate reason to want it, so an env var isn't
+  allowed to ask.
+
+Disabled routes return **404, not 403** — probing a deployment shouldn't
+reveal what's switched off. The backend reports the flag through
+`GET /api/meta` (`devRoutes`) so the UI drops the demo-wallet fallback and the
+"mark funded" button on its own, rather than keeping a second copy of the
+answer that has to be remembered at deploy time.
 
 Hard-won Kaspa script rules — confirmed on mainnet dust during the original
 spikes, real consensus behavior, not SDK quirks. Bake these into the

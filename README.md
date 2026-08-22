@@ -17,17 +17,47 @@ the service ever goes dark, each player can still unilaterally reclaim their
 own stake after a 14-day CLTV timeout. See `docs/DAGMATE_SPEC.md` for the
 full design.
 
-- `service/` — Kaspa L1 scripting/RPC sidecar: escrow build, wallet-connect
-  settlement (`buildSettleUnsigned` + `broadcastSettle`), move anchors, DAA
-  lookups. `service/core.js` (WASM/RPC/HD-seed init) is the one piece not
-  yet built — see the header of `service/escrow.js` for its exact contract.
+**Identity is a signature, not an address.** Addresses are public — they're
+printed on the match view — so every mutating endpoint takes its account from
+a session token earned by signing a server-issued nonce with the wallet
+(`signMessage`, never `signPskt`). See `docs/DAGMATE_SPEC.md` §1.1.
+
+- `service/` — Kaspa L1 scripting/RPC sidecar: WASM/RPC/HD-seed init
+  (`core.js`), escrow build, wallet-connect settlement (`buildSettleUnsigned`
+  + `broadcastSettle`), move anchors, DAA lookups, wallet-ownership proof
+  (`auth.js`). Holds the arbiter and operating keys, so it binds to 127.0.0.1
+  and only the site backend talks to it.
 - `bot/` — Telegram **alerts-only** bot: `/start` (link code), `/alerts
   on|off`, `/unlink`, plus an internal shared-secret webhook API the site
   backend calls to push notifications. No wallet, no game state, no keys.
-- `site/` — dagmate.org (not yet built): wallet-connect UI, matchmaking,
-  board, clock, backend API that orchestrates escrow build + settlement.
+- `site/` — dagmate.org: wallet-connect UI, matchmaking, board, clocks, and
+  the FastAPI backend (python-chess is the rules authority) that orchestrates
+  escrow build, deposit watching and settlement. Serves the frontend too, so
+  `uvicorn main:app` is the one process to run.
 - `docs/DAGMATE_SPEC.md` — build spec: escrow model, settlement rules, clock
   rules, on-chain anchor format, service REST surface, bot API surface.
+
+## Running it
+
+Both processes need env; there are no secrets in this repo and no defaults
+that reach a live node.
+
+    service/   DAGMATE_MASTER_MNEMONIC   (required)
+               DAGMATE_KASPA_WRPC        (required — no default node URL)
+               DAGMATE_NETWORK_ID        (default mainnet)
+    site/      DAGMATE_SERVICE_URL       (default http://127.0.0.1:8910)
+               DAGMATE_NETWORK_ID        (default mainnet)
+
+⚠️ **`DAGMATE_DEV_ROUTES` is opt-in and mainnet-refused.** It gates the demo
+wallet and `dev-mark-funded`, the latter of which starts a match nobody paid
+for. It defaults to off in both processes, and is ignored outright on mainnet,
+because the failure modes are asymmetric: forgetting to switch it on costs two
+minutes, forgetting to switch it off puts a free-money button on a public
+host. `site/backend/dev.cmd` turns it on for local work.
+
+Tests are dependency-free — `python site/backend/tools/test_auth.py` (and
+`test_settlement`, `test_deposits`, `test_clocks`). Real schema, real DB
+accessors, throwaway database; only the chain is stubbed.
 
 Owner-gated / private until GoonBoy has tested it end-to-end and it's ready for
 public testing.

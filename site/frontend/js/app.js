@@ -3,7 +3,10 @@
  * (requestAccounts()) when a browser extension is present. When none is
  * detected — e.g. this headless preview — it falls back to the backend's
  * dev-only demo wallet (POST /api/dev/demo-wallet), clearly labeled as such.
- * That fallback is NEVER part of the real signing/settlement path.
+ * That fallback is NEVER part of the real signing/settlement path, and it
+ * only appears when the server says the dev routes are on (GET /api/meta →
+ * `devRoutes`, off by default and impossible on mainnet). The UI asks rather
+ * than assuming, so nothing here has to be remembered at deploy time.
  *
  * Connecting is not the same as being signed in. Connecting only reveals an
  * address, which is public anyway; every call that changes something carries
@@ -260,6 +263,13 @@
       }
       return;
     }
+    // No extension. On a real deployment that's the end of the story — say so
+    // plainly rather than letting the request 404 and reporting it as a
+    // failure, because "you need a wallet" is the actual answer.
+    if (!state.meta || !state.meta.devRoutes) {
+      toast("No Kaspa wallet detected. Install Kasware or Kastle to play — DAGmate never holds your keys.");
+      return;
+    }
     toast("No Kasware/Kastle extension detected — using a local demo wallet for testing.");
     try {
       const kp = await api("POST", "/api/dev/demo-wallet");
@@ -436,7 +446,9 @@
       `${displayName(m.playerA)} (white) vs ${displayName(m.playerB)} (black)`;
     document.getElementById("boardMeta").textContent =
       `${m.stakeKas} KAS · ${m.mode} · ${m.status}${m.status === "live" ? ` · ${m.turn} to move` : ""}${m.result ? " · " + m.result : ""}`;
-    document.getElementById("fundBtn").style.display = m.status === "awaiting_deposit" ? "inline-block" : "none";
+    // Absent entirely once the dev routes are off (see loadMeta).
+    const fundBtn = document.getElementById("fundBtn");
+    if (fundBtn) fundBtn.style.display = m.status === "awaiting_deposit" ? "inline-block" : "none";
     document.getElementById("resignBtn").style.display = m.status === "live" ? "inline-block" : "none";
 
     renderClocks(m);
@@ -896,9 +908,16 @@
   // page nobody opens. Both strings are generated from the server's fee config
   // so that turning a rake on would change the wording automatically instead of
   // leaving a claim on the page that is no longer true.
-  async function renderFeeDisclaimer() {
+  //
+  // This also carries whether the dev routes are switched on, for the same
+  // reason: the UI asks the server what exists rather than keeping its own
+  // copy of the answer, so a real deployment loses the demo wallet and the
+  // "mark funded" button without anyone remembering to edit the frontend.
+  async function loadMeta() {
     let meta;
     try { meta = await api("GET", "/api/meta"); } catch (e) { return; }
+    state.meta = meta;
+    if (!meta.devRoutes) document.getElementById("fundBtn").remove();
     const f = meta.fees;
     document.getElementById("feeDisclaimer").textContent = f.takesCut
       ? `DAGmate takes ${(f.platformFeeBps / 100).toFixed(2)}% of each pot. `
@@ -915,6 +934,6 @@
   renderWalletBadge();
   restoreWallet();
   refreshTournaments();
-  renderFeeDisclaimer();
+  loadMeta();
   initPracticeLevels().then(practiceInit);
 })();
