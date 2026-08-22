@@ -68,5 +68,11 @@ Tests are dependency-free — `python site/backend/tools/test_auth.py` (and
 `test_settlement`, `test_reclaim`, `test_deposits`, `test_clocks`). Real
 schema, real DB accessors, throwaway database; only the chain is stubbed.
 
+`deploy/` has the server side: systemd units, the nginx vhost, an annotated env
+template, and `deploy.sh` (which ships `git archive HEAD`, so what runs on the
+server is always a commit). `deploy/README.md` is the runbook, including the
+pre-launch checklist. DAGmate runs no Kaspa node of its own — the sidecar
+resolves a public one and health-checks it on every connection.
+
 Owner-gated / private until GoonBoy has tested it end-to-end and it's ready for
 public testing.

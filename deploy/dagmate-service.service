@@ -1,0 +1,50 @@
+[Unit]
+Description=DAGmate Kaspa sidecar (holds the arbiter + operating keys)
+Documentation=https://github.com/ItsGoonBoyCrypto/DAGmate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dagmate
+Group=dagmate
+WorkingDirectory=/opt/dagmate/service
+EnvironmentFile=/etc/dagmate/dagmate.env
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+
+# This is the process that can co-sign a settlement, so it gets the tightest
+# box of the three. It binds 127.0.0.1 in code; these make that structural
+# rather than a line someone can edit.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+# ^ node's JIT needs W+X pages. Everything else above still applies.
+
+# It writes nothing. No state, no database, no logs of its own — the escrow
+# keys are derived from the seed on demand, which is the whole reason there is
+# nothing here to steal at rest.
+ReadWritePaths=
+
+# No egress allowlist: the public node pool rotates its members, so there is
+# no stable set of addresses to pin, and a list that has to be right would
+# quietly break settlements the day the pool changes. Inbound is what matters
+# here and that is handled by binding 127.0.0.1 (DAGMATE_SERVICE_HOST).
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dagmate-service
+
+[Install]
+WantedBy=multi-user.target

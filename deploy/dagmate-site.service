@@ -1,0 +1,42 @@
+[Unit]
+Description=DAGmate site backend (dagmate.org — API + static frontend)
+Documentation=https://github.com/ItsGoonBoyCrypto/DAGmate
+After=network-online.target dagmate-service.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dagmate
+Group=dagmate
+WorkingDirectory=/opt/dagmate/site/backend
+EnvironmentFile=/etc/dagmate/dagmate.env
+ExecStart=/opt/dagmate/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8800
+Restart=always
+RestartSec=5
+
+# 127.0.0.1 only: nginx terminates TLS and is the only thing that talks to it.
+# Binding 0.0.0.0 here would publish the API on :8800 alongside the TLS site,
+# which is the same API with the certificate — and the rate limits — removed.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# The match database — the only thing this process writes.
+ReadWritePaths=/var/lib/dagmate
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dagmate-site
+
+[Install]
+WantedBy=multi-user.target

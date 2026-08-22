@@ -1,0 +1,41 @@
+[Unit]
+Description=DAGmate Telegram alerts bot (no wallet, no game state, no keys)
+Documentation=https://github.com/ItsGoonBoyCrypto/DAGmate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dagmate
+Group=dagmate
+WorkingDirectory=/opt/dagmate/bot
+EnvironmentFile=/etc/dagmate/dagmate.env
+ExecStart=/opt/dagmate/venv/bin/python dagmate_bot.py
+Restart=always
+RestartSec=10
+
+# Deliberately NOT ordered after the site backend, and not Requires= either.
+# Alerts are best-effort by design: the bot being down must never be able to
+# stop a match, and the site being down must never stop /unlink working.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+ReadWritePaths=/var/lib/dagmate
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dagmate-bot
+
+[Install]
+WantedBy=multi-user.target
