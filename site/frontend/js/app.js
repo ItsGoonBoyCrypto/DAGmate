@@ -9,7 +9,7 @@
   "use strict";
 
   const STANDARD_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-  const PIECE_GLYPH = { p: "♟", n: "♞", b: "♝", r: "♜", q: "♛", k: "♚" };
+  const PIECE_NAME = { p: "pawn", n: "knight", b: "bishop", r: "rook", q: "queen", k: "king" };
 
   function displayName(obj) {
     if (!obj) return "?";
@@ -125,11 +125,13 @@
         div.appendChild(r);
       }
       if (cell.piece) {
-        const span = document.createElement("span");
         const isWhite = cell.piece === cell.piece.toUpperCase();
-        span.className = `piece ${isWhite ? "white" : "black"}`;
-        span.textContent = PIECE_GLYPH[cell.piece.toLowerCase()];
-        div.appendChild(span);
+        const img = document.createElement("img");
+        img.className = "piece";
+        img.draggable = false;
+        img.alt = PIECE_NAME[cell.piece.toLowerCase()];
+        img.src = `assets/pieces/${isWhite ? "w" : "b"}${cell.piece.toUpperCase()}.svg`;
+        div.appendChild(img);
       }
       if (onClick) div.addEventListener("click", () => onClick(cell.sq));
       el.appendChild(div);
