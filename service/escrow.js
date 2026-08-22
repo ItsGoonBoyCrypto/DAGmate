@@ -1,16 +1,24 @@
 /**
- * DAGmate — escrow + settlement builders (CHESS_SPEC.md §2, §3).
+ * DAGmate — escrow + settlement builders (docs/DAGMATE_SPEC.md §2, §3).
  *
- * Reuses kron.js's already-loaded WASM instance + serialized RPC queue
- * (`core.wasm()` / `core.withRpc`) rather than standing up a second WASM/RPC
- * stack: `loadKaspa()` is a process-wide singleton (see
- * @kronsdk/kron-sdk/dist/wasm/index.node.js), so a second independent
- * RpcClient racing kron.js's own would defeat the "only one WASM session at
- * a time" guarantee kron.js's rpcDo exists to provide (see its comment).
+ * Non-custodial: player keys are never derived or held here — a player's
+ * pubkey comes from their own wallet's connect response (Kasware/Kastle/
+ * Kaspire), and a player's signature over a settle tx comes from that
+ * wallet's own custom-script-signing call, not from this service. The only
+ * key this module derives is the per-match ARBITER co-signing key, from
+ * DAGmate's own HD seed (fresh, project-local — never shared key material).
  *
- * Script rules baked in here are proven on mainnet dust, not guessed — see
- * CHESS_SPEC.md §5.1 and kron-service/src/chess_spike.mjs for the spikes
- * that found them:
+ * NEEDS `./core.js` (not yet built): a standalone Kaspa WASM/RPC module
+ * exporting `wasm()`, `withRpc(fn)`, `netType()`, `network()`,
+ * `COVENANT_OPTS`, `deriveArbiter(matchId)`, `operatingAddress()` (funds
+ * move anchors — see `anchor()` below), `feeAddress()` (project rake/fee
+ * destination). Same shape as any Kaspa WASM sidecar (init WASM, hold one
+ * serialized RPC client, HD-derive from an env-configured xprv) — just with
+ * zero Dagger code or shared key material.
+ *
+ * Script rules baked in here are proven on mainnet dust — see
+ * docs/DAGMATE_SPEC.md §3 and service/spikes.mjs for the spikes that found
+ * them:
  *   - sigOpCount is a createTransactions() OPTION, billed by CHECKMULTISIG
  *     pubkey-count (n=3 for a 2-of-3), not required-sig-count (m=2).
  *   - Multisig witness sigs must be pushed in the SAME relative order as
@@ -21,7 +29,7 @@
  *   - Kaspa's OpCheckLockTimeVerify POPS the locktime value — no OP_DROP
  *     after it (that's Bitcoin-only convention and drops the wrong item here).
  */
-import * as core from './kron.js';
+import * as core from './core.js';
 
 const H = (h) => Uint8Array.from(Buffer.from(String(h).replace(/^0x/, ''), 'hex'));
 const rawSig = (s) => { const b = Buffer.from(String(s), 'hex'); return b.length === 66 ? b.subarray(1) : b; };
@@ -33,27 +41,27 @@ function xOnlyHex(key) {
   return String(xo.toString()).replace(/^0x/, '');
 }
 
-/** GET /chess/pubkey — x-only pubkey for a player wallet (account 0, `index`
- *  is the user's wallet index) or a per-match arbiter key (account 1,
- *  `index` is then the matchId — CHESS_SPEC.md §2.1). */
-export function chessPubkey({ index, account = 0 }) {
-  const acc = Number(account);
-  if (acc !== 0 && acc !== 1) throw new Error('account must be 0 (player) or 1 (arbiter)');
-  if (index == null) throw new Error('index required');
-  const { key } = acc === 0 ? core.deriveUser(Number(index)) : core.deriveArbiter(index);
+/** GET /escrow/arbiter-pubkey?matchId=<n> — x-only pubkey for the per-match
+ *  arbiter co-signing key. There is no player-pubkey endpoint: a player's
+ *  pubkey comes from their own wallet's connect response, not from us. */
+export function arbiterPubkey({ matchId }) {
+  if (matchId == null) throw new Error('matchId required');
+  const { key } = core.deriveArbiter(matchId);
   return { pubkey: xOnlyHex(key) };
 }
 
-/** POST /chess/escrow — build the per-player escrow redeem script + P2SH
+/** POST /escrow/build — build one player's escrow redeem script + P2SH
  *  address. Pure function: no chain calls, no signing. Two branches:
  *    IF   OP_2 <pkA> <pkB> <pkArbiter> OP_3 OP_CHECKMULTISIG      — settle
  *    ELSE <reclaimDaa> OP_CHECKLOCKTIMEVERIFY <pkDepositor> OP_CHECKSIG  — 14d reclaim
- *  `depositorIsA` selects which player's key backs the reclaim branch of
- *  THIS particular escrow address — each player gets their own (§2.2: an
- *  abandoned match degrades to "everyone reclaims their own stake"). */
-export function chessEscrow({ matchId, pkA, pkB, depositorIsA, reclaimDaa }) {
+ *  `pkA`/`pkB` are the players' own wallet pubkeys (site collects these at
+ *  connect time). `depositorIsA` selects which player's key backs the
+ *  reclaim branch of THIS particular escrow address — each player gets
+ *  their own (an abandoned match degrades to "everyone reclaims their own
+ *  stake"). */
+export function buildEscrow({ matchId, pkA, pkB, depositorIsA, reclaimDaa }) {
   if (matchId == null) throw new Error('matchId required');
-  if (!pkA || !pkB) throw new Error('pkA and pkB required (x-only pubkey hex)');
+  if (!pkA || !pkB) throw new Error('pkA and pkB required (x-only pubkey hex, from each wallet)');
   if (reclaimDaa == null) throw new Error('reclaimDaa required');
   const k = core.wasm();
   const { key: arbKey } = core.deriveArbiter(matchId);
@@ -68,7 +76,7 @@ export function chessEscrow({ matchId, pkA, pkB, depositorIsA, reclaimDaa }) {
   sb.addOp(k.Opcodes.OpCheckMultiSig);
   sb.addOp(k.Opcodes.OpElse);
   sb.addI64(BigInt(reclaimDaa));
-  sb.addOp(k.Opcodes.OpCheckLockTimeVerify); // pops the locktime itself — no OP_DROP (spike S3)
+  sb.addOp(k.Opcodes.OpCheckLockTimeVerify); // pops the locktime itself — no OP_DROP
   sb.addData(depositorPk);
   sb.addOp(k.Opcodes.OpCheckSig);
   sb.addOp(k.Opcodes.OpEndIf);
@@ -76,7 +84,7 @@ export function chessEscrow({ matchId, pkA, pkB, depositorIsA, reclaimDaa }) {
 
   const spk = k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).createPayToScriptHashScript();
   const address = k.addressFromScriptPublicKey(spk, core.netType()).toString();
-  return { address, redeemHex, arbiterIndex: Number(matchId) };
+  return { address, redeemHex };
 }
 
 /** Fill one escrow input's sigScript for the IF (settle) branch. `sigPlayer`
@@ -91,19 +99,18 @@ function fillEscrowInput(k, tx, inputIdx, redeemHex, sigPlayer, sigArb) {
   tx.fillInput(inputIdx, k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem));
 }
 
-/** POST /chess/settle — spend one or both escrow addresses' UTXOs in a single
- *  tx via the IF (2-of-3) branch.
- *  `escrows`: [{ address, redeemHex, depositorIndex }] (1 or 2 entries — an
- *  escrow can carry more than one UTXO if externally topped up; every UTXO at
- *  a listed address is swept in).
- *  `winnerIndex` — decisive result: that wallet's key co-signs EVERY input.
- *  `split: true` — draw: each escrow is co-signed by its OWN `depositorIndex`
- *  and the pot is split evenly.
- *  submit:false → dry-run (payout preview only, nothing signed/broadcast). */
-export async function chessSettle({ matchId, escrows, winnerIndex, split, rakeSompi = 0n, submit = false }) {
+/** POST /escrow/settle-unsigned — gather escrow UTXOs, build the settle tx,
+ *  and return it (plus the arbiter's own signatures, computed now since we
+ *  hold that key) for the site to pass to the winning player's wallet for a
+ *  wallet-connect custom-script signature. Nothing is broadcast here.
+ *  `escrows`: [{ address, redeemHex, depositorAddr }] (1 or 2 entries).
+ *  `winnerAddr` — decisive result: that address's key co-signs EVERY input.
+ *  `split: true` — draw: each escrow is co-signed by its OWN depositor and
+ *  the pot is split evenly. */
+export async function buildSettleUnsigned({ matchId, escrows, winnerAddr, split, rakeSompi = 0n }) {
   if (matchId == null) throw new Error('matchId required');
   if (!Array.isArray(escrows) || !escrows.length) throw new Error('escrows required');
-  if (winnerIndex == null && !split) throw new Error('winnerIndex or split required');
+  if (!winnerAddr && !split) throw new Error('winnerAddr or split required');
   if (split && escrows.length !== 2) throw new Error('split settle needs exactly 2 escrows');
   const k = core.wasm();
   const { key: arbKey } = core.deriveArbiter(matchId);
@@ -116,12 +123,11 @@ export async function chessSettle({ matchId, escrows, winnerIndex, split, rakeSo
 
     // Generous, fixed priority fee per covenant input — createTransactions()'s
     // auto-estimate doesn't fully price the extra sigOpCount budget a 2-of-3
-    // CHECKMULTISIG spend costs (spike S2 needed an explicit override too).
+    // CHECKMULTISIG spend costs.
     const priorityFee = 60_000_000n * BigInt(entries.length);
 
     let outputs;
-    if (winnerIndex != null) {
-      const { address: winnerAddr } = core.deriveUser(Number(winnerIndex));
+    if (winnerAddr) {
       const payout = potSompi - rake - priorityFee;
       if (payout <= 0n) throw new Error('pot too small to cover rake + fee');
       outputs = rake > 0n
@@ -130,52 +136,64 @@ export async function chessSettle({ matchId, escrows, winnerIndex, split, rakeSo
     } else {
       const half = (potSompi - rake - priorityFee) / 2n;
       if (half <= 0n) throw new Error('pot too small to cover rake + fee');
-      const { address: aAddr } = core.deriveUser(Number(escrows[0].depositorIndex));
-      const { address: bAddr } = core.deriveUser(Number(escrows[1].depositorIndex));
+      const aAddr = escrows[0].depositorAddr, bAddr = escrows[1].depositorAddr;
       outputs = rake > 0n
         ? [{ address: aAddr, amount: half }, { address: bAddr, amount: half }, { address: core.feeAddress(), amount: rake }]
         : [{ address: aAddr, amount: half }, { address: bAddr, amount: half }];
     }
 
-    if (!submit) {
-      return {
-        potSompi: potSompi.toString(), rakeSompi: rake.toString(),
-        payoutPreview: outputs.map((o) => ({ address: o.address, amount: o.amount.toString() })),
-      };
-    }
-
     const { transactions } = await k.createTransactions({
       entries, outputs, changeAddress: core.feeAddress(), priorityFee, networkId: core.network(),
-      sigOpCount: 3, // CHECKMULTISIG billed by pubkey-count (n=3), not required-sig-count (m=2) — spike S2
+      sigOpCount: 3, // CHECKMULTISIG billed by pubkey-count (n=3), not required-sig-count (m=2)
     });
     const tx = transactions[0];
-    for (let i = 0; i < entries.length; i++) {
-      const addr = entries[i].address.toString();
-      const escrow = escrows.find((e) => e.address === addr);
-      if (!escrow) throw new Error(`UTXO at unexpected address ${addr}`);
-      const signerIndex = winnerIndex != null ? Number(winnerIndex) : Number(escrow.depositorIndex);
-      const { key: playerKey } = core.deriveUser(signerIndex);
-      const sigPlayer = tx.createInputSignature(i, playerKey);
-      const sigArb = tx.createInputSignature(i, arbKey);
-      fillEscrowInput(k, tx, i, escrow.redeemHex, sigPlayer, sigArb);
-    }
-    const txid = await tx.submit(rpc);
-    return { txid, potSompi: potSompi.toString(), rakeSompi: rake.toString() };
+    // Arbiter signatures, one per input — computed now, held server-side
+    // until the site returns the matching player signature(s) to broadcast.
+    const sigsArb = entries.map((_, i) => tx.createInputSignature(i, arbKey));
+
+    return {
+      matchId: Number(matchId), potSompi: potSompi.toString(), rakeSompi: rake.toString(),
+      txJson: tx.serializeToSafeJSON(), sigsArb,
+      // which escrow each input maps to (so the site knows whose wallet must sign which input)
+      inputs: entries.map((e, i) => ({ index: i, address: e.address.toString() })),
+    };
   });
 }
 
-/** POST /chess/anchor — dust self-spend (or a fee-wallet payment if
- *  feeSompi>0) from wallet[index] carrying a DGCHS move-anchor payload.
- *  Payload support on this SDK confirmed by spike S1. */
-export async function chessAnchor({ index, payloadHex, feeSompi = 0n }) {
-  if (index == null) throw new Error('index required');
+/** POST /escrow/settle-broadcast — take a tx previously built by
+ *  buildSettleUnsigned (site round-tripped it through the winning/depositor
+ *  wallet(s) for a signature per input) and the matching player signatures,
+ *  assemble the final sigScripts, and submit. */
+export async function broadcastSettle({ txJson, escrows, sigsPlayer, sigsArb }) {
+  if (!txJson) throw new Error('txJson required');
+  if (!Array.isArray(sigsPlayer) || !Array.isArray(sigsArb)) throw new Error('sigsPlayer and sigsArb required, one per input');
+  const k = core.wasm();
+  return core.withRpc(async (rpc) => {
+    const tx = k.Transaction.deserializeFromSafeJSON(txJson);
+    for (let i = 0; i < sigsPlayer.length; i++) {
+      const addr = tx.inputs[i].previousOutpoint ? undefined : undefined; // input→address mapping comes from `escrows` by position
+      const escrow = escrows[i];
+      if (!escrow) throw new Error(`no escrow mapping for input ${i}`);
+      fillEscrowInput(k, tx, i, escrow.redeemHex, sigsPlayer[i], sigsArb[i]);
+    }
+    const txid = await tx.submit(rpc);
+    return { txid };
+  });
+}
+
+/** POST /escrow/anchor — dust tx carrying a DGMT move-anchor payload, paid
+ *  from DAGmate's OWN operating address (never a player's wallet — anchoring
+ *  every move can't require a wallet-connect popup per move without ruining
+ *  the game's UX, and this never touches player funds, so it's a normal
+ *  project operating cost, not custody). */
+export async function anchor({ matchId, ply, payloadHex, feeSompi = 0n }) {
   if (!payloadHex) throw new Error('payloadHex required');
   const k = core.wasm();
-  const { key, address } = core.deriveUser(Number(index));
+  const { key, address } = core.operatingAddress();
   const fee = BigInt(feeSompi ?? 0);
   return core.withRpc(async (rpc) => {
     const { entries } = await rpc.getUtxosByAddresses({ addresses: [address] });
-    if (!entries.length) throw new Error('no UTXO to anchor from');
+    if (!entries.length) throw new Error('no UTXO to anchor from — fund the operating address');
     const outputs = fee > 0n ? [{ address: core.feeAddress(), amount: fee }] : [];
     const { transactions } = await k.createTransactions({
       entries, outputs, changeAddress: address, priorityFee: 0n, networkId: core.network(),
@@ -183,14 +201,14 @@ export async function chessAnchor({ index, payloadHex, feeSompi = 0n }) {
     });
     let txid = null;
     for (const tx of transactions) { tx.sign([key]); txid = await tx.submit(rpc); }
-    return { txid };
+    return { txid, matchId: Number(matchId), ply: Number(ply) };
   });
 }
 
-/** GET /chess/daa — current virtual DAA score, so the bot can compute a
- *  reclaim deadline (`reclaimDaa = current + ~14 days of DAA`, CHESS_SPEC.md
- *  §2.3) without embedding chain-tip knowledge in Python. */
-export async function chessDaaScore() {
+/** GET /escrow/daa — current virtual DAA score, so the backend can compute
+ *  an escrow's CLTV reclaim deadline (`reclaimDaa = current + ~14 days of
+ *  DAA`) without embedding chain-tip knowledge outside this service. */
+export async function daaScore() {
   return core.withRpc(async (rpc) => {
     const info = await rpc.getBlockDagInfo();
     return { daaScore: String(info.virtualDaaScore) };

@@ -1,23 +1,21 @@
 /**
- * Dagger Chess — Day-0 mainnet spikes (dust only, S1/S2/S3). Run on the VPS
- * where MASTER_MNEMONIC + a funded fee wallet already exist.
- *   node src/chess_spike.mjs S1
- *   node src/chess_spike.mjs S2
- *   node src/chess_spike.mjs S3
- * Each spike funds a throwaway key from the fee wallet with dust, proves the
- * mechanic, and sweeps any leftover back to the fee wallet. Nothing here
- * touches real user indices.
+ * DAGmate — Day-0 mainnet spikes (dust only, S1/S2/S3). Run on a box where
+ * DAGMATE_MASTER_XPRV (or equivalent) + a funded operating address already
+ * exist — see docs/DAGMATE_SPEC.md §3.
+ *   node spikes.mjs S1
+ *   node spikes.mjs S2
+ *   node spikes.mjs S3
+ * Each spike funds a throwaway key from DAGmate's own operating address with
+ * dust, proves the mechanic, and sweeps any leftover back. Nothing here
+ * touches a player's wallet or key — same non-custodial boundary as
+ * escrow.js (see its header for what `./core.js` needs to export).
  */
 import { randomBytes } from 'node:crypto';
-import { loadKaspa } from '@kronsdk/kron-sdk/wasm';
+import * as core from './core.js';
 
-const k = await loadKaspa();
-const core = await import('./kron.js');
-await core.init();
-
-const COVENANT_OPTS = { flags: { covenantsEnabled: true } };
-const NET = k.NetworkType.Mainnet;
-const NETWORK_ID = 'mainnet';
+const k = core.wasm();
+const NET = core.netType();
+const NETWORK_ID = core.network();
 const DUST = 100_000_000n; // 1 KAS
 
 function newKey() {
@@ -26,22 +24,16 @@ function newKey() {
   return { key, address };
 }
 
-async function withRpc(fn) {
-  const rpc = new k.RpcClient({ url: process.env.KASPA_WRPC ?? 'wss://node.kron.technology', networkId: NETWORK_ID, encoding: k.Encoding.Borsh });
-  await rpc.connect();
-  try { return await fn(rpc); } finally { await rpc.disconnect(); }
-}
-
-async function fundFromFeeWallet(rpc, toAddress, sompi) {
-  const { address: feeAddr, key: feeKey } = core.deriveUser(2_000_000_000);
-  const { entries } = await rpc.getUtxosByAddresses({ addresses: [feeAddr] });
-  if (!entries.length) throw new Error('fee wallet has no UTXOs');
+async function fundFromOperatingAddress(rpc, toAddress, sompi) {
+  const { address: opAddr, key: opKey } = core.operatingAddress();
+  const { entries } = await rpc.getUtxosByAddresses({ addresses: [opAddr] });
+  if (!entries.length) throw new Error('operating address has no UTXOs');
   const { transactions } = await k.createTransactions({
     entries, outputs: [{ address: toAddress, amount: sompi }],
-    changeAddress: feeAddr, priorityFee: 20_000_000n, networkId: NETWORK_ID,
+    changeAddress: opAddr, priorityFee: 20_000_000n, networkId: NETWORK_ID,
   });
   let txid = null;
-  for (const tx of transactions) { tx.sign([feeKey]); txid = await tx.submit(rpc); }
+  for (const tx of transactions) { tx.sign([opKey]); txid = await tx.submit(rpc); }
   console.log(`   funded ${toAddress} with ${sompi} sompi — txid ${txid}`);
   return txid;
 }
@@ -58,25 +50,25 @@ async function waitUtxo(rpc, address, tries = 20) {
 async function sweepBack(rpc, fromAddress, fromKey) {
   const { entries } = await rpc.getUtxosByAddresses({ addresses: [fromAddress] });
   if (!entries.length) return null;
-  const { address: feeAddr } = core.deriveUser(2_000_000_000);
+  const { address: opAddr } = core.operatingAddress();
   const { transactions } = await k.createTransactions({
-    entries, outputs: [], changeAddress: feeAddr, priorityFee: 0n, networkId: NETWORK_ID,
+    entries, outputs: [], changeAddress: opAddr, priorityFee: 0n, networkId: NETWORK_ID,
   });
   let txid = null;
   for (const tx of transactions) { tx.sign([fromKey]); txid = await tx.submit(rpc); }
-  console.log(`   swept ${fromAddress} back to fee wallet — txid ${txid}`);
+  console.log(`   swept ${fromAddress} back to operating address — txid ${txid}`);
   return txid;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 async function s1_payload() {
-  console.log('S1 — payload support on createTransactions (SDK 0.17.1), mainnet dust');
-  await withRpc(async (rpc) => {
+  console.log('S1 — payload support on createTransactions, mainnet dust');
+  await core.withRpc(async (rpc) => {
     const { key, address } = newKey();
-    await fundFromFeeWallet(rpc, address, DUST);
+    await fundFromOperatingAddress(rpc, address, DUST);
     await waitUtxo(rpc, address);
     const { entries } = await rpc.getUtxosByAddresses({ addresses: [address] });
-    const payloadHex = Buffer.from('DGCHS|1|SPIKE|0|e2e4|deadbeef', 'utf8').toString('hex');
+    const payloadHex = Buffer.from('DGMT|1|SPIKE|0|e2e4|deadbeef', 'utf8').toString('hex');
     const { transactions } = await k.createTransactions({
       entries, outputs: [], changeAddress: address, priorityFee: 0n, networkId: NETWORK_ID,
       payload: payloadHex,
@@ -84,33 +76,31 @@ async function s1_payload() {
     let txid = null;
     for (const tx of transactions) { tx.sign([key]); txid = await tx.submit(rpc); }
     console.log(`   anchor tx submitted: ${txid}`);
-    console.log(`   verify payload on an explorer: kaspa:tx/${txid} (payload hex should start with 4447434853)`);
+    console.log(`   verify payload on an explorer: kaspa:tx/${txid} (payload hex should start with 44474d54)`);
     await new Promise((r) => setTimeout(r, 4000));
     await sweepBack(rpc, address, key);
   });
-  console.log('S1 done — inspect the txid above on KasCov/explorer for the payload bytes.');
+  console.log('S1 done — inspect the txid above on an explorer for the payload bytes.');
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 function buildEscrowRedeem(pkAx, pkBx, pkArbx) {
   // OP_IF <2-of-3 multisig> OP_ELSE <cltv reclaim to depositor> OP_ENDIF
   // Spike S2 exercises ONLY the IF branch (2-of-3 settle). S3 exercises ELSE.
-  const sb = new k.ScriptBuilder(COVENANT_OPTS);
+  const sb = new k.ScriptBuilder(core.COVENANT_OPTS);
   sb.addOp(k.Opcodes.OpIf);
   sb.addOp(k.Opcodes.Op2);
   sb.addData(pkAx); sb.addData(pkBx); sb.addData(pkArbx);
   sb.addOp(k.Opcodes.Op3);
   sb.addOp(k.Opcodes.OpCheckMultiSig);
   sb.addOp(k.Opcodes.OpElse);
-  sb.addOp(k.Opcodes.OpDrop); // placeholder ELSE branch for S2 (real CLTV branch built in s3)
+  sb.addOp(k.Opcodes.OpDrop); // placeholder ELSE branch for S2 (real CLTV branch built in S3)
   sb.addOp(k.Opcodes.OpTrue);
   sb.addOp(k.Opcodes.OpEndIf);
   return sb.drain(); // hex
 }
 
 function xOnly(pubkeyObj) {
-  // kron.js addrToPubkey32-style extraction isn't available for raw PrivateKey objects;
-  // use PublicKey -> XOnlyPublicKey path.
   const pub = pubkeyObj.toPublicKey ? pubkeyObj.toPublicKey() : pubkeyObj;
   const xo = pub.toXOnlyPublicKey ? pub.toXOnlyPublicKey() : pub;
   const hex = xo.toString();
@@ -119,24 +109,24 @@ function xOnly(pubkeyObj) {
 
 async function s2_multisig() {
   console.log('S2 — 2-of-3 CHECKMULTISIG escrow spend, mainnet dust (the real unknown)');
-  await withRpc(async (rpc) => {
+  await core.withRpc(async (rpc) => {
     const a = newKey(), b = newKey(), arb = newKey();
     console.log('   playerA pub:', xOnly(a.key).length, 'bytes');
 
     const redeemHex = buildEscrowRedeem(xOnly(a.key), xOnly(b.key), xOnly(arb.key));
-    const spk = k.ScriptBuilder.fromScript(redeemHex, COVENANT_OPTS).createPayToScriptHashScript();
+    const spk = k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).createPayToScriptHashScript();
     const escrowAddr = k.addressFromScriptPublicKey(spk, NET).toString();
     console.log('   escrow address:', escrowAddr);
 
     const FUND = 300_000_000n; // 3 KAS — generous margin for fee estimation on this spend
-    await fundFromFeeWallet(rpc, escrowAddr, FUND);
+    await fundFromOperatingAddress(rpc, escrowAddr, FUND);
     const entries = await waitUtxo(rpc, escrowAddr);
 
     // Settle: winner = playerA, arbiter co-signs. Spend to A's own address (fresh throwaway).
-    const { address: feeAddr } = core.deriveUser(2_000_000_000);
+    const { address: opAddr } = core.operatingAddress();
     const { transactions } = await k.createTransactions({
       entries, outputs: [{ address: a.address, amount: 100_000_000n }],
-      changeAddress: feeAddr, priorityFee: 50_000_000n, networkId: NETWORK_ID,
+      changeAddress: opAddr, priorityFee: 50_000_000n, networkId: NETWORK_ID,
       sigOpCount: 3, // CHECKMULTISIG is billed conservatively by pubkey count (n=3), not required-sig count (m=2)
     });
     const tx = transactions[0];
@@ -145,13 +135,13 @@ async function s2_multisig() {
     const sigA = tx.createInputSignature(idx, a.key);
     const raw = (s) => { const buf = Buffer.from(String(s), 'hex'); return buf.length === 66 ? buf.subarray(1) : buf; };
 
-    const redeem = new k.ScriptBuilder(COVENANT_OPTS)
+    const redeem = new k.ScriptBuilder(core.COVENANT_OPTS)
       // NOTE: Kaspa's OpCheckMultiSig has no Bitcoin-style off-by-one dummy element — do not push one.
       .addData(raw(sigA)) // sigs must be pushed in the same relative order as their pubkeys (pkA, pkB, pkArb)
       .addData(raw(sigArb))
       .addOp(k.Opcodes.OpTrue) // select IF branch
       .drain();
-    tx.fillInput(idx, k.ScriptBuilder.fromScript(redeemHex, COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem));
+    tx.fillInput(idx, k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem));
 
     const txid = await tx.submit(rpc);
     console.log(`   settle tx submitted: ${txid}`);
@@ -164,16 +154,17 @@ async function s2_multisig() {
 // ─────────────────────────────────────────────────────────────────────────
 async function s3_cltv() {
   console.log('S3 — CLTV reclaim branch, mainnet, short window (~60s in DAA-score terms)');
-  await withRpc(async (rpc) => {
+  await core.withRpc(async (rpc) => {
     const depositor = newKey();
     const info = await rpc.getBlockDagInfo();
     const currentDaa = BigInt(info.virtualDaaScore);
-    // Margin must comfortably exceed fundFromFeeWallet + waitUtxo's polling overhead (can easily
-    // be 10-30s on its own), or the "early" attempt will already be past the deadline by the time
-    // it actually runs — false-passing the test. DAA advances ~10/s, so 600 ~= 60s of headroom.
+    // Margin must comfortably exceed fundFromOperatingAddress + waitUtxo's polling overhead
+    // (can easily be 10-30s on its own), or the "early" attempt will already be past the
+    // deadline by the time it actually runs — false-passing the test. DAA advances ~10/s,
+    // so 600 ~= 60s of headroom.
     const reclaimDaa = currentDaa + 600n;
 
-    const sb = new k.ScriptBuilder(COVENANT_OPTS);
+    const sb = new k.ScriptBuilder(core.COVENANT_OPTS);
     sb.addOp(k.Opcodes.OpIf);
     sb.addOp(k.Opcodes.OpFalse); // dead branch for this spike (settle path not exercised here)
     sb.addOp(k.Opcodes.OpElse);
@@ -183,12 +174,12 @@ async function s3_cltv() {
     sb.addOp(k.Opcodes.OpCheckSig);
     sb.addOp(k.Opcodes.OpEndIf);
     const redeemHex = sb.drain();
-    const spk = k.ScriptBuilder.fromScript(redeemHex, COVENANT_OPTS).createPayToScriptHashScript();
+    const spk = k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).createPayToScriptHashScript();
     const escrowAddr = k.addressFromScriptPublicKey(spk, NET).toString();
     console.log('   escrow address:', escrowAddr, ' reclaimDaa:', reclaimDaa.toString(), ' currentDaa:', currentDaa.toString());
 
     const S3_FUND = 100_000_000n; // 1 KAS — low-level createTransaction() has no auto change output
-    await fundFromFeeWallet(rpc, escrowAddr, S3_FUND);
+    await fundFromOperatingAddress(rpc, escrowAddr, S3_FUND);
     const entries = await waitUtxo(rpc, escrowAddr);
 
     async function attemptReclaim(label) {
@@ -204,8 +195,8 @@ async function s3_cltv() {
 
       const sig = k.createInputSignature(txn, 0, depositor.key);
       const raw = (s) => { const buf = Buffer.from(String(s), 'hex'); return buf.length === 66 ? buf.subarray(1) : buf; };
-      const redeem = new k.ScriptBuilder(COVENANT_OPTS).addData(raw(sig)).addOp(k.Opcodes.OpFalse).drain();
-      const sigScript = k.ScriptBuilder.fromScript(redeemHex, COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem);
+      const redeem = new k.ScriptBuilder(core.COVENANT_OPTS).addData(raw(sig)).addOp(k.Opcodes.OpFalse).drain();
+      const sigScript = k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem);
       const inputs2 = txn.inputs;
       inputs2[0].signatureScript = sigScript;
       txn.inputs = inputs2;
@@ -239,5 +230,5 @@ const which = process.argv[2];
 if (which === 'S1') await s1_payload();
 else if (which === 'S2') await s2_multisig();
 else if (which === 'S3') await s3_cltv();
-else { console.error('usage: node src/chess_spike.mjs [S1|S2|S3]'); process.exit(1); }
+else { console.error('usage: node spikes.mjs [S1|S2|S3]'); process.exit(1); }
 process.exit(0);
