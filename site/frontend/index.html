@@ -53,6 +53,7 @@
             Gas-only (no stake, moves still anchored on-chain)
           </label>
           <button type="submit" class="btn btn-primary full">Create challenge</button>
+          <p class="fee-note" id="challengeFeeNote"></p>
         </form>
 
         <div class="settings-row">
@@ -91,6 +92,7 @@
         <div class="board" id="board"></div>
         <div class="board-side">
           <div id="clocks" class="clocks"></div>
+          <div id="claimPanel" class="claim-panel"></div>
           <div id="escrowInfo" class="escrow-info"></div>
           <div id="moveLog" class="move-log"></div>
         </div>
@@ -135,6 +137,17 @@
   </section>
 
 </main>
+
+<!-- The fee promise, on every page. Written by js/app.js from the server's own
+     fee config (/api/meta), never hardcoded — a disclaimer that can drift out of
+     step with what the settle path actually charges is worse than none. -->
+<footer class="site-footer">
+  <p id="feeDisclaimer" class="fee-disclaimer"></p>
+  <p class="fee-disclaimer muted">
+    Non-custodial: your stake sits in a per-match escrow only you and your opponent
+    can fund, and DAGmate can never move it alone.
+  </p>
+</footer>
 
 <div class="toast" id="toast"></div>
 

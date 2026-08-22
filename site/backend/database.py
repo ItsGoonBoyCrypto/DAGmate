@@ -113,6 +113,21 @@ def ensure_schema():
         _add_column(c, "matches", "clock_warned_white", "INTEGER NOT NULL DEFAULT 0")
         _add_column(c, "matches", "clock_warned_black", "INTEGER NOT NULL DEFAULT 0")
 
+        # Settlement state (settlement.py). A settle tx is BUILT ONCE and then
+        # reused: rebuilding picks different UTXOs/fees and would silently
+        # invalidate any signature already collected, which in a draw (where
+        # the two players sign at different times, possibly days apart) would
+        # mean the first signer's approval quietly stopped counting.
+        _add_column(c, "matches", "settle_tx_json", "TEXT")
+        _add_column(c, "matches", "settle_inputs_json", "TEXT")   # per-input: escrow + required signer
+        _add_column(c, "matches", "settle_sigs_arb_json", "TEXT")  # ours, computed at build time
+        _add_column(c, "matches", "settle_sigs_player_json", "TEXT")  # filled in as players sign
+        _add_column(c, "matches", "settle_pot_sompi", "INTEGER")
+        _add_column(c, "matches", "settle_rake_sompi", "INTEGER")
+        _add_column(c, "matches", "settle_prepared_ts", "INTEGER")
+        _add_column(c, "matches", "settle_txid", "TEXT")
+        _add_column(c, "matches", "settle_broadcast_ts", "INTEGER")
+
 
 def _add_column(c: sqlite3.Connection, table: str, column: str, decl: str):
     """Idempotent ALTER TABLE ADD COLUMN (SQLite has no IF NOT EXISTS here)."""
@@ -322,6 +337,48 @@ def expire_match(match_id: str) -> bool:
         cur = c.execute(
             "UPDATE matches SET status='expired', result='deposit_timeout', settled_ts=? "
             "WHERE id=? AND status='awaiting_deposit'", (int(time.time()), match_id))
+        return cur.rowcount == 1
+
+
+# ── settlement ───────────────────────────────────────────────────────────
+def save_settlement_build(match_id: str, *, tx_json: str, inputs: list[dict],
+                          sigs_arb: list[str], pot_sompi: int, rake_sompi: int) -> bool:
+    """Store the built settle tx, once. Guarded on `settle_tx_json IS NULL`:
+    two players hitting Claim at the same moment must not each build their own
+    tx, because the second build would replace the first and orphan any
+    signature already collected against it. The loser of that race reads back
+    the winner's tx and signs that instead."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET settle_tx_json=?, settle_inputs_json=?, settle_sigs_arb_json=?, "
+            "settle_sigs_player_json=?, settle_pot_sompi=?, settle_rake_sompi=?, settle_prepared_ts=? "
+            "WHERE id=? AND settle_tx_json IS NULL",
+            (tx_json, json.dumps(inputs), json.dumps(sigs_arb),
+             json.dumps([None] * len(inputs)), pot_sompi, rake_sompi,
+             int(time.time()), match_id))
+        return cur.rowcount == 1
+
+
+def save_settlement_sigs(match_id: str, sigs_player: list) -> bool:
+    """Write back the player-signature array. Guarded on the tx still being the
+    one those signatures were made against — a signature is only valid for the
+    exact tx it signed, so if the build changed underneath, these are worthless
+    and must not be stored as if they weren't."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET settle_sigs_player_json=? WHERE id=? AND settle_txid IS NULL",
+            (json.dumps(sigs_player), match_id))
+        return cur.rowcount == 1
+
+
+def mark_settlement_broadcast(match_id: str, txid: str) -> bool:
+    """Guarded: only the first call records a txid. Two tabs (or a double
+    click) finishing the signature set at once must not both submit — the
+    second would be a double-spend attempt against an already-spent escrow."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET settle_txid=?, settle_broadcast_ts=? "
+            "WHERE id=? AND settle_txid IS NULL", (txid, int(time.time()), match_id))
         return cur.rowcount == 1
 
 

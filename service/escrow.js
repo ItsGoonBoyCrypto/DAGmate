@@ -215,7 +215,9 @@ export async function broadcastSettle({ txJson, escrows, sigsPlayer, sigsArb }) 
   return core.withRpc(async (rpc) => {
     const tx = k.Transaction.deserializeFromSafeJSON(txJson);
     for (let i = 0; i < sigsPlayer.length; i++) {
-      const addr = tx.inputs[i].previousOutpoint ? undefined : undefined; // input→address mapping comes from `escrows` by position
+      // `escrows` here is indexed BY INPUT INDEX, not one entry per escrow —
+      // an escrow holding two UTXOs appears twice. The backend expands it
+      // (settlement._escrows_per_input); this side trusts the position.
       const escrow = escrows[i];
       if (!escrow) throw new Error(`no escrow mapping for input ${i}`);
       fillEscrowInput(k, tx, i, escrow.redeemHex, sigsPlayer[i], sigsArb[i]);

@@ -17,7 +17,18 @@ BOT_WEBHOOK_URL = os.getenv("DAGMATE_BOT_WEBHOOK_URL", "http://127.0.0.1:8901")
 BOT_WEBHOOK_SECRET = os.getenv("DAGMATE_WEBHOOK_SECRET", "")
 
 FEE_ADDRESS = os.getenv("DAGMATE_FEE_ADDRESS")  # optional; service falls back to operating address
-RAKE_BPS = int(os.getenv("DAGMATE_RAKE_BPS", "300"))  # 3% default, basis points
+
+# ⚠️ PLATFORM TAKES NO CUT OF A POT — GoonBoy, 2026-08-22: "no fees taken by the
+# platform - just gas, entries or challenges charged." The winner receives the
+# entire pot minus the Kaspa network fee. What a player pays is the stake they
+# agreed (challenge), the entry fee they chose (tournament), or gas — never a
+# slice of their winnings.
+#
+# The rake MECHANISM stays (spec §2.3, service/escrow.js) but is off, so the
+# promise is one number in one place rather than a code path that has to be
+# remembered. Everything user-facing derives from this same value, so if it is
+# ever turned on the UI says so rather than quietly shaving the payout.
+RAKE_BPS = int(os.getenv("DAGMATE_RAKE_BPS", "0"))
 
 # CLTV reclaim window: ~14 days of DAA at Kaspa's ~10 blocks/sec cadence.
 RECLAIM_DAA_WINDOW = 14 * 24 * 3600 * 10
@@ -35,6 +46,18 @@ DEPOSIT_CONFIRM_DAA = int(os.getenv("DAGMATE_DEPOSIT_CONFIRM_DAA", "100"))
 # this a one-sided deposit sits in limbo until the 14-day CLTV, which is a
 # terrible outcome for the player who actually paid.
 DEPOSIT_DEADLINE_SECS = int(os.getenv("DAGMATE_DEPOSIT_DEADLINE_SECS", str(60 * 60)))
+
+# ── settlement (settlement.py) ──────────────────────────────────────────
+# ⚠️ MUST match `priorityFee` in service/escrow.js buildSettleUnsigned(). It's
+# duplicated because the backend has to decide whether a pot is even worth
+# settling BEFORE it asks the sidecar to build a tx — otherwise the only way a
+# player learns their pot is too small is a raw sidecar error. If you change
+# one, change the other.
+SETTLE_FEE_SOMPI_PER_INPUT = 60_000_000
+# A settle spends at least one input per escrow, so this is the floor below
+# which releasing the pot would cost more than the pot. Gas-only matches sit
+# under it by design: they exist for the on-chain move record, not the money.
+SETTLE_MIN_POT_SOMPI = 2 * SETTLE_FEE_SOMPI_PER_INPUT
 
 # Tournament fee tiers, KAS. Config-driven per spec §8 — easy to add/remove.
 TOURNAMENT_TIERS_KAS = [20, 100, 250, 500]

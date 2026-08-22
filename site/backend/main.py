@@ -11,10 +11,10 @@ faked:
     deposit check entirely. Real deposits are now watched (deposits.py), so
     this route is only for clicking through locally without a reachable Kaspa
     node — it MUST be off before any public deployment.
-  - Game-over settlement records a DB winner but does NOT yet call
-    service/escrow's settle-unsigned/settle-broadcast (that needs a real
-    wallet-connect signature round-trip from the winner's browser extension,
-    which isn't available in a headless preview).
+  - Settlement is wired (settlement.py) but its signature round-trip has never
+    run against a real wallet extension — `signPskt()` needs Kasware/Kastle,
+    which a headless preview doesn't have. The orchestration is unit-tested;
+    the signatures themselves are not yet proven end-to-end.
   - Learn-level gas payments are recorded optimistically, not yet verified
     against a real on-chain payment.
 """
@@ -39,6 +39,7 @@ import deposits
 import engine
 import kns
 import service_client
+import settlement
 from service_client import ServiceError
 
 log = logging.getLogger("dagmate.site")
@@ -372,8 +373,11 @@ async def resign(match_id: str, body: ResignBody):
 
 
 async def _settle_game_over(match_id: str, result: str, winner_color: str | None):
-    """Records the result. Does NOT yet move real funds — see module
-    docstring's settlement gap.
+    """Records the result. Money moves separately, through the settle
+    endpoints below: releasing the pot needs a player signature, so it can't
+    happen inside the request that ended the game — the winner might not even
+    be the one who sent it (a resignation ends the game from the loser's
+    browser).
 
     Guarded, because the clock loop can be deciding the same match at the same
     moment: whoever gets there first ends it, and the loser of that race stays
@@ -389,6 +393,46 @@ async def _settle_game_over(match_id: str, result: str, winner_color: str | None
     summary = f"{result}" + (" — you won" if winner_id else " — draw")
     for pid in (m["player_a_account_id"], m["player_b_account_id"]):
         await bot_client.notify_settled(pid, match_id, summary)
+
+
+# ── settlement ───────────────────────────────────────────────────────────
+class SettlePrepareBody(BaseModel):
+    address: str
+
+
+@app.post("/api/matches/{match_id}/settle/prepare")
+async def settle_prepare(match_id: str, body: SettlePrepareBody):
+    """Build (once) the tx that releases the pot, and say what this player
+    still has to sign. Both players may call this — on a draw they both must."""
+    try:
+        return await settlement.prepare(match_id, body.address)
+    except settlement.SettlementError as e:
+        raise HTTPException(400, str(e))
+    except ServiceError as e:
+        raise HTTPException(503, f"Kaspa service unavailable: {e}")
+
+
+class SettleSubmitBody(BaseModel):
+    address: str
+    # {input index: signature}. JSON object keys are strings, so this is typed
+    # as such and converted below rather than silently dropping entries.
+    sigs: dict[str, str]
+
+
+@app.post("/api/matches/{match_id}/settle/submit")
+async def settle_submit(match_id: str, body: SettleSubmitBody):
+    try:
+        sigs = {int(k): v for k, v in body.sigs.items()}
+    except ValueError:
+        raise HTTPException(400, "signature keys must be input indexes")
+    if not sigs:
+        raise HTTPException(400, "no signatures supplied")
+    try:
+        return await settlement.submit(match_id, body.address, sigs)
+    except settlement.SettlementError as e:
+        raise HTTPException(400, str(e))
+    except ServiceError as e:
+        raise HTTPException(503, f"Kaspa service unavailable: {e}")
 
 
 # ── tournaments ──────────────────────────────────────────────────────────
@@ -542,6 +586,24 @@ async def demo_wallet():
         raise HTTPException(502, f"couldn't reach the Kaspa service: {e}")
     db.get_or_create_account(kp["address"], kp["pubkey"], is_demo=True)
     return kp
+
+
+# ── site meta ────────────────────────────────────────────────────────────
+@app.get("/api/meta")
+def meta():
+    """Facts the frontend states out loud — chiefly the fee policy, which is a
+    promise to players and so is DERIVED from the same config the settle path
+    charges from. If the rake is ever switched on, the disclaimer changes by
+    itself instead of becoming a lie nobody remembered to update."""
+    return {
+        "fees": {
+            "platformFeeBps": config.RAKE_BPS,
+            "takesCut": config.RAKE_BPS > 0,
+            "networkFeeKasPerInput": config.SETTLE_FEE_SOMPI_PER_INPUT / config.SOMPI_PER_KAS,
+        },
+        "gasOnlyKas": config.GAS_ONLY_STAKE_SOMPI / config.SOMPI_PER_KAS,
+        "reclaimDays": config.RECLAIM_DAA_WINDOW // (24 * 3600 * 10),
+    }
 
 
 # ── health + static frontend ────────────────────────────────────────────

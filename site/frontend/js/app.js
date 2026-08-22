@@ -29,6 +29,10 @@
     // off the device's absolute clock, so a machine set to the wrong date still
     // shows the right numbers.
     clockRecvAt: 0,
+    // Settlement is prepared once per match (it builds a real tx), so the
+    // match it belongs to is tracked alongside it.
+    settle: null,
+    settleFor: null,
     selectedSquare: null,
     practiceFen: STANDARD_FEN,
     practiceLegalMoves: [],
@@ -390,6 +394,7 @@
     document.getElementById("resignBtn").style.display = m.status === "live" ? "inline-block" : "none";
 
     renderClocks(m);
+    renderClaim(m);
     renderEscrowInfo(m);
 
     const moveLog = document.getElementById("moveLog");
@@ -446,6 +451,105 @@
     if (s >= 86400) return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
     if (s >= 3600) return `${Math.floor(s / 3600)}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
     return `${Math.floor(s / 60)}:${pad(s % 60)}`;
+  }
+
+  // ── claiming the pot ─────────────────────────────────────────────────
+  // The game is over and the money is still sitting in escrow. Releasing it
+  // needs a signature from a player's own wallet, so this panel is the only
+  // place funds ever move.
+  function renderClaim(m) {
+    const el = document.getElementById("claimPanel");
+    if (m.status !== "settled" || !myColorFor(m)) { el.innerHTML = ""; return; }
+    // Prepared once per match, not once per poll: prepare() builds a real
+    // transaction the first time it's called, and the 4s refresh would
+    // otherwise hammer the Kaspa sidecar for the whole time the panel is open.
+    if (state.settleFor !== m.id) {
+      state.settleFor = m.id;
+      state.settle = null;
+      el.innerHTML = `<div class="claim-title">Checking the pot…</div>`;
+      api("POST", `/api/matches/${m.id}/settle/prepare`, { address: state.address })
+        .then((s) => { if (state.settleFor === m.id) { state.settle = s; renderClaim(m); } })
+        .catch((e) => { el.innerHTML = `<div class="claim-title">Payout</div>
+          <div class="claim-note">${e.message}</div>`; });
+      return;
+    }
+    const s = state.settle;
+    if (!s) return;
+
+    if (s.state === "broadcast") {
+      el.innerHTML = `<div class="claim-title">Paid out</div>
+        <div class="claim-amount">${s.payoutKas} KAS</div>
+        <div class="claim-note">Released on chain. Transaction <code>${s.txid}</code>.</div>`;
+      return;
+    }
+    const heading = s.isDraw ? "Draw — your half" : (s.youWon ? "You won the pot" : "Payout");
+    const needsMe = s.mySignatureInputs && s.mySignatureInputs.length;
+    el.innerHTML = `
+      <div class="claim-title">${heading}</div>
+      <div class="claim-amount">${s.payoutKas} KAS</div>
+      ${feeBreakdown(s)}
+      ${needsMe ? `<button class="btn btn-primary full" id="claimBtn">Sign &amp; release</button>`
+                : `<div class="claim-note">${s.waitingOnOpponent
+                     ? "Waiting for your opponent to sign their side of the draw."
+                     : "Nothing for you to sign here."}</div>`}`;
+    if (needsMe) document.getElementById("claimBtn").addEventListener("click", () => claim(m));
+  }
+
+  // Stated every time money is quoted, because "the pot minus a network fee"
+  // is a promise and a player should be able to check it against the number
+  // above rather than take it on trust. The platform line is driven by the
+  // server's own fee config, so it can never say "no cut" while taking one.
+  function feeBreakdown(s) {
+    return `<div class="claim-fees">
+      <div><span>Pot</span><span>${s.potKas} KAS</span></div>
+      <div><span>Kaspa network fee</span><span>−${s.networkFeeKas} KAS</span></div>
+      <div><span>DAGmate fee</span><span>${s.platformFeeKas > 0
+        ? `−${s.platformFeeKas} KAS` : "none"}</span></div>
+    </div>`;
+  }
+
+  async function claim(m) {
+    const s = state.settle;
+    const btn = document.getElementById("claimBtn");
+    if (btn) { btn.disabled = true; btn.textContent = "Waiting for your wallet…"; }
+    let sigs;
+    try {
+      sigs = await signSettleInputs(s.txJson, s.mySignatureInputs);
+    } catch (e) {
+      toast(`Signing failed: ${e.message}`);
+      if (btn) { btn.disabled = false; btn.textContent = "Sign & release"; }
+      return;
+    }
+    try {
+      state.settle = await api("POST", `/api/matches/${m.id}/settle/submit`,
+                               { address: state.address, sigs });
+      renderClaim(m);
+      toast(state.settle.txid ? "Payout broadcast." : "Signed — waiting on your opponent.");
+    } catch (e) {
+      toast(`Payout failed: ${e.message}`);
+      if (btn) { btn.disabled = false; btn.textContent = "Sign & release"; }
+    }
+  }
+
+  // The one place a player's key is asked for anything. The escrow is a custom
+  // P2SH script, so this needs a wallet's custom-script signing API (Kasware
+  // `signPskt`, Kastle `signTx` with `scripts[]`) — a plain "send" API can't
+  // produce these signatures. The demo wallet deliberately cannot do it: it
+  // exists to click through the game locally, and letting it anywhere near a
+  // real payout is exactly the shortcut that ends up shipping.
+  async function signSettleInputs(txJson, indexes) {
+    const provider = window.kasware || window.kastle;
+    if (!provider) throw new Error("connect Kasware or Kastle to release the pot");
+    const out = {};
+    if (typeof provider.signPskt === "function") {
+      for (const i of indexes) out[i] = await provider.signPskt(txJson, { inputIndex: i });
+      return out;
+    }
+    if (typeof provider.signTx === "function") {
+      for (const i of indexes) out[i] = await provider.signTx(txJson, { inputIndex: i });
+      return out;
+    }
+    throw new Error("this wallet doesn't expose custom-script signing yet");
   }
 
   // Escrow addresses + live deposit progress. The backend watches both
@@ -742,9 +846,29 @@
     if (!document.hidden && state.currentMatchId) refreshCurrentMatch();
   });
 
+  // The fee promise, stated in the player's own words rather than a policy
+  // page nobody opens. Both strings are generated from the server's fee config
+  // so that turning a rake on would change the wording automatically instead of
+  // leaving a claim on the page that is no longer true.
+  async function renderFeeDisclaimer() {
+    let meta;
+    try { meta = await api("GET", "/api/meta"); } catch (e) { return; }
+    const f = meta.fees;
+    document.getElementById("feeDisclaimer").textContent = f.takesCut
+      ? `DAGmate takes ${(f.platformFeeBps / 100).toFixed(2)}% of each pot. `
+        + "You also pay the Kaspa network fee to release it."
+      : "DAGmate takes no cut of any pot. You pay only the stake you agreed, the "
+        + "tournament entry you chose, or gas — the winner receives the whole pot "
+        + "minus the Kaspa network fee to release it.";
+    document.getElementById("challengeFeeNote").textContent = f.takesCut
+      ? `You pay your stake. DAGmate takes ${(f.platformFeeBps / 100).toFixed(2)}% of the pot on settlement.`
+      : "You pay your stake and nothing else — DAGmate takes no cut of the pot.";
+  }
+
   // ── boot ─────────────────────────────────────────────────────────────
   renderWalletBadge();
   restoreWallet();
   refreshTournaments();
+  renderFeeDisclaimer();
   initPracticeLevels().then(practiceInit);
 })();
