@@ -52,6 +52,17 @@ async def build_escrow(*, match_id: str, pk_a: str, pk_b: str, depositor_is_a: b
     })
 
 
+async def escrow_balances(addresses: list[str], confirm_daa: int) -> dict[str, dict]:
+    """{address: {"sompi": int, "confirmedSompi": int, "utxos": int}} — one RPC
+    round-trip for the whole batch. Amounts come back over the wire as decimal
+    strings (see escrow.js) and are parsed to int here, never float: these get
+    compared against a stake, so a rounding artefact would be a money bug."""
+    r = await _post("/escrow/balances", {"addresses": addresses, "confirmDaa": confirm_daa})
+    return {addr: {"sompi": int(v["sompi"]), "confirmedSompi": int(v["confirmedSompi"]),
+                   "utxos": int(v["utxos"])}
+            for addr, v in r["balances"].items()}
+
+
 async def settle_unsigned(*, match_id: str, escrows: list[dict], winner_addr: str | None, split: bool, rake_sompi: int) -> dict:
     return await _post("/escrow/settle-unsigned", {
         "matchId": match_id, "escrows": escrows, "winnerAddr": winner_addr,

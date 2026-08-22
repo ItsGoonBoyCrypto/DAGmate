@@ -99,6 +99,50 @@ function fillEscrowInput(k, tx, inputIdx, redeemHex, sigPlayer, sigArb) {
   tx.fillInput(inputIdx, k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem));
 }
 
+/** POST /escrow/balances — how much is actually sitting at each address.
+ *  This is what the backend's deposit watcher runs on, so it is a
+ *  money-critical read and deliberately conservative:
+ *    - `confirmedSompi` only counts UTXOs at least `confirmDaa` DAA deep.
+ *      A match must never go live (and so become settleable) off the back of
+ *      a UTXO that could still be reorged out from under the escrow.
+ *    - Totals are summed as BigInt and returned as decimal STRINGS. Sompi
+ *      amounts exceed JS's safe-integer range at ~90M KAS, and more to the
+ *      point JSON numbers would hand the Python side a float — never a thing
+ *      to compare a stake against.
+ *  One RPC round-trip covers every address, so the watcher can poll every
+ *  open match at once rather than per-match. */
+export async function addressBalances({ addresses, confirmDaa = 0 }) {
+  if (!Array.isArray(addresses) || !addresses.length) throw new Error('addresses required');
+  const minDepth = BigInt(confirmDaa ?? 0);
+  return core.withRpc(async (rpc) => {
+    const info = await rpc.getBlockDagInfo();
+    const tipDaa = BigInt(info.virtualDaaScore);
+    const { entries } = await rpc.getUtxosByAddresses({ addresses });
+
+    const out = {};
+    for (const a of addresses) out[a] = { sompi: 0n, confirmedSompi: 0n, utxos: 0 };
+    for (const e of entries) {
+      const addr = String(e.address);
+      const slot = out[addr];
+      if (!slot) continue; // node returned an address we didn't ask about
+      const amount = BigInt(e.amount);
+      // A UTXO not yet in the DAG has no blockDaaScore; treat it as depth 0
+      // rather than assuming it's confirmed.
+      const daa = e.blockDaaScore == null ? tipDaa : BigInt(e.blockDaaScore);
+      const depth = tipDaa > daa ? tipDaa - daa : 0n;
+      slot.sompi += amount;
+      slot.utxos += 1;
+      if (depth >= minDepth) slot.confirmedSompi += amount;
+    }
+    return {
+      tipDaa: tipDaa.toString(),
+      balances: Object.fromEntries(Object.entries(out).map(([a, v]) => [a, {
+        sompi: v.sompi.toString(), confirmedSompi: v.confirmedSompi.toString(), utxos: v.utxos,
+      }])),
+    };
+  });
+}
+
 /** POST /escrow/settle-unsigned — gather escrow UTXOs, build the settle tx,
  *  and return it (plus the arbiter's own signatures, computed now since we
  *  hold that key) for the site to pass to the winning player's wallet for a

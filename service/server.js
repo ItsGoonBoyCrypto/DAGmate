@@ -42,6 +42,8 @@ app.get('/escrow/arbiter-pubkey', wrap((req) =>
 
 app.post('/escrow/build', wrap((req) => escrow.buildEscrow(req.body)));
 
+app.post('/escrow/balances', wrap((req) => escrow.addressBalances(req.body)));
+
 app.post('/escrow/settle-unsigned', wrap((req) => escrow.buildSettleUnsigned(req.body)));
 
 app.post('/escrow/settle-broadcast', wrap((req) => escrow.broadcastSettle(req.body)));

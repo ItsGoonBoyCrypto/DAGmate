@@ -94,6 +94,21 @@ def ensure_schema():
           primary_name TEXT,
           fetched_ts INTEGER NOT NULL)""")
 
+        # Deposit-watcher state (deposits.py). Added by migration rather than
+        # in the CREATE above so existing local/testnet DBs pick it up.
+        _add_column(c, "matches", "funded_a_sompi", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(c, "matches", "funded_b_sompi", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(c, "matches", "funded_a_ts", "INTEGER")
+        _add_column(c, "matches", "funded_b_ts", "INTEGER")
+        _add_column(c, "matches", "deposit_checked_ts", "INTEGER")
+
+
+def _add_column(c: sqlite3.Connection, table: str, column: str, decl: str):
+    """Idempotent ALTER TABLE ADD COLUMN (SQLite has no IF NOT EXISTS here)."""
+    existing = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
 
 def _row(cur) -> dict | None:
     r = cur.fetchone()
@@ -215,6 +230,56 @@ def settle_match(match_id: str, *, status: str, result: str, winner_account_id: 
 def set_match_status(match_id: str, status: str):
     with _lock, _conn() as c:
         c.execute("UPDATE matches SET status=? WHERE id=?", (status, match_id))
+
+
+# ── deposit watching ─────────────────────────────────────────────────────
+def list_matches_awaiting_deposit() -> list[dict]:
+    """Only matches whose escrows actually exist — one built with an
+    unreachable sidecar has NULL addresses and there is nothing to watch."""
+    with _lock, _conn() as c:
+        return _rows(c.execute(
+            "SELECT * FROM matches WHERE status='awaiting_deposit' "
+            "AND escrow_a_address IS NOT NULL AND escrow_b_address IS NOT NULL "
+            "ORDER BY created_ts"))
+
+
+def record_deposits(match_id: str, a_sompi: int, b_sompi: int, stake_sompi: int) -> dict:
+    """Persist the observed on-chain balance of each escrow. The `*_ts` columns
+    latch the FIRST moment a side was seen fully funded and are never cleared,
+    so a transient node hiccup that under-reports a balance can't retroactively
+    un-fund a side."""
+    now = int(time.time())
+    with _lock, _conn() as c:
+        c.execute(
+            "UPDATE matches SET funded_a_sompi=?, funded_b_sompi=?, deposit_checked_ts=?, "
+            "funded_a_ts = CASE WHEN funded_a_ts IS NULL AND ? >= ? THEN ? ELSE funded_a_ts END, "
+            "funded_b_ts = CASE WHEN funded_b_ts IS NULL AND ? >= ? THEN ? ELSE funded_b_ts END "
+            "WHERE id=?",
+            (a_sompi, b_sompi, now, a_sompi, stake_sompi, now, b_sompi, stake_sompi, now, match_id))
+        return _row(c.execute("SELECT * FROM matches WHERE id=?", (match_id,)))
+
+
+def mark_match_live(match_id: str) -> bool:
+    """Guarded transition: only ever fires from awaiting_deposit, and returns
+    whether THIS call is the one that made the change. The watcher uses that to
+    decide whether to notify, so a re-poll (or two workers) can't double-start
+    a match or double-DM its players."""
+    with _lock, _conn() as c:
+        cur = c.execute("UPDATE matches SET status='live' WHERE id=? AND status='awaiting_deposit'",
+                         (match_id,))
+        return cur.rowcount == 1
+
+
+def expire_match(match_id: str) -> bool:
+    """Same guarded-transition contract as mark_match_live. `expired` means the
+    funding window closed without both sides paying; any stake that DID land is
+    still the depositor's — it's recoverable through the escrow's own CLTV
+    reclaim branch, not by us."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET status='expired', result='deposit_timeout', settled_ts=? "
+            "WHERE id=? AND status='awaiting_deposit'", (int(time.time()), match_id))
+        return cur.rowcount == 1
 
 
 def set_match_escrows(match_id: str, escrow_a: dict, escrow_b: dict):

@@ -302,6 +302,20 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
   padding: 10px 12px;
   line-height: 1.6;
 }
+/* Per-player deposit progress inside .escrow-info, while a match waits to be
+   funded. The tick is the whole status signal, so it stays legible: grey dots
+   while we're still waiting, accent check once that side's stake confirmed. */
+.deposit-row { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0; }
+.deposit-row + .deposit-row { border-top: 1px solid var(--panel-border-soft); }
+.deposit-tick {
+  flex: 0 0 18px; text-align: center; font-size: 13px;
+  color: var(--muted); font-family: var(--font-sans);
+}
+.deposit-tick.ok { color: var(--accent); font-weight: 800; }
+.deposit-row > div { min-width: 0; }
+.deposit-row .deposit-addr { color: var(--muted); opacity: 0.75; font-size: 10.5px; margin-top: 2px; }
+.escrow-info .meta { margin-top: 10px; font-family: var(--font-sans); word-break: normal; }
+
 .move-log { font-family: var(--font-mono); font-size: 13px; color: var(--text); max-height: 200px; overflow-y: auto; }
 
 /* ── learn ──────────────────────────────────────────────────────────── */

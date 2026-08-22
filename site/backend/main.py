@@ -7,10 +7,10 @@ is the one process to run locally.
 Known, deliberate gaps in this pass (see docs/DAGMATE_SPEC.md and the
 project memory for the full picture) — flagged here rather than silently
 faked:
-  - No on-chain deposit-watching loop yet. `/api/matches/{id}/dev-mark-funded`
-    is a dev-only stand-in so a match can be played through locally without a
-    live, reachable Kaspa node. Real flow: backend watches both escrow
-    addresses' UTXOs and flips awaiting_deposit -> live itself.
+  - `/api/matches/{id}/dev-mark-funded` still exists and skips the on-chain
+    deposit check entirely. Real deposits are now watched (deposits.py), so
+    this route is only for clicking through locally without a reachable Kaspa
+    node — it MUST be off before any public deployment.
   - Game-over settlement records a DB winner but does NOT yet call
     service/escrow's settle-unsigned/settle-broadcast (that needs a real
     wallet-connect signature round-trip from the winner's browser extension,
@@ -20,6 +20,7 @@ faked:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import random
@@ -33,6 +34,7 @@ import chess_logic
 import config
 import curriculum
 import database as db
+import deposits
 import engine
 import kns
 import service_client
@@ -45,8 +47,12 @@ app = FastAPI(title="DAGmate")
 
 
 @app.on_event("startup")
-def _startup():
+async def _startup():
     db.ensure_schema()
+    if config.DEPOSIT_WATCH_ENABLED:
+        asyncio.create_task(deposits.watch_loop())
+    else:
+        log.warning("deposit watcher DISABLED — matches will never go live on their own")
 
 
 def _short(addr: str) -> str:
@@ -110,6 +116,18 @@ def _match_public(m: dict) -> dict:
         "winnerAccountId": m["winner_account_id"],
         "escrowA": m["escrow_a_address"], "escrowB": m["escrow_b_address"],
         "tournamentId": m["tournament_id"], "round": m["round"],
+        # Deposit progress, so the player can see whose stake is outstanding
+        # rather than staring at "awaiting_deposit" with no explanation.
+        "funding": {
+            "stakeKas": m["stake_sompi"] / config.SOMPI_PER_KAS,
+            "aKas": (m["funded_a_sompi"] or 0) / config.SOMPI_PER_KAS,
+            "bKas": (m["funded_b_sompi"] or 0) / config.SOMPI_PER_KAS,
+            "aFunded": m["funded_a_ts"] is not None,
+            "bFunded": m["funded_b_ts"] is not None,
+            "checkedTs": m["deposit_checked_ts"],
+            "deadlineTs": m["created_ts"] + config.DEPOSIT_DEADLINE_SECS,
+            "windowMins": config.DEPOSIT_DEADLINE_SECS // 60,
+        },
     }
 
 

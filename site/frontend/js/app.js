@@ -383,8 +383,7 @@
     document.getElementById("fundBtn").style.display = m.status === "awaiting_deposit" ? "inline-block" : "none";
     document.getElementById("resignBtn").style.display = m.status === "live" ? "inline-block" : "none";
 
-    const escrowEl = document.getElementById("escrowInfo");
-    escrowEl.innerHTML = `escrow A: ${m.escrowA || "(pending)"}<br>escrow B: ${m.escrowB || "(pending)"}`;
+    renderEscrowInfo(m);
 
     const moveLog = document.getElementById("moveLog");
     moveLog.textContent = m.winnerAccountId !== undefined && m.result ? `Result: ${m.result}` : "";
@@ -396,6 +395,32 @@
       flipped: color === "black",
       onClick: onBoardSquareClick,
     });
+  }
+
+  // Escrow addresses + live deposit progress. The backend watches both
+  // addresses on chain and starts the match itself once each holds its stake,
+  // so this is a read-only view of that — there is nothing to click.
+  function renderEscrowInfo(m) {
+    const el = document.getElementById("escrowInfo");
+    const f = m.funding;
+    if (!f || m.status !== "awaiting_deposit") {
+      el.innerHTML = `escrow A: ${m.escrowA || "(pending)"}<br>escrow B: ${m.escrowB || "(pending)"}`;
+      return;
+    }
+    const side = (label, addr, paid, got) => `
+      <div class="deposit-row">
+        <span class="deposit-tick ${paid ? "ok" : ""}">${paid ? "✓" : "…"}</span>
+        <div>
+          <div>${label} — ${paid ? "stake received" : `${got} / ${f.stakeKas} KAS`}</div>
+          <div class="deposit-addr">${addr || "(pending)"}</div>
+        </div>
+      </div>`;
+    el.innerHTML =
+      side(`${displayName(m.playerA)} (white)`, m.escrowA, f.aFunded, f.aKas) +
+      side(`${displayName(m.playerB)} (black)`, m.escrowB, f.bFunded, f.bKas) +
+      `<div class="meta">Send at least ${f.stakeKas} KAS to your own escrow address. The match
+       starts automatically once both stakes confirm. If both sides haven't funded within
+       ${f.windowMins} minutes the match is cancelled, and any stake you sent stays yours.</div>`;
   }
 
   function onBoardSquareClick(sq) {

@@ -22,6 +22,20 @@ RAKE_BPS = int(os.getenv("DAGMATE_RAKE_BPS", "300"))  # 3% default, basis points
 # CLTV reclaim window: ~14 days of DAA at Kaspa's ~10 blocks/sec cadence.
 RECLAIM_DAA_WINDOW = 14 * 24 * 3600 * 10
 
+# ── deposit watcher (deposits.py) ───────────────────────────────────────
+# The loop that flips a match awaiting_deposit -> live by looking at what's
+# actually on chain. Money-critical, so the defaults are conservative.
+DEPOSIT_WATCH_ENABLED = os.getenv("DAGMATE_DEPOSIT_WATCH", "1") == "1"
+DEPOSIT_POLL_SECS = int(os.getenv("DAGMATE_DEPOSIT_POLL_SECS", "20"))
+# Confirmation depth in DAA before a deposit counts. Kaspa runs ~10 blocks/sec,
+# so 100 DAA is roughly 10 seconds — cheap in UX terms, and it means a match
+# can never become settleable off a UTXO that's still reorg-able.
+DEPOSIT_CONFIRM_DAA = int(os.getenv("DAGMATE_DEPOSIT_CONFIRM_DAA", "100"))
+# How long both players get to fund before the match is abandoned. Without
+# this a one-sided deposit sits in limbo until the 14-day CLTV, which is a
+# terrible outcome for the player who actually paid.
+DEPOSIT_DEADLINE_SECS = int(os.getenv("DAGMATE_DEPOSIT_DEADLINE_SECS", str(60 * 60)))
+
 # Tournament fee tiers, KAS. Config-driven per spec §8 — easy to add/remove.
 TOURNAMENT_TIERS_KAS = [20, 100, 250, 500]
 TOURNAMENT_MIN_ENTRANTS = int(os.getenv("DAGMATE_TOURNAMENT_MIN_ENTRANTS", "8"))
