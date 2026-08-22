@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DAGmate — wagered chess on Kaspa</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">♞</span>
+    <span class="brand-name">DAGmate</span>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="play">Play</button>
+    <button class="tab" data-tab="tournaments">Tournaments</button>
+    <button class="tab" data-tab="learn">Learn</button>
+  </nav>
+  <div class="wallet-area" id="walletArea">
+    <button class="btn btn-primary" id="connectBtn">Connect wallet</button>
+  </div>
+</header>
+
+<main id="app">
+
+  <!-- PLAY TAB -->
+  <section class="tab-panel active" id="panel-play">
+
+    <div class="grid-2">
+      <div class="card">
+        <h2>New challenge</h2>
+        <form id="challengeForm">
+          <label>Opponent address <span class="muted">(leave blank for an open challenge)</span>
+            <input type="text" id="chOpponent" placeholder="kaspa:...">
+          </label>
+          <div class="row">
+            <label class="grow">Stake (KAS)
+              <input type="number" id="chStake" min="0" step="0.1" value="1" >
+            </label>
+            <label>Mode
+              <select id="chMode">
+                <option value="rapid">Rapid</option>
+                <option value="daily">Daily</option>
+              </select>
+            </label>
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="chGasOnly">
+            Gas-only (no stake, moves still anchored on-chain)
+          </label>
+          <button type="submit" class="btn btn-primary full">Create challenge</button>
+        </form>
+
+        <div class="settings-row">
+          <label class="checkbox">
+            <input type="checkbox" id="acceptChallengesToggle">
+            Accept incoming challenges
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Open challenges</h2>
+        <div id="challengeList" class="list">
+          <p class="muted">Connect a wallet to see challenges.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>My matches</h2>
+      <div id="matchList" class="list">
+        <p class="muted">Connect a wallet to see your matches.</p>
+      </div>
+    </div>
+
+    <div class="card" id="boardCard" style="display:none;">
+      <div class="board-header">
+        <h2 id="boardTitle">Match</h2>
+        <div class="board-meta" id="boardMeta"></div>
+        <div class="board-actions">
+          <button class="btn btn-danger" id="resignBtn">Resign</button>
+          <button class="btn" id="fundBtn" style="display:none;">Dev: mark funded</button>
+        </div>
+      </div>
+      <div class="board-wrap">
+        <div class="board" id="board"></div>
+        <div class="board-side">
+          <div id="escrowInfo" class="escrow-info"></div>
+          <div id="moveLog" class="move-log"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Practice vs. bot <span class="muted">(free, local — not a real match)</span></h2>
+      <div class="board-wrap">
+        <div class="board" id="practiceBoard"></div>
+        <div class="board-side">
+          <p class="muted" id="practiceStatus">Your move — you're playing white.</p>
+          <button class="btn" id="practiceResetBtn">Reset board</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TOURNAMENTS TAB -->
+  <section class="tab-panel" id="panel-tournaments">
+    <div class="card">
+      <h2>Tournaments</h2>
+      <p class="muted">Winner-takes-pot. Auto-starts once a tier reaches its minimum entrants.</p>
+      <div id="tournamentList" class="list"></div>
+    </div>
+  </section>
+
+  <!-- LEARN TAB -->
+  <section class="tab-panel" id="panel-learn">
+    <div class="card">
+      <h2>Learn</h2>
+      <p class="muted">Rules levels are free. Later levels cost a small one-time gas fee to unlock.</p>
+      <div id="learnList" class="list"></div>
+    </div>
+    <div class="card" id="learnContentCard" style="display:none;">
+      <h2 id="learnContentTitle"></h2>
+      <div id="learnContentBody" class="learn-content"></div>
+    </div>
+  </section>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script src="js/app.js"></script>
+</body>
+</html>

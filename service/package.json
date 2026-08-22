@@ -5,10 +5,12 @@
   "type": "module",
   "description": "DAGmate Kaspa L1 sidecar — non-custodial escrow/settlement builders and mainnet spikes, wrapping @kronsdk/kron-sdk. Own HD seed, own key layout, zero Dagger code or shared key material.",
   "scripts": {
+    "start": "node server.js",
     "spike": "node spikes.mjs"
   },
   "dependencies": {
-    "@kronsdk/kron-sdk": "0.17.1"
+    "@kronsdk/kron-sdk": "0.17.1",
+    "express": "^5.2.1"
   },
   "engines": {
     "node": ">=20"

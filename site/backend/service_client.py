@@ -1,0 +1,82 @@
+"""DAGmate site backend — client for service/ (the Kaspa sidecar, see
+docs/DAGMATE_SPEC.md §3). Every call is best-effort: if the sidecar or its
+configured Kaspa node is unreachable, callers get a clear ServiceError
+instead of a stack trace, and the site keeps working for everything that
+doesn't need live chain data (challenges, tournaments lobby, learn page,
+the board itself once a match exists)."""
+from __future__ import annotations
+
+import httpx
+
+import config
+
+
+class ServiceError(RuntimeError):
+    pass
+
+
+def _url(path: str) -> str:
+    return f"{config.SERVICE_URL}{path}"
+
+
+async def _get(path: str, params: dict | None = None) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(_url(path), params=params)
+    except httpx.RequestError as e:
+        raise ServiceError(f"service unreachable at {config.SERVICE_URL}: {e}") from e
+    if r.status_code >= 400:
+        raise ServiceError(r.json().get("error", r.text))
+    return r.json()
+
+
+async def _post(path: str, body: dict) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(_url(path), json=body)
+    except httpx.RequestError as e:
+        raise ServiceError(f"service unreachable at {config.SERVICE_URL}: {e}") from e
+    if r.status_code >= 400:
+        raise ServiceError(r.json().get("error", r.text))
+    return r.json()
+
+
+async def arbiter_pubkey(match_id: int) -> str:
+    return (await _get("/escrow/arbiter-pubkey", {"matchId": match_id}))["pubkey"]
+
+
+async def build_escrow(*, match_id: str, pk_a: str, pk_b: str, depositor_is_a: bool, reclaim_daa: int) -> dict:
+    return await _post("/escrow/build", {
+        "matchId": match_id, "pkA": pk_a, "pkB": pk_b,
+        "depositorIsA": depositor_is_a, "reclaimDaa": reclaim_daa,
+    })
+
+
+async def settle_unsigned(*, match_id: str, escrows: list[dict], winner_addr: str | None, split: bool, rake_sompi: int) -> dict:
+    return await _post("/escrow/settle-unsigned", {
+        "matchId": match_id, "escrows": escrows, "winnerAddr": winner_addr,
+        "split": split, "rakeSompi": rake_sompi,
+    })
+
+
+async def settle_broadcast(*, tx_json: str, escrows: list[dict], sigs_player: list[str], sigs_arb: list[str]) -> dict:
+    return await _post("/escrow/settle-broadcast", {
+        "txJson": tx_json, "escrows": escrows, "sigsPlayer": sigs_player, "sigsArb": sigs_arb,
+    })
+
+
+async def anchor(*, match_id: str, ply: int, payload_hex: str, fee_sompi: int = 0) -> dict:
+    return await _post("/escrow/anchor", {
+        "matchId": match_id, "ply": ply, "payloadHex": payload_hex, "feeSompi": fee_sompi,
+    })
+
+
+async def daa_score() -> int:
+    return int((await _get("/escrow/daa"))["daaScore"])
+
+
+async def generate_demo_keypair() -> dict:
+    """Local-testing-only helper: a fresh throwaway Kaspa keypair, used as a
+    stand-in wallet when no browser extension (Kasware/Kastle) is available
+    to click through the full flow. See config.DEMO_WALLET_ENABLED."""
+    return await _post("/dev/demo-keypair", {})
