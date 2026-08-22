@@ -31,7 +31,9 @@ from pydantic import BaseModel
 import bot_client
 import chess_logic
 import config
+import curriculum
 import database as db
+import engine
 import kns
 import service_client
 from service_client import ServiceError
@@ -126,9 +128,10 @@ def wallet_connect(body: ConnectBody):
 @app.get("/api/profile")
 def get_profile(address: str):
     a = _get_account_or_404(address)
-    levels = [{**lv, "unlocked": lv["gas_kas"] == 0 or lv["id"] in db.unlocked_levels(a["id"])}
+    unlocked = db.unlocked_levels(a["id"])
+    levels = [{**lv, "unlocked": lv["gas_kas"] == 0 or lv["id"] in unlocked}
               for lv in config.LEARN_LEVELS]
-    return {**_account_public(a), "learnLevels": levels}
+    return {**_account_public(a), "learnTiers": config.LEARN_TIERS, "learnLevels": levels}
 
 
 class AcceptTogglBody(BaseModel):
@@ -420,6 +423,27 @@ def unlock_level(level_id: str, body: UnlockLevelBody):
     return {"ok": True}
 
 
+@app.get("/api/learn/levels")
+def learn_levels():
+    """Catalogue only — bodies never appear here (see curriculum.level_index)."""
+    return {"tiers": config.LEARN_TIERS, "levels": config.LEARN_LEVELS}
+
+
+@app.get("/api/learn/levels/{level_id}/content")
+def learn_level_content(level_id: str, address: str):
+    """The paywall. Level bodies live server-side and only leave through here,
+    so a locked level is genuinely unreadable rather than just hidden in the UI."""
+    a = _get_account_or_404(address)
+    unlocked = curriculum.gas_for(level_id) == 0 or level_id in db.unlocked_levels(a["id"])
+    body = curriculum.content_for(level_id, unlocked)
+    if body is None:
+        if level_id not in curriculum.LEVELS_BY_ID:
+            raise HTTPException(404, "unknown level")
+        raise HTTPException(403, "level locked")
+    lv = curriculum.LEVELS_BY_ID[level_id]
+    return {"id": level_id, "title": lv["title"], "body": body}
+
+
 class PracticeMoveBody(BaseModel):
     fen: str
     uci: str
@@ -445,15 +469,23 @@ def practice_start_fen():
 
 class PracticeBotBody(BaseModel):
     fen: str
+    level: str | None = None
+
+
+@app.get("/api/practice/levels")
+def practice_levels():
+    return {"levels": engine.level_list(), "default": engine.DEFAULT_LEVEL}
 
 
 @app.post("/api/practice/bot-move")
 def practice_bot_move(body: PracticeBotBody):
-    uci = chess_logic.weak_bot_move(body.fen)
+    # Sync `def` on purpose: FastAPI runs these in a threadpool, so the engine's
+    # wall-clock budget can't stall the event loop for every other request.
+    uci = engine.best_move(body.fen, body.level)
     if not uci:
         return {"uci": None, "status": chess_logic.status_of(chess_logic.board_from(body.fen))}
     status = chess_logic.apply_uci(body.fen, uci)
-    return {"uci": uci, "status": status}
+    return {"uci": uci, "level": engine.resolve_level(body.level).key, "status": status}
 
 
 # ── dev-only demo wallet ────────────────────────────────────────────────

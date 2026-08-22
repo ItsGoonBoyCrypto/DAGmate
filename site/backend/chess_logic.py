@@ -7,8 +7,6 @@ plain list of UCI strings (both trivial to store/replay).
 """
 from __future__ import annotations
 
-import random
-
 import chess
 
 STARTING_FEN = chess.STARTING_FEN
@@ -59,15 +57,5 @@ def status_of(board: chess.Board) -> dict:
     }
 
 
-def weak_bot_move(fen: str) -> str | None:
-    """Free practice opponent (spec §9): a plain random-legal-move bot — no
-    external engine binary/download, deliberately weak. Prefers a capture or
-    a checking move about a third of the time for a slightly less random
-    feel, otherwise picks uniformly at random."""
-    board = board_from(fen)
-    moves = list(board.legal_moves)
-    if not moves:
-        return None
-    spicy = [m for m in moves if board.is_capture(m) or board.gives_check(m)]
-    pool = spicy if spicy and random.random() < 0.35 else moves
-    return random.choice(pool).uci()
+# The practice opponent lives in engine.py — this module stays purely the rules
+# authority so there is exactly one place that decides what is legal.

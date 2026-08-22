@@ -198,6 +198,25 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
 .list-item .meta { color: var(--muted); font-size: 12px; font-weight: 500; margin-top: 2px; }
 .list-item .actions { display: flex; gap: 6px; flex-shrink: 0; }
 
+/* Learn tier separator — groups the 30 levels into their six difficulty tiers. */
+.tier-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 4px 6px;
+  border-bottom: 1px solid var(--panel-border-soft);
+}
+.tier-head:first-child { padding-top: 0; }
+.tier-head .tier-label {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.tier-head .meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+
 /* ── board card ─────────────────────────────────────────────────────── */
 .board-header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
 .board-header h2 { margin: 0; }
@@ -259,8 +278,9 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
 .sq.light .coord { color: var(--board-dark); }
 .sq.dark .coord { color: var(--board-light); }
 
-/* cburnett piece set (lichess-org/lila, GPL-2.0). The SVGs carry their own
-   black outline, so no text-stroke trick is needed for contrast. */
+/* chessnut piece set (Apache-2.0) — see assets/pieces/ATTRIBUTION.md. The SVGs
+   carry their own black outline, so no text-stroke trick is needed for contrast.
+   Sized by CSS, so swapping in another set with the same 12 filenames just works. */
 .piece {
   width: 86%;
   height: 86%;

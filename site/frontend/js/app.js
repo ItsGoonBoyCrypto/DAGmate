@@ -29,6 +29,8 @@
     practiceLegalMoves: [],
     practiceSelected: null,
     practiceTurnLock: false,
+    practiceLevels: [],
+    practiceLevel: null,
   };
 
   // ── tiny helpers ─────────────────────────────────────────────────────
@@ -472,34 +474,8 @@
   }
 
   // ── learn ────────────────────────────────────────────────────────────
-  const LEARN_CONTENT = {
-    "rules-1": `<ul><li>Pawns move forward one square (two from their start), capture diagonally.</li>
-      <li>Knights move in an "L": two squares one way, one square perpendicular — they jump over pieces.</li>
-      <li>Bishops slide diagonally any distance; each bishop stays on one color forever.</li>
-      <li>Rooks slide horizontally/vertically any distance.</li>
-      <li>The queen combines rook + bishop movement.</li>
-      <li>The king moves one square in any direction.</li></ul>`,
-    "rules-2": `<ul><li><b>Check</b>: the king is under attack and must be gotten out of it next move.</li>
-      <li><b>Checkmate</b>: the king is in check with no legal way out — the game ends immediately.</li>
-      <li><b>Stalemate</b>: the side to move has no legal move and isn't in check — the game is a draw.</li>
-      <li>Games also draw on insufficient material, 75 moves without a capture/pawn move, or fivefold repetition.</li></ul>`,
-    "tactics-1": `<ul><li><b>Fork</b>: one piece attacks two enemy pieces at once — knights are especially good at this.</li>
-      <li><b>Pin</b>: a piece can't move without exposing a more valuable piece (or the king) behind it to attack.</li></ul>`,
-    "tactics-2": `<ul><li><b>Skewer</b>: like a pin in reverse — attack a valuable piece, and when it moves, take what's behind it.</li>
-      <li><b>Discovered attack</b>: moving one piece out of the way unleashes an attack from another piece behind it.</li></ul>`,
-    "openings-1": `<ul><li>Control the center (e4/d4/e5/d5) early.</li>
-      <li>Develop knights and bishops before moving the same piece twice.</li>
-      <li>Castle early to get the king safe and connect the rooks.</li>
-      <li>Avoid bringing the queen out too early — it can be chased around and lose tempo.</li></ul>`,
-    "openings-2": `<ul><li>Watch for early queen sorties threatening quick mate (e.g. "Scholar's Mate" style ideas) — a defended f7/f2 square matters.</li>
-      <li>Don't grab loose pawns with your queen while your king is still in the center — development wins tempo battles.</li></ul>`,
-    "endgames-1": `<ul><li>The king becomes a strong piece in the endgame — activate it.</li>
-      <li>"Opposition": facing kings with one square between them — the side NOT to move usually has the advantage in a king-and-pawn race.</li>
-      <li>A lone king generally can't stop a passed pawn defended by its own king.</li></ul>`,
-    "endgames-2": `<ul><li>The "Lucena position": a well-known winning technique for promoting a rook-pawn with your rook's help ("building a bridge").</li>
-      <li>The "Philidor position": the standard drawing technique when defending a rook endgame a pawn down.</li></ul>`,
-  };
-
+  // Level bodies deliberately do NOT live here — they're fetched per level from
+  // /api/learn/levels/{id}/content, so a locked level can't be read from source.
   async function refreshLearn() {
     const el = document.getElementById("learnList");
     document.getElementById("learnContentCard").style.display = "none";
@@ -507,23 +483,42 @@
     await refreshProfile();
     if (!state.profile) { el.innerHTML = `<p class="muted">Couldn't load your profile.</p>`; return; }
     el.innerHTML = "";
-    for (const lv of state.profile.learnLevels) {
-      const div = document.createElement("div");
-      div.className = "list-item";
-      div.innerHTML = `<div><div>${lv.title}</div>
-        <div class="meta">${lv.category} ${lv.gas_kas ? "· " + lv.gas_kas + " KAS gas" : "· free"}</div></div>
-        <div class="actions"><span class="badge ${lv.unlocked ? "unlocked" : "locked"}">${lv.unlocked ? "unlocked" : "locked"}</span>
-          <button class="btn">${lv.unlocked ? "Open" : "Unlock"}</button></div>`;
-      div.querySelector("button").addEventListener("click", () => lv.unlocked ? openLevel(lv) : unlockLevel(lv));
-      el.appendChild(div);
+    for (const tier of state.profile.learnTiers) {
+      const levels = state.profile.learnLevels.filter((lv) => lv.tier === tier.key);
+      if (!levels.length) continue;
+      const done = levels.filter((lv) => lv.unlocked).length;
+      const head = document.createElement("div");
+      head.className = "tier-head";
+      head.innerHTML = `<div><div class="tier-label">${tier.label}</div>
+        <div class="meta">${tier.blurb}</div></div>
+        <span class="badge">${done}/${levels.length}</span>`;
+      el.appendChild(head);
+      for (const lv of levels) {
+        const div = document.createElement("div");
+        div.className = "list-item";
+        div.innerHTML = `<div><div>${lv.title}</div>
+          <div class="meta">${lv.summary} ${lv.gas_kas ? "· " + lv.gas_kas + " KAS gas" : "· free"}</div></div>
+          <div class="actions"><span class="badge ${lv.unlocked ? "unlocked" : "locked"}">${lv.unlocked ? "unlocked" : "locked"}</span>
+            <button class="btn">${lv.unlocked ? "Open" : "Unlock"}</button></div>`;
+        div.querySelector("button").addEventListener("click", () => lv.unlocked ? openLevel(lv) : unlockLevel(lv));
+        el.appendChild(div);
+      }
     }
   }
 
-  function openLevel(lv) {
-    document.getElementById("learnContentCard").style.display = "block";
+  async function openLevel(lv) {
+    const card = document.getElementById("learnContentCard");
+    card.style.display = "block";
     document.getElementById("learnContentTitle").textContent = lv.title;
-    document.getElementById("learnContentBody").innerHTML = LEARN_CONTENT[lv.id] || "<p>Content coming soon.</p>";
-    document.getElementById("learnContentCard").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const body = document.getElementById("learnContentBody");
+    body.innerHTML = `<p class="muted">Loading…</p>`;
+    card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    try {
+      const r = await api("GET", `/api/learn/levels/${lv.id}/content?address=${encodeURIComponent(state.address)}`);
+      body.innerHTML = r.body;
+    } catch (e) {
+      body.innerHTML = `<p class="muted">${e.message}</p>`;
+    }
   }
 
   async function unlockLevel(lv) {
@@ -542,6 +537,38 @@
     await refreshPracticeLegalMoves();
     renderPracticeBoard();
     document.getElementById("practiceStatus").textContent = "Your move — you're playing white.";
+  }
+
+  async function initPracticeLevels() {
+    const sel = document.getElementById("practiceLevel");
+    let levels, def;
+    try {
+      const r = await api("GET", "/api/practice/levels");
+      levels = r.levels; def = r.default;
+    } catch (e) { return; }
+    state.practiceLevels = levels;
+    // A saved level is only honoured if the backend still offers it.
+    const saved = localStorage.getItem("dagmate.practiceLevel");
+    state.practiceLevel = levels.some((l) => l.key === saved) ? saved : def;
+    sel.innerHTML = "";
+    for (const lv of levels) {
+      const opt = document.createElement("option");
+      opt.value = lv.key;
+      opt.textContent = lv.label;
+      sel.appendChild(opt);
+    }
+    sel.value = state.practiceLevel;
+    renderPracticeLevelBlurb();
+    sel.addEventListener("change", () => {
+      state.practiceLevel = sel.value;
+      localStorage.setItem("dagmate.practiceLevel", sel.value);
+      renderPracticeLevelBlurb();
+    });
+  }
+
+  function renderPracticeLevelBlurb() {
+    const lv = (state.practiceLevels || []).find((l) => l.key === state.practiceLevel);
+    document.getElementById("practiceLevelBlurb").textContent = lv ? lv.blurb : "";
   }
 
   async function refreshPracticeLegalMoves() {
@@ -587,7 +614,7 @@
         document.getElementById("practiceStatus").textContent = "Bot thinking…";
         setTimeout(async () => {
           try {
-            const r = await api("POST", "/api/practice/bot-move", { fen: state.practiceFen });
+            const r = await api("POST", "/api/practice/bot-move", { fen: state.practiceFen, level: state.practiceLevel });
             if (r.uci) { state.practiceFen = r.status.fen; updatePracticeStatus(r.status); }
           } catch (e) { toast(e.message); }
           state.practiceTurnLock = false;
@@ -630,5 +657,5 @@
   renderWalletBadge();
   restoreWallet();
   refreshTournaments();
-  practiceInit();
+  initPracticeLevels().then(practiceInit);
 })();
