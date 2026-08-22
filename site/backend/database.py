@@ -38,6 +38,27 @@ def ensure_schema():
           is_demo_wallet INTEGER NOT NULL DEFAULT 0,
           created_ts INTEGER NOT NULL)""")
 
+        # ── auth (auth.py) ────────────────────────────────────────────────
+        # A login challenge. `address` is stored WITH the nonce because the
+        # message a player signs is rebuilt server-side from this row and
+        # never taken from the request — otherwise a signature harvested over
+        # some other string could be replayed as a login.
+        c.execute("""CREATE TABLE IF NOT EXISTS auth_nonces (
+          nonce TEXT PRIMARY KEY,
+          address TEXT NOT NULL,
+          issued_ts INTEGER NOT NULL,
+          used_ts INTEGER)""")
+
+        # Sessions store a HASH of the token, never the token itself. Anything
+        # that can read this DB — a backup, a stray file copy, a query-shaped
+        # bug — would otherwise be handing out live logins for every player.
+        c.execute("""CREATE TABLE IF NOT EXISTS sessions (
+          token_hash TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL,
+          issued_ts INTEGER NOT NULL,
+          expires_ts INTEGER NOT NULL,
+          revoked_ts INTEGER)""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS challenges (
           id TEXT PRIMARY KEY,
           from_account_id TEXT NOT NULL,
@@ -145,8 +166,62 @@ def _rows(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+# ── auth: login nonces + sessions ────────────────────────────────────────
+def create_nonce(nonce: str, address: str, issued_ts: int):
+    with _lock, _conn() as c:
+        c.execute("INSERT INTO auth_nonces (nonce, address, issued_ts) VALUES (?,?,?)",
+                   (nonce, address, issued_ts))
+
+
+def consume_nonce(nonce: str, now_ts: int) -> dict | None:
+    """Claim a login challenge, once. The guarded UPDATE is the replay defence:
+    a signature stays valid forever, so the only thing stopping a captured
+    login from being replayed is that its nonce can be spent exactly once, and
+    `rowcount == 1` is what tells us THIS call is the one that spent it."""
+    with _lock, _conn() as c:
+        row = _row(c.execute("SELECT * FROM auth_nonces WHERE nonce=?", (nonce,)))
+        if not row:
+            return None
+        cur = c.execute("UPDATE auth_nonces SET used_ts=? WHERE nonce=? AND used_ts IS NULL",
+                        (now_ts, nonce))
+        return row if cur.rowcount == 1 else None
+
+
+def purge_nonces(before_ts: int):
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM auth_nonces WHERE issued_ts < ?", (before_ts,))
+
+
+def create_session(token_hash: str, account_id: str, issued_ts: int, expires_ts: int):
+    with _lock, _conn() as c:
+        c.execute("INSERT INTO sessions (token_hash, account_id, issued_ts, expires_ts) VALUES (?,?,?,?)",
+                   (token_hash, account_id, issued_ts, expires_ts))
+
+
+def account_for_session(token_hash: str, now_ts: int) -> dict | None:
+    """The account behind a session token, or None if there isn't a live one.
+    Expiry and revocation are enforced in the query rather than by the caller,
+    so no endpoint can forget to check them."""
+    with _lock, _conn() as c:
+        return _row(c.execute(
+            "SELECT a.* FROM sessions s JOIN accounts a ON a.id = s.account_id "
+            "WHERE s.token_hash=? AND s.revoked_ts IS NULL AND s.expires_ts > ?",
+            (token_hash, now_ts)))
+
+
+def revoke_session(token_hash: str, now_ts: int) -> bool:
+    with _lock, _conn() as c:
+        cur = c.execute("UPDATE sessions SET revoked_ts=? WHERE token_hash=? AND revoked_ts IS NULL",
+                        (now_ts, token_hash))
+        return cur.rowcount == 1
+
+
 # ── accounts ─────────────────────────────────────────────────────────────
 def get_or_create_account(address: str, pubkey: str | None = None, is_demo: bool = False) -> dict:
+    """⚠️ Only ever call this with a pubkey the sidecar has already proven
+    belongs to `address` (auth.verify). The stored pubkey is what escrows are
+    built from, so letting an unproven one in would let a stranger install
+    their own key on someone else's account."""
     with _lock, _conn() as c:
         row = _row(c.execute("SELECT * FROM accounts WHERE address=?", (address,)))
         if row:

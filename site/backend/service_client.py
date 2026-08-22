@@ -86,6 +86,26 @@ async def daa_score() -> int:
     return int((await _get("/escrow/daa"))["daaScore"])
 
 
+async def verify_message(*, address: str, pubkey: str, message: str, signature: str) -> dict:
+    """{"ok": bool, "reason": str} — did the holder of `address` sign `message`?
+
+    All the key maths lives on the sidecar (service/auth.js), including the
+    check that `pubkey` actually derives to `address`; this side only ever
+    sees a boolean, so there's no way for the backend to talk itself into
+    accepting a signature it shouldn't."""
+    return await _post("/auth/verify-message", {
+        "address": address, "pubkey": pubkey, "message": message, "signature": signature,
+    })
+
+
+async def demo_sign_message(*, private_key_hex: str, message: str) -> str:
+    """Local-testing-only: sign a login challenge with a demo-wallet key, so
+    the demo path goes THROUGH the real auth handshake rather than around it."""
+    return (await _post("/dev/sign-message", {
+        "privateKeyHex": private_key_hex, "message": message,
+    }))["signature"]
+
+
 async def generate_demo_keypair() -> dict:
     """Local-testing-only helper: a fresh throwaway Kaspa keypair, used as a
     stand-in wallet when no browser extension (Kasware/Kastle) is available

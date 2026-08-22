@@ -4,6 +4,13 @@
  * detected — e.g. this headless preview — it falls back to the backend's
  * dev-only demo wallet (POST /api/dev/demo-wallet), clearly labeled as such.
  * That fallback is NEVER part of the real signing/settlement path.
+ *
+ * Connecting is not the same as being signed in. Connecting only reveals an
+ * address, which is public anyway; every call that changes something carries
+ * a session token earned by SIGNING a server nonce with that wallet. So
+ * `state.address` is for display, and `state.session` is what the server
+ * actually believes — never send an address expecting it to be treated as
+ * identity, because the backend now ignores it (see site/backend/auth.py).
  */
 (() => {
   "use strict";
@@ -18,9 +25,10 @@
 
   const state = {
     address: null,
-    pubkey: null,
     knsName: null,
     isDemoWallet: false,
+    // The proof, not the claim. Everything that changes state needs this.
+    session: null,
     profile: null,
     currentMatchId: null,
     currentMatch: null,
@@ -45,6 +53,7 @@
   // ── tiny helpers ─────────────────────────────────────────────────────
   async function api(method, path, body) {
     const opts = { method, headers: {} };
+    if (state.session) opts.headers["Authorization"] = `Bearer ${state.session}`;
     if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
@@ -52,6 +61,10 @@
     const r = await fetch(path, opts);
     let data = null;
     try { data = await r.json(); } catch (_) { /* no body */ }
+    // A dead session looks identical to never having signed in, so treat it
+    // that way rather than leaving the UI showing a wallet the server has
+    // stopped recognising.
+    if (r.status === 401 && state.session) forgetSession();
     if (!r.ok) throw new Error((data && data.detail) || r.statusText);
     return data;
   }
@@ -175,34 +188,55 @@
     document.getElementById("disconnectBtn").addEventListener("click", disconnectWallet);
   }
 
-  async function setWallet(address, pubkey, isDemo) {
+  /* Sign in: prove the wallet is ours by signing a one-time server nonce.
+   *
+   * `signMessage` (rather than signing a transaction) is what both Kasware
+   * and Kastle expose, and it's the honest thing to ask for — the popup says
+   * a message is being signed, and the message itself says in plain words
+   * that nothing is being spent. A login that asked players to sign a
+   * transaction would be teaching them a habit that gets them robbed
+   * somewhere else.
+   */
+  async function signIn(address, pubkey, isDemo, sign) {
+    const challenge = await api("POST", "/api/auth/nonce", { address });
+    const signature = await sign(challenge.message);
+    const r = await api("POST", "/api/auth/verify",
+                        { address, pubkey, nonce: challenge.nonce, signature });
+    state.session = r.token;
     state.address = address;
-    state.pubkey = pubkey || null;
     state.isDemoWallet = isDemo;
-    localStorage.setItem("dagmate_address", address);
-    if (pubkey) localStorage.setItem("dagmate_pubkey", pubkey); else localStorage.removeItem("dagmate_pubkey");
+    state.knsName = (r.account && r.account.knsName) || null;
+    localStorage.setItem("dagmate_session", r.token);
     localStorage.setItem("dagmate_demo", isDemo ? "1" : "0");
-    const acct = await api("POST", "/api/wallet/connect", { address, pubkey });
-    state.knsName = acct.knsName || null;
     renderWalletBadge();
     await refreshProfile();
     refreshAll();
   }
 
-  function disconnectWallet() {
+  /** Drop local sign-in state without telling the server (it already
+   *  disagrees, or we're tearing down after a 401). */
+  function forgetSession() {
+    state.session = null;
     state.address = null;
-    state.pubkey = null;
     state.isDemoWallet = false;
     state.currentMatchId = null;
     state.currentMatch = null;
-    localStorage.removeItem("dagmate_address");
-    localStorage.removeItem("dagmate_pubkey");
+    state.settle = null;
+    state.settleFor = null;
+    localStorage.removeItem("dagmate_session");
     localStorage.removeItem("dagmate_demo");
+    localStorage.removeItem("dagmate_demo_key");
     renderWalletBadge();
     document.getElementById("boardCard").style.display = "none";
     document.getElementById("challengeList").innerHTML = `<p class="muted">Connect a wallet to see challenges.</p>`;
     document.getElementById("matchList").innerHTML = `<p class="muted">Connect a wallet to see your matches.</p>`;
     document.getElementById("learnList").innerHTML = `<p class="muted">Connect a wallet to see learn levels.</p>`;
+  }
+
+  function disconnectWallet() {
+    // Revoke server-side too, so a copied token doesn't outlive the click.
+    api("POST", "/api/auth/logout").catch(() => {});
+    forgetSession();
   }
 
   async function connectWallet() {
@@ -212,70 +246,82 @@
         const accounts = await provider.requestAccounts();
         const address = accounts && accounts[0];
         if (!address) throw new Error("no account returned");
-        let pubkey = null;
-        if (typeof provider.getPublicKey === "function") {
-          try { pubkey = await provider.getPublicKey(); } catch (_) { /* not all wallets expose this */ }
+        if (typeof provider.getPublicKey !== "function") {
+          throw new Error("this wallet doesn't expose its public key, which DAGmate needs to build your escrow");
         }
-        await setWallet(address, pubkey, false);
-        toast(pubkey ? "Wallet connected." : "Wallet connected — no pubkey exposed, escrow-building will be skipped.");
+        const pubkey = await provider.getPublicKey();
+        if (typeof provider.signMessage !== "function") {
+          throw new Error("this wallet can't sign messages, so it can't prove the address is yours");
+        }
+        await signIn(address, pubkey, false, (msg) => provider.signMessage(msg));
+        toast("Signed in.");
       } catch (e) {
-        toast(`Wallet connect failed: ${e.message}`);
+        toast(`Sign-in failed: ${e.message}`);
       }
       return;
     }
     toast("No Kasware/Kastle extension detected — using a local demo wallet for testing.");
     try {
       const kp = await api("POST", "/api/dev/demo-wallet");
-      await setWallet(kp.address, kp.pubkey, true);
+      // Note this goes through the identical handshake — the demo wallet is a
+      // stand-in for the extension, not a way around the login.
+      localStorage.setItem("dagmate_demo_key", kp.privateKeyHex);
+      await signIn(kp.address, kp.pubkey, true, async (msg) => {
+        const r = await api("POST", "/api/dev/demo-sign",
+                            { privateKeyHex: kp.privateKeyHex, message: msg });
+        return r.signature;
+      });
     } catch (e) {
       toast(`Couldn't create a demo wallet: ${e.message}`);
     }
   }
 
   async function restoreWallet() {
-    const address = localStorage.getItem("dagmate_address");
-    if (!address) { renderWalletBadge(); return; }
-    const pubkey = localStorage.getItem("dagmate_pubkey");
-    const isDemo = localStorage.getItem("dagmate_demo") === "1";
+    const token = localStorage.getItem("dagmate_session");
+    if (!token) { renderWalletBadge(); return; }
+    state.session = token;
+    state.isDemoWallet = localStorage.getItem("dagmate_demo") === "1";
     try {
-      const acct = await api("POST", "/api/wallet/connect", { address, pubkey });
-      state.address = address;
-      state.pubkey = pubkey;
-      state.isDemoWallet = isDemo;
-      state.knsName = acct.knsName || null;
+      // The session itself is the source of truth for who we are — the
+      // address is read back from the server rather than trusted from
+      // localStorage, so an edited value can't mislabel the UI.
+      const p = await api("GET", "/api/profile");
+      state.address = p.address;
+      state.knsName = p.knsName || null;
+      state.profile = p;
       renderWalletBadge();
-      await refreshProfile();
+      document.getElementById("acceptChallengesToggle").checked = p.acceptChallenges;
       refreshAll();
     } catch (e) {
-      renderWalletBadge();
+      forgetSession();
     }
   }
 
   async function refreshProfile() {
-    if (!state.address) return;
+    if (!state.session) return;
     try {
-      state.profile = await api("GET", `/api/profile?address=${encodeURIComponent(state.address)}`);
+      state.profile = await api("GET", "/api/profile");
       document.getElementById("acceptChallengesToggle").checked = state.profile.acceptChallenges;
     } catch (e) { /* not fatal */ }
   }
 
   document.getElementById("acceptChallengesToggle").addEventListener("change", async (e) => {
-    if (!state.address) { e.target.checked = false; toast("Connect a wallet first."); return; }
+    if (!state.session) { e.target.checked = false; toast("Connect a wallet first."); return; }
     try {
-      await api("POST", "/api/profile/accept-challenges", { address: state.address, enabled: e.target.checked });
+      await api("POST", "/api/profile/accept-challenges", { enabled: e.target.checked });
     } catch (err) { toast(err.message); }
   });
 
   // ── challenges ───────────────────────────────────────────────────────
   document.getElementById("challengeForm").addEventListener("submit", async (e) => {
     e.preventDefault();
-    if (!state.address) { toast("Connect a wallet first."); return; }
+    if (!state.session) { toast("Connect a wallet first."); return; }
     const toAddress = document.getElementById("chOpponent").value.trim() || null;
     const gasOnly = document.getElementById("chGasOnly").checked;
     const stakeKas = gasOnly ? 0 : parseFloat(document.getElementById("chStake").value || "0");
     const mode = document.getElementById("chMode").value;
     try {
-      await api("POST", "/api/challenges", { fromAddress: state.address, toAddress, stakeKas, mode, gasOnly });
+      await api("POST", "/api/challenges", { toAddress, stakeKas, mode, gasOnly });
       toast("Challenge created.");
       e.target.reset();
       document.getElementById("chStake").value = 1;
@@ -285,9 +331,9 @@
 
   async function refreshChallenges() {
     const el = document.getElementById("challengeList");
-    if (!state.address) { el.innerHTML = `<p class="muted">Connect a wallet to see challenges.</p>`; return; }
+    if (!state.session) { el.innerHTML = `<p class="muted">Connect a wallet to see challenges.</p>`; return; }
     let list;
-    try { list = await api("GET", `/api/challenges?address=${encodeURIComponent(state.address)}`); }
+    try { list = await api("GET", "/api/challenges"); }
     catch (e) { el.innerHTML = `<p class="muted">${e.message}</p>`; return; }
     if (!list.length) { el.innerHTML = `<p class="muted">No open challenges right now.</p>`; return; }
     el.innerHTML = "";
@@ -319,11 +365,11 @@
   }
 
   async function acceptChallenge(id) {
-    if (!state.pubkey) {
+    if (state.profile && !state.profile.hasPubkey) {
       toast("This wallet has no pubkey on file — escrow can't be built. Use a demo wallet for local testing.");
     }
     try {
-      const match = await api("POST", `/api/challenges/${id}/accept`, { address: state.address, pubkey: state.pubkey });
+      const match = await api("POST", `/api/challenges/${id}/accept`);
       toast("Challenge accepted — match created.");
       refreshChallenges();
       refreshMatches();
@@ -339,9 +385,9 @@
   // ── matches ──────────────────────────────────────────────────────────
   async function refreshMatches() {
     const el = document.getElementById("matchList");
-    if (!state.address) { el.innerHTML = `<p class="muted">Connect a wallet to see your matches.</p>`; return; }
+    if (!state.session) { el.innerHTML = `<p class="muted">Connect a wallet to see your matches.</p>`; return; }
     let list;
-    try { list = await api("GET", `/api/matches?address=${encodeURIComponent(state.address)}`); }
+    try { list = await api("GET", "/api/matches"); }
     catch (e) { el.innerHTML = `<p class="muted">${e.message}</p>`; return; }
     if (!list.length) { el.innerHTML = `<p class="muted">No matches yet — create or accept a challenge.</p>`; return; }
     el.innerHTML = "";
@@ -467,7 +513,7 @@
       state.settleFor = m.id;
       state.settle = null;
       el.innerHTML = `<div class="claim-title">Checking the pot…</div>`;
-      api("POST", `/api/matches/${m.id}/settle/prepare`, { address: state.address })
+      api("POST", `/api/matches/${m.id}/settle/prepare`)
         .then((s) => { if (state.settleFor === m.id) { state.settle = s; renderClaim(m); } })
         .catch((e) => { el.innerHTML = `<div class="claim-title">Payout</div>
           <div class="claim-note">${e.message}</div>`; });
@@ -522,7 +568,7 @@
     }
     try {
       state.settle = await api("POST", `/api/matches/${m.id}/settle/submit`,
-                               { address: state.address, sigs });
+                               { sigs });
       renderClaim(m);
       toast(state.settle.txid ? "Payout broadcast." : "Signed — waiting on your opponent.");
     } catch (e) {
@@ -598,7 +644,7 @@
 
   async function submitMove(uci) {
     try {
-      const m = await api("POST", `/api/matches/${state.currentMatchId}/move`, { address: state.address, uci });
+      const m = await api("POST", `/api/matches/${state.currentMatchId}/move`, { uci });
       state.currentMatch = m;
       renderMatchCard();
       refreshMatches();
@@ -608,7 +654,7 @@
   document.getElementById("resignBtn").addEventListener("click", async () => {
     if (!state.currentMatchId) return;
     try {
-      const m = await api("POST", `/api/matches/${state.currentMatchId}/resign`, { address: state.address });
+      const m = await api("POST", `/api/matches/${state.currentMatchId}/resign`);
       state.currentMatch = m;
       renderMatchCard();
       refreshMatches();
@@ -644,9 +690,9 @@
   }
 
   async function joinTournament(tierKas) {
-    if (!state.address) { toast("Connect a wallet first."); return; }
+    if (!state.session) { toast("Connect a wallet first."); return; }
     try {
-      const r = await api("POST", `/api/tournaments/${tierKas}/join`, { address: state.address });
+      const r = await api("POST", `/api/tournaments/${tierKas}/join`);
       toast(r.alreadyJoined ? "Already in this lobby." : r.started ? "Lobby full — tournament started!" : "Joined lobby.");
       refreshTournaments();
       if (r.started) refreshMatches();
@@ -659,7 +705,7 @@
   async function refreshLearn() {
     const el = document.getElementById("learnList");
     document.getElementById("learnContentCard").style.display = "none";
-    if (!state.address) { el.innerHTML = `<p class="muted">Connect a wallet to see learn levels.</p>`; return; }
+    if (!state.session) { el.innerHTML = `<p class="muted">Connect a wallet to see learn levels.</p>`; return; }
     await refreshProfile();
     if (!state.profile) { el.innerHTML = `<p class="muted">Couldn't load your profile.</p>`; return; }
     el.innerHTML = "";
@@ -694,7 +740,7 @@
     body.innerHTML = `<p class="muted">Loading…</p>`;
     card.scrollIntoView({ behavior: "smooth", block: "nearest" });
     try {
-      const r = await api("GET", `/api/learn/levels/${lv.id}/content?address=${encodeURIComponent(state.address)}`);
+      const r = await api("GET", `/api/learn/levels/${lv.id}/content`);
       body.innerHTML = r.body;
     } catch (e) {
       body.innerHTML = `<p class="muted">${e.message}</p>`;
@@ -703,7 +749,7 @@
 
   async function unlockLevel(lv) {
     try {
-      await api("POST", `/api/learn/levels/${lv.id}/unlock`, { address: state.address });
+      await api("POST", `/api/learn/levels/${lv.id}/unlock`);
       toast(lv.gas_kas ? `Unlocked (${lv.gas_kas} KAS gas — recorded, not yet chain-verified in this test build).` : "Unlocked.");
       await refreshLearn();
     } catch (e) { toast(e.message); }
@@ -827,7 +873,7 @@
   }
 
   setInterval(() => {
-    if (!state.address) return;
+    if (!state.session) return;
     refreshChallenges();
     refreshMatches();
     if (state.currentMatchId) refreshCurrentMatch();

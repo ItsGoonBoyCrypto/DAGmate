@@ -33,6 +33,23 @@ RAKE_BPS = int(os.getenv("DAGMATE_RAKE_BPS", "0"))
 # CLTV reclaim window: ~14 days of DAA at Kaspa's ~10 blocks/sec cadence.
 RECLAIM_DAA_WINDOW = 14 * 24 * 3600 * 10
 
+# ── auth (auth.py) ──────────────────────────────────────────────────────
+# Connecting a wallet is a CLAIM; signing a nonce with it is the proof. Until
+# this landed, every endpoint took the caller's word for which address they
+# were, which meant anyone could resign (and so lose) anyone else's match by
+# reading their address off the public match view.
+#
+# Short nonce TTL: the window in which a captured login challenge is worth
+# anything at all. Single-use is the real defence (database.consume_nonce);
+# this just keeps the table small and the blast radius short.
+AUTH_NONCE_TTL_SECS = int(os.getenv("DAGMATE_AUTH_NONCE_TTL_SECS", "300"))
+# Session lifetime. Long enough that a `daily` match (3d+12h) doesn't log you
+# out mid-game, short enough that a stolen token isn't a permanent key.
+AUTH_SESSION_TTL_SECS = int(os.getenv("DAGMATE_AUTH_SESSION_TTL_SECS", str(14 * 24 * 3600)))
+# Shown in the message the wallet asks the player to sign, so the popup names
+# who is asking. Set this to the real host in deployment.
+AUTH_DOMAIN = os.getenv("DAGMATE_AUTH_DOMAIN", "dagmate.org")
+
 # ── deposit watcher (deposits.py) ───────────────────────────────────────
 # The loop that flips a match awaiting_deposit -> live by looking at what's
 # actually on chain. Money-critical, so the defaults are conservative.

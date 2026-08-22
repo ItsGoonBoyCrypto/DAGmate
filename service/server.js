@@ -13,6 +13,7 @@ import { randomBytes } from 'node:crypto';
 import express from 'express';
 import * as escrow from './escrow.js';
 import * as core from './core.js';
+import * as auth from './auth.js';
 
 const PORT = Number(process.env.DAGMATE_SERVICE_PORT || 8910);
 const HOST = process.env.DAGMATE_SERVICE_HOST || '127.0.0.1';
@@ -52,6 +53,12 @@ app.post('/escrow/anchor', wrap((req) => escrow.anchor(req.body)));
 
 app.get('/escrow/daa', wrap(() => escrow.daaScore()));
 
+// Wallet-ownership proof. Always 200 with {ok:false, reason} on a failed
+// check rather than an error status — a rejected login is a normal outcome
+// here, and the backend shouldn't have to tell "you didn't prove it" apart
+// from "the sidecar is broken".
+app.post('/auth/verify-message', wrap((req) => auth.verifyOwnership(req.body)));
+
 app.get('/health', (req, res) => res.json({ ok: true, network: process.env.DAGMATE_NETWORK_ID || 'mainnet' }));
 
 if (DEV_ROUTES) {
@@ -66,6 +73,11 @@ if (DEV_ROUTES) {
     const xo = pub.toXOnlyPublicKey ? pub.toXOnlyPublicKey() : pub;
     return { address, pubkey: String(xo.toString()).replace(/^0x/, ''), privateKeyHex: key.toString() };
   }));
+
+  // Lets the demo wallet answer a login challenge, so local testing exercises
+  // the real auth path instead of a bypass around it — a login flow that only
+  // ever runs in production is a login flow nobody has tested.
+  app.post('/dev/sign-message', wrap((req) => auth.signWithDemoKey(req.body)));
 }
 
 app.listen(PORT, HOST, () => {

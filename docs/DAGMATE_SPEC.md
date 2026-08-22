@@ -84,6 +84,47 @@ Telegram bot (dagmate/bot)       — alerts only: challenge received, your
 Chain: Kaspa mainnet.
 ```
 
+### 1.1 Identity — who the backend believes you are
+
+A Kaspa address is public; it is printed on the match view. So an address in a
+request body proves nothing, and treating one as identity made a funded match
+takeable with no cryptography at all: challenge someone, wait for both stakes
+to land, then `POST /resign` naming *their* address. Settlement would then
+quite legitimately pay the attacker. The escrow signatures were never the weak
+part — the game **result** was.
+
+Identity is therefore a signature, not a string:
+
+1. `POST /api/auth/nonce {address}` → a single-use nonce and the exact text to
+   sign.
+2. The wallet signs that text (`signMessage`, supported by Kasware and Kastle).
+   Deliberately **not** `signPskt` — a login that asks players to sign a
+   transaction teaches a habit that gets them robbed on some other site.
+3. `POST /api/auth/verify {address, pubkey, nonce, signature}` → the sidecar
+   checks it, and we return a session token.
+4. Every mutating endpoint takes its account from that token via
+   `Depends(require_account)` and **ignores any address in the body**.
+
+Three properties carry the weight:
+
+- **The signed message is rebuilt server-side** from the stored nonce row,
+  never accepted from the client. Otherwise any signature that player had ever
+  produced anywhere could be replayed as a login.
+- **The nonce is single-use**, via a guarded `UPDATE ... WHERE used_ts IS NULL`.
+  A signature stays valid forever, so this is the entire replay defence.
+- **The pubkey must derive to the claimed address**, enforced in
+  `service/auth.js` where the key maths lives. A signature alone proves
+  *somebody* signed; the address derivation is what makes it proof of *who*.
+
+Session tokens are random and stored only as a SHA-256 hash, so read access to
+the DB doesn't hand out live logins. Expiry and revocation are enforced inside
+the lookup query, so no endpoint can forget to check them.
+
+The stored pubkey matters beyond login: it is what escrows are built from.
+`get_or_create_account` is reachable only from the verify path, after the
+sidecar has proven the key belongs to the address — otherwise an attacker
+could repoint a victim's account at their own key.
+
 ---
 
 ## 2. Escrow design (the on-chain part)

@@ -4,6 +4,14 @@ service/ (Node, Kaspa sidecar) for escrow addresses and to bot/ (Telegram
 alerts) best-effort. Serves the static frontend too, so `uvicorn main:app`
 is the one process to run locally.
 
+WHO THE CALLER IS: every mutating endpoint resolves its account from a
+session token (auth.py), never from an address in the request body. An
+address is public — it's printed on the match view — so trusting one meant
+anyone could POST /resign as anyone and walk off with the pot. If you add an
+endpoint that changes state or reveals a player's own data, take
+`account: dict = Depends(require_account)` and use that; there is no
+supported way to name a different player.
+
 Known, deliberate gaps in this pass (see docs/DAGMATE_SPEC.md and the
 project memory for the full picture) — flagged here rather than silently
 faked:
@@ -14,7 +22,9 @@ faked:
   - Settlement is wired (settlement.py) but its signature round-trip has never
     run against a real wallet extension — `signPskt()` needs Kasware/Kastle,
     which a headless preview doesn't have. The orchestration is unit-tested;
-    the signatures themselves are not yet proven end-to-end.
+    the signatures themselves are not yet proven end-to-end. The same is true
+    of the login signature: `signMessage()` is verified against Kaspa's own
+    WASM implementation, but not yet against a real extension's output.
   - Learn-level gas payments are recorded optimistically, not yet verified
     against a real on-chain payment.
 """
@@ -25,10 +35,11 @@ import logging
 import os
 import random
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import auth
 import bot_client
 import chess_logic
 import clocks
@@ -67,14 +78,37 @@ def _account_public(a: dict) -> dict:
         "id": a["id"], "address": a["address"], "shortAddress": _short(a["address"]),
         "knsName": kns.primary_name(a["address"]),
         "acceptChallenges": bool(a["accept_challenges"]), "isDemoWallet": bool(a["is_demo_wallet"]),
+        # Whether an escrow can be built for this player at all. The key
+        # itself never leaves the server — the UI only needs to know if it's
+        # there, and a pubkey is one lookup away from a balance.
+        "hasPubkey": bool(a["pubkey"]),
     }
 
 
-def _get_account_or_404(address: str) -> dict:
-    a = db.get_account_by_address(address)
+# ── who's calling ───────────────────────────────────────────────────────
+def _token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    return token.strip() if scheme.lower() == "bearer" and token.strip() else None
+
+
+def require_account(authorization: str | None = Header(default=None)) -> dict:
+    """The caller's account, proven by a wallet signature (see auth.py).
+
+    Use this on ANYTHING that changes state or returns a player's own data.
+    It is the only supported way to learn who is calling — no endpoint should
+    ever take an address from the request and treat it as identity."""
+    a = auth.account_for_token(_token(authorization))
     if not a:
-        raise HTTPException(404, "no account for this address — connect a wallet first")
+        raise HTTPException(401, "connect and sign in with your wallet")
     return a
+
+
+def optional_account(authorization: str | None = Header(default=None)) -> dict | None:
+    """For reads that are richer when signed in but fine when not (the open
+    challenge board). Never gates a write."""
+    return auth.account_for_token(_token(authorization))
 
 
 async def _reclaim_daa() -> tuple[int, str]:
@@ -135,42 +169,70 @@ def _match_public(m: dict) -> dict:
     }
 
 
-# ── wallet / profile ────────────────────────────────────────────────────
-class ConnectBody(BaseModel):
+# ── auth ─────────────────────────────────────────────────────────────────
+# There is deliberately no "connect" endpoint that takes an address and
+# creates an account from it. Accounts are created by /api/auth/verify and
+# nowhere else, because the stored pubkey is what escrows are built from: an
+# unproven one would let a stranger install their own key on someone else's
+# account before that player ever showed up.
+class NonceBody(BaseModel):
     address: str
-    pubkey: str | None = None
 
 
-@app.post("/api/wallet/connect")
-def wallet_connect(body: ConnectBody):
-    a = db.get_or_create_account(body.address, body.pubkey)
-    return _account_public(a)
+@app.post("/api/auth/nonce")
+def auth_nonce(body: NonceBody):
+    """Hand out a single-use login challenge and the exact text to sign."""
+    try:
+        return auth.issue_nonce(body.address)
+    except auth.AuthError as e:
+        raise HTTPException(400, str(e))
 
 
+class VerifyBody(BaseModel):
+    address: str
+    pubkey: str
+    nonce: str
+    signature: str
+
+
+@app.post("/api/auth/verify")
+async def auth_verify(body: VerifyBody):
+    try:
+        r = await auth.verify(address=body.address, pubkey=body.pubkey,
+                              nonce=body.nonce, signature=body.signature)
+    except auth.AuthError as e:
+        raise HTTPException(401, str(e))
+    except ServiceError as e:
+        raise HTTPException(503, f"Kaspa service unavailable: {e}")
+    return {**r["session"], "account": _account_public(r["account"])}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(authorization: str | None = Header(default=None)):
+    return {"ok": auth.logout(_token(authorization))}
+
+
+# ── profile ──────────────────────────────────────────────────────────────
 @app.get("/api/profile")
-def get_profile(address: str):
-    a = _get_account_or_404(address)
-    unlocked = db.unlocked_levels(a["id"])
+def get_profile(account: dict = Depends(require_account)):
+    unlocked = db.unlocked_levels(account["id"])
     levels = [{**lv, "unlocked": lv["gas_kas"] == 0 or lv["id"] in unlocked}
               for lv in config.LEARN_LEVELS]
-    return {**_account_public(a), "learnTiers": config.LEARN_TIERS, "learnLevels": levels}
+    return {**_account_public(account), "learnTiers": config.LEARN_TIERS, "learnLevels": levels}
 
 
 class AcceptTogglBody(BaseModel):
-    address: str
     enabled: bool
 
 
 @app.post("/api/profile/accept-challenges")
-def set_accept_challenges(body: AcceptTogglBody):
-    a = _get_account_or_404(body.address)
-    db.set_accept_challenges(a["id"], body.enabled)
+def set_accept_challenges(body: AcceptTogglBody, account: dict = Depends(require_account)):
+    db.set_accept_challenges(account["id"], body.enabled)
     return {"ok": True}
 
 
 # ── challenges ───────────────────────────────────────────────────────────
 class NewChallengeBody(BaseModel):
-    fromAddress: str
     toAddress: str | None = None
     stakeKas: float = 0
     mode: str = "rapid"
@@ -178,42 +240,35 @@ class NewChallengeBody(BaseModel):
 
 
 @app.post("/api/challenges")
-def new_challenge(body: NewChallengeBody):
+def new_challenge(body: NewChallengeBody, account: dict = Depends(require_account)):
     if body.mode not in ("rapid", "daily"):
         raise HTTPException(400, "mode must be 'rapid' or 'daily'")
-    frm = _get_account_or_404(body.fromAddress)
+    stake_sompi = config.GAS_ONLY_STAKE_SOMPI if body.gasOnly else round(body.stakeKas * config.SOMPI_PER_KAS)
+    if stake_sompi <= 0:
+        raise HTTPException(400, "stake must be above zero (or tick gas-only)")
     to_id = None
     if body.toAddress:
         to = db.get_account_by_address(body.toAddress)
         if to:
+            if to["id"] == account["id"]:
+                raise HTTPException(400, "you can't challenge yourself")
             if not to["accept_challenges"]:
                 raise HTTPException(400, "that player isn't accepting challenges right now")
             to_id = to["id"]
-    stake_sompi = config.GAS_ONLY_STAKE_SOMPI if body.gasOnly else round(body.stakeKas * config.SOMPI_PER_KAS)
-    c = db.create_challenge(frm["id"], to_id, stake_sompi, body.mode, body.gasOnly)
+    c = db.create_challenge(account["id"], to_id, stake_sompi, body.mode, body.gasOnly)
     return _challenge_public(c)
 
 
 @app.get("/api/challenges")
-def list_challenges(address: str | None = None):
-    account_id = None
-    if address:
-        a = db.get_account_by_address(address)
-        account_id = a["id"] if a else None
-    return [_challenge_public(c) for c in db.list_open_challenges(account_id)]
-
-
-class AcceptChallengeBody(BaseModel):
-    address: str
-    pubkey: str | None = None
+def list_challenges(account: dict | None = Depends(optional_account)):
+    return [_challenge_public(c) for c in db.list_open_challenges(account["id"] if account else None)]
 
 
 @app.post("/api/challenges/{challenge_id}/accept")
-async def accept_challenge(challenge_id: str, body: AcceptChallengeBody):
+async def accept_challenge(challenge_id: str, accepter: dict = Depends(require_account)):
     ch = db.get_challenge(challenge_id)
     if not ch or ch["status"] != "open":
         raise HTTPException(404, "challenge not found or no longer open")
-    accepter = db.get_or_create_account(body.address, body.pubkey)
     if ch["to_account_id"] and ch["to_account_id"] != accepter["id"]:
         raise HTTPException(403, "this challenge isn't addressed to you")
     if accepter["id"] == ch["from_account_id"]:
@@ -238,10 +293,15 @@ async def accept_challenge(challenge_id: str, body: AcceptChallengeBody):
 
 
 @app.post("/api/challenges/{challenge_id}/decline")
-def decline_challenge(challenge_id: str):
+def decline_challenge(challenge_id: str, account: dict = Depends(require_account)):
+    """Only the two people it concerns can kill a challenge — the player it
+    was sent to (declining) or the one who sent it (withdrawing). Without that
+    check any passer-by could cancel every open challenge on the board."""
     ch = db.get_challenge(challenge_id)
     if not ch:
         raise HTTPException(404, "not found")
+    if account["id"] not in (ch["from_account_id"], ch["to_account_id"]):
+        raise HTTPException(403, "that challenge isn't yours to decline")
     db.set_challenge_status(challenge_id, "declined")
     return {"ok": True}
 
@@ -269,9 +329,8 @@ async def _create_match_from_pair(*, challenge_id, tournament_id, round_no, play
 
 # ── matches ──────────────────────────────────────────────────────────────
 @app.get("/api/matches")
-def list_matches(address: str):
-    a = _get_account_or_404(address)
-    return [_match_public(m) for m in db.list_matches_for_account(a["id"])]
+def list_matches(account: dict = Depends(require_account)):
+    return [_match_public(m) for m in db.list_matches_for_account(account["id"])]
 
 
 @app.get("/api/matches/{match_id}")
@@ -301,16 +360,14 @@ def dev_mark_funded(match_id: str):
 
 
 class MoveBody(BaseModel):
-    address: str
     uci: str
 
 
 @app.post("/api/matches/{match_id}/move")
-async def make_move(match_id: str, body: MoveBody):
+async def make_move(match_id: str, body: MoveBody, a: dict = Depends(require_account)):
     m = db.get_match(match_id)
     if not m or m["status"] != "live":
         raise HTTPException(400, "match isn't live")
-    a = _get_account_or_404(body.address)
     is_a = a["id"] == m["player_a_account_id"]
     is_b = a["id"] == m["player_b_account_id"]
     if not (is_a or is_b):
@@ -353,16 +410,14 @@ async def make_move(match_id: str, body: MoveBody):
     return out
 
 
-class ResignBody(BaseModel):
-    address: str
-
-
 @app.post("/api/matches/{match_id}/resign")
-async def resign(match_id: str, body: ResignBody):
+async def resign(match_id: str, a: dict = Depends(require_account)):
+    """The single most abusable endpoint on the site — resigning hands the
+    pot to the other player, so it MUST be the resigning player who called it.
+    That's why identity comes from a signed session and not from the body."""
     m = db.get_match(match_id)
     if not m or m["status"] != "live":
         raise HTTPException(400, "match isn't live")
-    a = _get_account_or_404(body.address)
     is_a = a["id"] == m["player_a_account_id"]
     is_b = a["id"] == m["player_b_account_id"]
     if not (is_a or is_b):
@@ -396,16 +451,12 @@ async def _settle_game_over(match_id: str, result: str, winner_color: str | None
 
 
 # ── settlement ───────────────────────────────────────────────────────────
-class SettlePrepareBody(BaseModel):
-    address: str
-
-
 @app.post("/api/matches/{match_id}/settle/prepare")
-async def settle_prepare(match_id: str, body: SettlePrepareBody):
+async def settle_prepare(match_id: str, account: dict = Depends(require_account)):
     """Build (once) the tx that releases the pot, and say what this player
     still has to sign. Both players may call this — on a draw they both must."""
     try:
-        return await settlement.prepare(match_id, body.address)
+        return await settlement.prepare(match_id, account["address"])
     except settlement.SettlementError as e:
         raise HTTPException(400, str(e))
     except ServiceError as e:
@@ -413,14 +464,14 @@ async def settle_prepare(match_id: str, body: SettlePrepareBody):
 
 
 class SettleSubmitBody(BaseModel):
-    address: str
     # {input index: signature}. JSON object keys are strings, so this is typed
     # as such and converted below rather than silently dropping entries.
     sigs: dict[str, str]
 
 
 @app.post("/api/matches/{match_id}/settle/submit")
-async def settle_submit(match_id: str, body: SettleSubmitBody):
+async def settle_submit(match_id: str, body: SettleSubmitBody,
+                        account: dict = Depends(require_account)):
     try:
         sigs = {int(k): v for k, v in body.sigs.items()}
     except ValueError:
@@ -428,7 +479,7 @@ async def settle_submit(match_id: str, body: SettleSubmitBody):
     if not sigs:
         raise HTTPException(400, "no signatures supplied")
     try:
-        return await settlement.submit(match_id, body.address, sigs)
+        return await settlement.submit(match_id, account["address"], sigs)
     except settlement.SettlementError as e:
         raise HTTPException(400, str(e))
     except ServiceError as e:
@@ -450,15 +501,10 @@ def list_tournaments():
     return out
 
 
-class JoinTournamentBody(BaseModel):
-    address: str
-
-
 @app.post("/api/tournaments/{tier_kas}/join")
-async def join_tournament(tier_kas: int, body: JoinTournamentBody):
+async def join_tournament(tier_kas: int, a: dict = Depends(require_account)):
     if tier_kas not in config.TOURNAMENT_TIERS_KAS:
         raise HTTPException(400, "unknown tier")
-    a = _get_account_or_404(body.address)
     if not a["pubkey"]:
         raise HTTPException(400, "connect a wallet with a pubkey before joining a tournament")
     t = db.get_or_create_open_tournament(tier_kas)
@@ -494,19 +540,14 @@ async def _start_tournament(tournament_id: str) -> bool:
 
 
 # ── learn ────────────────────────────────────────────────────────────────
-class UnlockLevelBody(BaseModel):
-    address: str
-
-
 @app.post("/api/learn/levels/{level_id}/unlock")
-def unlock_level(level_id: str, body: UnlockLevelBody):
+def unlock_level(level_id: str, account: dict = Depends(require_account)):
     level = next((lv for lv in config.LEARN_LEVELS if lv["id"] == level_id), None)
     if not level:
         raise HTTPException(404, "unknown level")
-    a = _get_account_or_404(body.address)
     # Real flow: verify a matching on-chain gas payment to the operating
     # address before unlocking (see module docstring — not yet wired).
-    db.unlock_level(a["id"], level_id)
+    db.unlock_level(account["id"], level_id)
     return {"ok": True}
 
 
@@ -517,11 +558,13 @@ def learn_levels():
 
 
 @app.get("/api/learn/levels/{level_id}/content")
-def learn_level_content(level_id: str, address: str):
+def learn_level_content(level_id: str, account: dict = Depends(require_account)):
     """The paywall. Level bodies live server-side and only leave through here,
-    so a locked level is genuinely unreadable rather than just hidden in the UI."""
-    a = _get_account_or_404(address)
-    unlocked = curriculum.gas_for(level_id) == 0 or level_id in db.unlocked_levels(a["id"])
+    so a locked level is genuinely unreadable rather than just hidden in the UI.
+
+    Session-scoped, not address-scoped: when this took an `address` query
+    param, reading a paid level was a matter of naming anyone who'd bought it."""
+    unlocked = curriculum.gas_for(level_id) == 0 or level_id in db.unlocked_levels(account["id"])
     body = curriculum.content_for(level_id, unlocked)
     if body is None:
         if level_id not in curriculum.LEVELS_BY_ID:
@@ -576,6 +619,10 @@ def practice_bot_move(body: PracticeBotBody):
 
 
 # ── dev-only demo wallet ────────────────────────────────────────────────
+# The demo wallet deliberately signs its way in through the SAME nonce →
+# signature → verify handshake a real wallet uses, rather than being handed a
+# session directly. A login path that only ever runs in production is a login
+# path nobody has tested, and this is the one that guards the pot.
 @app.post("/api/dev/demo-wallet")
 async def demo_wallet():
     if not config.DEMO_WALLET_ENABLED:
@@ -584,8 +631,27 @@ async def demo_wallet():
         kp = await service_client.generate_demo_keypair()
     except ServiceError as e:
         raise HTTPException(502, f"couldn't reach the Kaspa service: {e}")
-    db.get_or_create_account(kp["address"], kp["pubkey"], is_demo=True)
     return kp
+
+
+class DemoSignBody(BaseModel):
+    privateKeyHex: str
+    message: str
+
+
+@app.post("/api/dev/demo-sign")
+async def demo_sign(body: DemoSignBody):
+    """Sign a login challenge with a demo-wallet key. Harmless by
+    construction — it can only sign with a key the caller already holds — but
+    it still disappears with DAGMATE_DEMO_WALLET=0."""
+    if not config.DEMO_WALLET_ENABLED:
+        raise HTTPException(404, "demo wallet disabled")
+    try:
+        sig = await service_client.demo_sign_message(
+            private_key_hex=body.privateKeyHex, message=body.message)
+    except ServiceError as e:
+        raise HTTPException(502, f"couldn't reach the Kaspa service: {e}")
+    return {"signature": sig}
 
 
 # ── site meta ────────────────────────────────────────────────────────────
