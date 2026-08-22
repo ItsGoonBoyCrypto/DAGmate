@@ -30,17 +30,13 @@ TOURNAMENT_MIN_ENTRANTS = int(os.getenv("DAGMATE_TOURNAMENT_MIN_ENTRANTS", "8"))
 GAS_ONLY_STAKE_SOMPI = 1000
 
 # Learn page: leveled curriculum, each level a plain gas send (no escrow).
-# (category, title, gas_kas) — difficulty ramps left to right within a category.
-LEARN_LEVELS = [
-    {"id": "rules-1", "category": "rules", "title": "How the pieces move", "gas_kas": 0},
-    {"id": "rules-2", "category": "rules", "title": "Check, checkmate & stalemate", "gas_kas": 0},
-    {"id": "tactics-1", "category": "tactics", "title": "Forks & pins", "gas_kas": 1},
-    {"id": "tactics-2", "category": "tactics", "title": "Skewers & discovered attacks", "gas_kas": 1},
-    {"id": "openings-1", "category": "openings", "title": "Opening principles", "gas_kas": 2},
-    {"id": "openings-2", "category": "openings", "title": "Common traps to avoid", "gas_kas": 2},
-    {"id": "endgames-1", "category": "endgames", "title": "King & pawn endgames", "gas_kas": 3},
-    {"id": "endgames-2", "category": "endgames", "title": "Rook endgames", "gas_kas": 3},
-]
+# The catalogue itself lives in curriculum.py (one source of truth for both the
+# index and the paid bodies) — this is only the index view, which never carries
+# level content and so is safe to serve to anyone.
+import curriculum  # noqa: E402  (kept below the env block for readability)
+
+LEARN_TIERS = curriculum.TIERS
+LEARN_LEVELS = curriculum.level_index()
 
 # KNS (.kas domain) lookups — same public indexer Dagger uses. Third-party,
 # no key/auth; every call is defensive (short timeout, DB-cached, never
