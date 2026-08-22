@@ -1,0 +1,16 @@
+.env
+.env.*
+*.db
+*.db-journal
+*.db-wal
+*.key
+*.pem
+*mnemonic*
+node_modules/
+dist/
+venv/
+__pycache__/
+*.pyc
+state/
+*-snapshot.json
+*_card.png
