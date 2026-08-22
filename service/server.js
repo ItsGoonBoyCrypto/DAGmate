@@ -58,6 +58,10 @@ app.post('/escrow/settle-unsigned', wrap((req) => escrow.buildSettleUnsigned(req
 
 app.post('/escrow/settle-broadcast', wrap((req) => escrow.broadcastSettle(req.body)));
 
+app.post('/escrow/reclaim-unsigned', wrap((req) => escrow.buildReclaimUnsigned(req.body)));
+
+app.post('/escrow/reclaim-broadcast', wrap((req) => escrow.broadcastReclaim(req.body)));
+
 app.post('/escrow/anchor', wrap((req) => escrow.anchor(req.body)));
 
 app.get('/escrow/daa', wrap(() => escrow.daaScore()));

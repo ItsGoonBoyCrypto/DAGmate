@@ -44,6 +44,8 @@
     // match it belongs to is tracked alongside it.
     settle: null,
     settleFor: null,
+    reclaim: null,
+    reclaimFor: null,
     selectedSquare: null,
     practiceFen: STANDARD_FEN,
     practiceLegalMoves: [],
@@ -226,6 +228,8 @@
     state.currentMatch = null;
     state.settle = null;
     state.settleFor = null;
+    state.reclaim = null;
+    state.reclaimFor = null;
     localStorage.removeItem("dagmate_session");
     localStorage.removeItem("dagmate_demo");
     localStorage.removeItem("dagmate_demo_key");
@@ -453,6 +457,7 @@
 
     renderClocks(m);
     renderClaim(m);
+    renderReclaim(m);
     renderEscrowInfo(m);
 
     const moveLog = document.getElementById("moveLog");
@@ -608,6 +613,101 @@
       return out;
     }
     throw new Error("this wallet doesn't expose custom-script signing yet");
+  }
+
+  // ── reclaiming a stranded stake ──────────────────────────────────────
+  // The match died with money in it: one side funded and the other never did,
+  // or the pot is too small to release. After the 14-day timelock the escrow's
+  // second branch opens and the depositor can walk their own stake back out
+  // with nothing but their own signature.
+  //
+  // The escape-hatch note is not decoration. The whole non-custodial claim
+  // rests on this working WITHOUT DAGmate, so the redeem script and the DAA
+  // are printed where the player can copy them.
+  function renderReclaim(m) {
+    const el = document.getElementById("reclaimPanel");
+    const r = m.reclaim;
+    const color = myColorFor(m);
+    if (!r || !r.eligible || !color) { el.innerHTML = ""; state.reclaimFor = null; return; }
+
+    const txid = color === "white" ? r.aTxid : r.bTxid;
+    if (txid) {
+      el.innerHTML = `<div class="claim-title">Stake reclaimed</div>
+        <div class="claim-note">Returned to your wallet. Transaction <code>${txid}</code>.</div>`;
+      return;
+    }
+    // Same once-per-match guard as renderClaim: prepare() builds a real
+    // transaction against the live UTXO set, and the 4s refresh must not turn
+    // an open panel into a poll loop against the Kaspa node.
+    if (state.reclaimFor !== m.id) {
+      state.reclaimFor = m.id;
+      state.reclaim = null;
+      el.innerHTML = `<div class="claim-title">Checking your escrow…</div>`;
+      api("POST", `/api/matches/${m.id}/reclaim/prepare`)
+        .then((s) => { if (state.reclaimFor === m.id) { state.reclaim = s; renderReclaim(m); } })
+        .catch((e) => { el.innerHTML = `<div class="claim-title">Reclaim your stake</div>
+          <div class="claim-note">${e.message}</div>${escapeHatch(m, color)}`; });
+      return;
+    }
+    const s = state.reclaim;
+    if (!s) return;
+
+    if (s.state === "broadcast") {
+      el.innerHTML = `<div class="claim-title">Stake reclaimed</div>
+        <div class="claim-note">Returned to your wallet. Transaction <code>${s.txid}</code>.</div>`;
+      return;
+    }
+    el.innerHTML = `
+      <div class="claim-title">Reclaim your stake</div>
+      <div class="claim-amount">${s.payoutKas} KAS</div>
+      <div class="claim-fees">
+        <div><span>In your escrow</span><span>${s.totalKas} KAS</span></div>
+        <div><span>Kaspa network fee</span><span>−${s.networkFeeKas} KAS</span></div>
+        <div><span>DAGmate fee</span><span>none</span></div>
+      </div>
+      <button class="btn btn-primary full" id="reclaimBtn">Sign &amp; reclaim</button>
+      ${escapeHatch(m, color)}`;
+    document.getElementById("reclaimBtn").addEventListener("click", () => doReclaim(m));
+  }
+
+  // Printed whether or not the button works, because its whole purpose is to
+  // be useful when DAGmate isn't. With these two values a player can spend the
+  // escrow's timelock branch from any Kaspa tooling, no server involved.
+  function escapeHatch(m, color) {
+    const redeem = color === "white" ? m.escrowARedeemHex : m.escrowBRedeemHex;
+    const addr = color === "white" ? m.escrowA : m.escrowB;
+    if (!redeem) return "";
+    return `<div class="claim-note" style="margin-top:10px;">
+      This stake is yours with or without DAGmate. After DAA
+      <code>${m.reclaim.reclaimDaa}</code> the escrow's timelock branch is
+      spendable by your key alone — escrow <code>${addr}</code>, redeem script
+      <code>${redeem}</code>.</div>`;
+  }
+
+  async function doReclaim(m) {
+    const s = state.reclaim;
+    const btn = document.getElementById("reclaimBtn");
+    if (btn) { btn.disabled = true; btn.textContent = "Waiting for your wallet…"; }
+    let sigMap;
+    try {
+      // Identical wallet call to a settlement: same custom-script signing API,
+      // same P2SH input. Only the branch the signature ends up selecting
+      // differs, and that's decided server-side when the witness is built.
+      sigMap = await signSettleInputs(s.txJson, s.mySignatureInputs);
+    } catch (e) {
+      toast(`Signing failed: ${e.message}`);
+      if (btn) { btn.disabled = false; btn.textContent = "Sign & reclaim"; }
+      return;
+    }
+    try {
+      state.reclaim = await api("POST", `/api/matches/${m.id}/reclaim/submit`,
+                                { txJson: s.txJson, sigs: s.mySignatureInputs.map((i) => sigMap[i]) });
+      renderReclaim(m);
+      toast("Stake reclaimed.");
+    } catch (e) {
+      toast(`Reclaim failed: ${e.message}`);
+      if (btn) { btn.disabled = false; btn.textContent = "Sign & reclaim"; }
+    }
   }
 
   // Escrow addresses + live deposit progress. The backend watches both

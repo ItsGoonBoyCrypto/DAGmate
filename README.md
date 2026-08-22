@@ -17,6 +17,13 @@ the service ever goes dark, each player can still unilaterally reclaim their
 own stake after a 14-day CLTV timeout. See `docs/DAGMATE_SPEC.md` for the
 full design.
 
+That last claim is checkable rather than rhetorical: the match view publishes
+each escrow's address, redeem script and reclaim DAA, so a player can spend
+their own timelock branch from any Kaspa tooling without this service running.
+The in-app **Reclaim** button is a convenience over that same branch — it
+builds the transaction, but only the depositor's wallet can sign it. See
+`docs/DAGMATE_SPEC.md` §2.4.
+
 **Identity is a signature, not an address.** Addresses are public — they're
 printed on the match view — so every mutating endpoint takes its account from
 a session token earned by signing a server-issued nonce with the wallet
@@ -24,7 +31,8 @@ a session token earned by signing a server-issued nonce with the wallet
 
 - `service/` — Kaspa L1 scripting/RPC sidecar: WASM/RPC/HD-seed init
   (`core.js`), escrow build, wallet-connect settlement (`buildSettleUnsigned`
-  + `broadcastSettle`), move anchors, DAA lookups, wallet-ownership proof
+  + `broadcastSettle`), timelock reclaim (`buildReclaimUnsigned` +
+  `broadcastReclaim`), move anchors, DAA lookups, wallet-ownership proof
   (`auth.js`). Holds the arbiter and operating keys, so it binds to 127.0.0.1
   and only the site backend talks to it.
 - `bot/` — Telegram **alerts-only** bot: `/start` (link code), `/alerts
@@ -56,8 +64,8 @@ minutes, forgetting to switch it off puts a free-money button on a public
 host. `site/backend/dev.cmd` turns it on for local work.
 
 Tests are dependency-free — `python site/backend/tools/test_auth.py` (and
-`test_settlement`, `test_deposits`, `test_clocks`). Real schema, real DB
-accessors, throwaway database; only the chain is stubbed.
+`test_settlement`, `test_reclaim`, `test_deposits`, `test_clocks`). Real
+schema, real DB accessors, throwaway database; only the chain is stubbed.
 
 Owner-gated / private until GoonBoy has tested it end-to-end and it's ready for
 public testing.

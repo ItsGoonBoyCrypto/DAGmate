@@ -19,6 +19,25 @@ def _url(path: str) -> str:
     return f"{config.SERVICE_URL}{path}"
 
 
+def _error(path: str, r: httpx.Response) -> ServiceError:
+    """The sidecar's own error message, or something useful if it didn't send
+    one. It usually replies `{"error": ...}`, but not always: an unknown route
+    gets Express's HTML 404 page, which json() chokes on. That is exactly what
+    a version-skewed deploy looks like — a backend calling a route the sidecar
+    it's talking to doesn't have — so it has to produce a readable message
+    rather than a JSONDecodeError surfacing as a bare 500."""
+    try:
+        msg = r.json().get("error")
+    except ValueError:
+        msg = None
+    if msg:
+        return ServiceError(str(msg))
+    if r.status_code == 404:
+        return ServiceError(f"Kaspa service has no route {path} — the sidecar is "
+                            f"older than this backend, or a dev-only route is switched off")
+    return ServiceError(f"Kaspa service returned HTTP {r.status_code} for {path}")
+
+
 async def _get(path: str, params: dict | None = None) -> dict:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -26,7 +45,7 @@ async def _get(path: str, params: dict | None = None) -> dict:
     except httpx.RequestError as e:
         raise ServiceError(f"service unreachable at {config.SERVICE_URL}: {e}") from e
     if r.status_code >= 400:
-        raise ServiceError(r.json().get("error", r.text))
+        raise _error(path, r)
     return r.json()
 
 
@@ -37,7 +56,7 @@ async def _post(path: str, body: dict) -> dict:
     except httpx.RequestError as e:
         raise ServiceError(f"service unreachable at {config.SERVICE_URL}: {e}") from e
     if r.status_code >= 400:
-        raise ServiceError(r.json().get("error", r.text))
+        raise _error(path, r)
     return r.json()
 
 
@@ -73,6 +92,21 @@ async def settle_unsigned(*, match_id: str, escrows: list[dict], winner_addr: st
 async def settle_broadcast(*, tx_json: str, escrows: list[dict], sigs_player: list[str], sigs_arb: list[str]) -> dict:
     return await _post("/escrow/settle-broadcast", {
         "txJson": tx_json, "escrows": escrows, "sigsPlayer": sigs_player, "sigsArb": sigs_arb,
+    })
+
+
+async def reclaim_unsigned(*, address: str, depositor_addr: str, reclaim_daa: int) -> dict:
+    """Unsigned tx draining one escrow's CLTV branch back to its depositor.
+    Sompi fields come back as decimal strings (see escrow.js) — parsed to int
+    by the caller, never float."""
+    return await _post("/escrow/reclaim-unsigned", {
+        "address": address, "depositorAddr": depositor_addr, "reclaimDaa": reclaim_daa,
+    })
+
+
+async def reclaim_broadcast(*, tx_json: str, redeem_hex: str, sigs: list[str]) -> dict:
+    return await _post("/escrow/reclaim-broadcast", {
+        "txJson": tx_json, "redeemHex": redeem_hex, "sigs": sigs,
     })
 
 

@@ -76,6 +76,14 @@ SETTLE_FEE_SOMPI_PER_INPUT = 60_000_000
 # under it by design: they exist for the on-chain move record, not the money.
 SETTLE_MIN_POT_SOMPI = 2 * SETTLE_FEE_SOMPI_PER_INPUT
 
+# ── reclaim (reclaim.py) ────────────────────────────────────────────────
+# ⚠️ MUST match RECLAIM_FEE_SOMPI_PER_INPUT in service/escrow.js. Same reason
+# as the settle fee above: the backend quotes the payout before the sidecar
+# builds the tx, so a mismatch means the UI states a number the chain doesn't
+# deliver. Much lower than the settle fee because the CLTV branch is a
+# single-sig spend, not a 2-of-3 CHECKMULTISIG.
+RECLAIM_FEE_SOMPI_PER_INPUT = 10_000_000
+
 # Tournament fee tiers, KAS. Config-driven per spec §8 — easy to add/remove.
 TOURNAMENT_TIERS_KAS = [20, 100, 250, 500]
 TOURNAMENT_MIN_ENTRANTS = int(os.getenv("DAGMATE_TOURNAMENT_MIN_ENTRANTS", "8"))

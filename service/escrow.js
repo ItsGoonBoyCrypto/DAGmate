@@ -227,6 +227,115 @@ export async function broadcastSettle({ txJson, escrows, sigsPlayer, sigsArb }) 
   });
 }
 
+/** Fee for spending the CLTV branch, per input. Far below the settle fee
+ *  because this is a single-sig spend (sigOpCount 1) rather than a 2-of-3
+ *  CHECKMULTISIG. ⚠️ Mirrored in site/backend/config.py as
+ *  RECLAIM_FEE_SOMPI_PER_INPUT — change both or the backend will quote a
+ *  payout the chain doesn't deliver. */
+const RECLAIM_FEE_SOMPI_PER_INPUT = 10_000_000n; // 0.1 KAS
+
+/** POST /escrow/reclaim-unsigned — build the tx that walks a stranded stake
+ *  back out of ONE escrow via its ELSE (timelock) branch, and hand it to the
+ *  site unsigned. Nothing here is signed and no key is touched: the reclaim
+ *  branch is `<reclaimDaa> CLTV <pkDepositor> CHECKSIG`, so only the
+ *  depositor's own wallet can complete it. That is the point — reclaim has to
+ *  keep working if DAGmate is gone, and a builder that needed our key would
+ *  quietly make that false.
+ *
+ *  Four things make this different from buildSettleUnsigned, all of them
+ *  money-critical:
+ *
+ *  1. It uses the LOW-LEVEL `createTransaction()`, not `createTransactions()`,
+ *     because the high-level builder returns a PendingTransaction whose
+ *     `.transaction` is a SNAPSHOT — assigning `lockTime` to it does not
+ *     persist, and a tx without the lock time fails CLTV.
+ *  2. ⚠️ `createTransaction()` has NO automatic change output. The output
+ *     amount is computed exactly as `total - fee`; anything left unspent is
+ *     silently donated to a miner. There is deliberately no change address:
+ *     one input set, one output, one number to get right.
+ *  3. `lockTime` must be >= the script's `reclaimDaa` (the in-script check is
+ *     `stack_value <= tx.lock_time`). It is set to exactly `reclaimDaa` so
+ *     the tx becomes valid at the earliest moment it legally can.
+ *  4. EVERY input's `sequence` must differ from MAX_TX_IN_SEQUENCE_NUM or
+ *     both the in-script CLTV and the consensus finality check are skipped
+ *     outright — the timelock would be decorative. The mutated array is
+ *     assigned back because `.inputs` may hand out clones, not live refs. */
+export async function buildReclaimUnsigned({ address, depositorAddr, reclaimDaa }) {
+  if (!address) throw new Error('address required (the escrow to drain)');
+  if (!depositorAddr) throw new Error('depositorAddr required (where the stake goes back to)');
+  if (reclaimDaa == null) throw new Error('reclaimDaa required');
+  const k = core.wasm();
+  const lockTime = BigInt(reclaimDaa);
+
+  return core.withRpc(async (rpc) => {
+    const info = await rpc.getBlockDagInfo();
+    const tipDaa = BigInt(info.virtualDaaScore);
+    // Refused rather than built-and-rejected. The node would throw this tx out
+    // anyway (consensus finality), but a wallet popup the player can only
+    // approve into a failure is a worse way to learn the date.
+    if (tipDaa < lockTime) {
+      throw new Error(`timelock hasn't opened yet — reclaimable at DAA ${lockTime}, chain is at ${tipDaa}`);
+    }
+
+    const { entries } = await rpc.getUtxosByAddresses({ addresses: [address] });
+    if (!entries.length) throw new Error('nothing left in this escrow to reclaim');
+    const totalSompi = entries.reduce((s, e) => s + BigInt(e.amount), 0n);
+    const fee = RECLAIM_FEE_SOMPI_PER_INPUT * BigInt(entries.length);
+    const payout = totalSompi - fee;
+    if (payout <= 0n) {
+      throw new Error('what is left in this escrow is smaller than the network fee needed to move it');
+    }
+
+    const txn = k.createTransaction(entries, [{ address: depositorAddr, amount: payout }], fee, undefined, 1);
+    txn.lockTime = lockTime;
+    const inputs = txn.inputs;
+    for (const inp of inputs) inp.sequence = 0n; // != MAX, or CLTV is skipped
+    txn.inputs = inputs; // commit back — .inputs may return clones
+
+    return {
+      txJson: txn.serializeToSafeJSON(),
+      inputs: entries.map((e, i) => ({ index: i, address: e.address.toString() })),
+      totalSompi: totalSompi.toString(), feeSompi: fee.toString(), payoutSompi: payout.toString(),
+      tipDaa: tipDaa.toString(), reclaimDaa: lockTime.toString(),
+    };
+  });
+}
+
+/** POST /escrow/reclaim-broadcast — take the tx from buildReclaimUnsigned,
+ *  now carrying the depositor's own signature per input, finish the sigScripts
+ *  and submit.
+ *
+ *  The witness is `<sig> OP_FALSE`: the trailing FALSE selects the script's
+ *  ELSE branch (settle is the same shape with OP_TRUE). One signature, no
+ *  arbiter — there is no second party to wait on, which is what makes this a
+ *  one-visit flow while settlement is a multi-visit one. */
+export async function broadcastReclaim({ txJson, redeemHex, sigs }) {
+  if (!txJson) throw new Error('txJson required');
+  if (!redeemHex) throw new Error('redeemHex required');
+  if (!Array.isArray(sigs) || !sigs.length) throw new Error('sigs required, one per input');
+  const k = core.wasm();
+  return core.withRpc(async (rpc) => {
+    const tx = k.Transaction.deserializeFromSafeJSON(txJson);
+    if (tx.inputs.length !== sigs.length) {
+      throw new Error(`expected ${tx.inputs.length} signatures, got ${sigs.length}`);
+    }
+    for (let i = 0; i < sigs.length; i++) {
+      if (!sigs[i]) throw new Error(`missing signature for input ${i}`);
+      const redeem = new k.ScriptBuilder(core.COVENANT_OPTS)
+        .addData(rawSig(sigs[i]))
+        .addOp(k.Opcodes.OpFalse) // select the ELSE (timelock reclaim) branch
+        .drain();
+      tx.fillInput(i, k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS)
+        .encodePayToScriptHashSignatureScript(redeem));
+    }
+    // Explicit `allowOrphan: false`: a reclaim spends a confirmed UTXO that has
+    // been sitting for two weeks, so an orphan here means something is wrong
+    // with the tx, not that a parent is in flight.
+    const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false });
+    return { txid: String(resp.transactionId ?? resp) };
+  });
+}
+
 /** POST /escrow/anchor — dust tx carrying a DGMT move-anchor payload, paid
  *  from DAGmate's OWN operating address (never a player's wallet — anchoring
  *  every move can't require a wallet-connect popup per move without ruining

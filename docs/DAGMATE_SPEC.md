@@ -183,6 +183,48 @@ escrow via the ELSE branch with any wallet that can sign a custom script —
 this is the actual trust-minimization claim, and it should be demonstrably
 true (a small reference reclaim script belongs in this repo).
 
+### 2.4 Reclaim — spending the ELSE branch
+
+Built: `service/escrow.js` (`buildReclaimUnsigned` / `broadcastReclaim`),
+`site/backend/reclaim.py`, `tools/test_reclaim.py`.
+
+Two-visit and non-custodial, like settlement: the backend builds an unsigned
+tx, the depositor's own wallet signs it, the backend relays it. The ELSE
+branch is single-sig on the depositor's key, which DAGmate does not hold, so
+there is no version of this the service can do alone — which is the point.
+
+Unlike settlement it is stateless. One signer in one sitting means a rebuild
+costs nothing, so no tx is stored; only the resulting txid, as a receipt.
+
+Four rules, in descending order of how expensive they'd be to get wrong:
+
+1. **Never offered while the pot can still be won.** After the timelock the
+   *script* lets a loser walk their own stake back, and no backend policy
+   changes that. What the backend controls is whether DAGmate helps, and it
+   does not build that tx for a match a winner can still claim — otherwise
+   "wait two weeks" is a free undo on a lost game. Eligible: `expired`,
+   `awaiting_deposit`, and `settled` with a pot too small to release
+   (gas-only, where the 2-of-3 branch is open but useless).
+2. **The escrow follows from the session, not the request.** Player A
+   reclaims escrow A; there is no parameter for it. Same for the payout
+   address and the redeem script — both come from the account and the DB.
+3. **The tx uses the low-level `createTransaction()`**, because a
+   `PendingTransaction`'s `.transaction` is a snapshot and an assigned
+   `lockTime` doesn't persist (§3 rule 6). ⚠️ That builder has **no automatic
+   change output**: the output is computed as `total − fee` exactly, or the
+   remainder is silently donated to a miner.
+4. **`lockTime = reclaimDaa` and every input's `sequence ≠ MAX`** — without
+   the second, both the in-script CLTV and the consensus finality check are
+   skipped and the timelock is decorative (§3 rules 7–8). `lockTime` and
+   `sequence` were verified to survive `serializeToSafeJSON()` →
+   `deserializeFromSafeJSON()`, which they must, since the tx crosses to the
+   player's wallet as JSON and back.
+
+The match view publishes each escrow's address, redeem script and reclaim DAA,
+and the UI prints them next to the button whether or not the button works.
+That is the disaster path above made checkable: with those three values a
+player spends the branch from any Kaspa tooling, no server involved.
+
 ---
 
 ## 3. Service (`service/`)
@@ -199,6 +241,12 @@ POST /escrow/settle-unsigned  { matchId, escrows, winnerAddr|split, rakeSompi }
                                            // to the winner's wallet for signing
 POST /escrow/settle-broadcast  { matchId, txJson, sigWinner, sigArbiter }
      → { txid }
+POST /escrow/reclaim-unsigned  { address, depositorAddr, reclaimDaa }
+     → { txJson, inputs, totalSompi, feeSompi, payoutSompi, tipDaa, reclaimDaa }
+                                          // ELSE-branch drain of ONE escrow;
+                                          // refuses before the timelock opens
+POST /escrow/reclaim-broadcast  { txJson, redeemHex, sigs }
+     → { txid }                           // witness is <sig> OP_FALSE
 POST /escrow/anchor  { matchId, payloadHex, feeSompi }
      → { txid }
 GET  /escrow/daa      → { daaScore }

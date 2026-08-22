@@ -149,6 +149,14 @@ def ensure_schema():
         _add_column(c, "matches", "settle_txid", "TEXT")
         _add_column(c, "matches", "settle_broadcast_ts", "INTEGER")
 
+        # Reclaim receipts (reclaim.py). A record only — the chain is the
+        # authority on whether an escrow still holds anything. Reclaim keeps no
+        # built-tx state on purpose: one signer, one visit, so a rebuild costs
+        # nothing and can't orphan a co-signer's signature the way a settle
+        # rebuild would.
+        _add_column(c, "matches", "reclaim_a_txid", "TEXT")
+        _add_column(c, "matches", "reclaim_b_txid", "TEXT")
+
 
 def _add_column(c: sqlite3.Connection, table: str, column: str, decl: str):
     """Idempotent ALTER TABLE ADD COLUMN (SQLite has no IF NOT EXISTS here)."""
@@ -454,6 +462,21 @@ def mark_settlement_broadcast(match_id: str, txid: str) -> bool:
         cur = c.execute(
             "UPDATE matches SET settle_txid=?, settle_broadcast_ts=? "
             "WHERE id=? AND settle_txid IS NULL", (txid, int(time.time()), match_id))
+        return cur.rowcount == 1
+
+
+# ── reclaim ──────────────────────────────────────────────────────────────
+def mark_reclaim_broadcast(match_id: str, side: str, txid: str) -> bool:
+    """Record which tx drained this player's escrow. Guarded on the column
+    still being NULL so a double-click can't overwrite the real txid with a
+    second (rejected) attempt's — the first submission is the one that spent
+    the UTXO, and that's the receipt the player should keep."""
+    if side not in ("a", "b"):
+        raise ValueError("side must be 'a' or 'b'")
+    col = f"reclaim_{side}_txid"
+    with _lock, _conn() as c:
+        cur = c.execute(f"UPDATE matches SET {col}=? WHERE id=? AND {col} IS NULL",
+                        (txid, match_id))
         return cur.rowcount == 1
 
 

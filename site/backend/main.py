@@ -50,6 +50,7 @@ import database as db
 import deposits
 import engine
 import kns
+import reclaim
 import service_client
 import settlement
 from service_client import ServiceError
@@ -166,6 +167,13 @@ def _match_public(m: dict) -> dict:
                     "knsName": kns.cached_name(b["address"])} if b else None,
         "winnerAccountId": m["winner_account_id"],
         "escrowA": m["escrow_a_address"], "escrowB": m["escrow_b_address"],
+        # Published on purpose: with the redeem script and the timelock, a
+        # player can spend their own escrow's reclaim branch without DAGmate
+        # existing at all. That's what makes the non-custodial claim checkable
+        # rather than a promise. They're public data either way — a P2SH script
+        # is revealed the first time it's spent.
+        "escrowARedeemHex": m["escrow_a_redeem_hex"], "escrowBRedeemHex": m["escrow_b_redeem_hex"],
+        "reclaim": reclaim.summary(m),
         "tournamentId": m["tournament_id"], "round": m["round"],
         # Deposit progress, so the player can see whose stake is outstanding
         # rather than staring at "awaiting_deposit" with no explanation.
@@ -504,6 +512,38 @@ async def settle_submit(match_id: str, body: SettleSubmitBody,
     try:
         return await settlement.submit(match_id, account["address"], sigs)
     except settlement.SettlementError as e:
+        raise HTTPException(400, str(e))
+    except ServiceError as e:
+        raise HTTPException(503, f"Kaspa service unavailable: {e}")
+
+
+# ── reclaim ──────────────────────────────────────────────────────────────
+# The way out when a match dies with money in it. Both endpoints take the
+# escrow from the session, never the body — see reclaim.py, property 3.
+@app.post("/api/matches/{match_id}/reclaim/prepare")
+async def reclaim_prepare(match_id: str, account: dict = Depends(require_account)):
+    try:
+        return await reclaim.prepare(match_id, account["address"])
+    except reclaim.ReclaimError as e:
+        raise HTTPException(400, str(e))
+    except ServiceError as e:
+        raise HTTPException(503, f"Kaspa service unavailable: {e}")
+
+
+class ReclaimSubmitBody(BaseModel):
+    # The tx the wallet signed, handed straight back. Nothing was stored
+    # server-side to compare it against, and nothing needs to be: the
+    # signatures only validate against the exact tx they were made over.
+    txJson: str
+    sigs: list[str]
+
+
+@app.post("/api/matches/{match_id}/reclaim/submit")
+async def reclaim_submit(match_id: str, body: ReclaimSubmitBody,
+                         account: dict = Depends(require_account)):
+    try:
+        return await reclaim.submit(match_id, account["address"], body.txJson, body.sigs)
+    except reclaim.ReclaimError as e:
         raise HTTPException(400, str(e))
     except ServiceError as e:
         raise HTTPException(503, f"Kaspa service unavailable: {e}")
