@@ -39,15 +39,25 @@ nobody can touch the other side's stake, arbiter included.
 - Settlement: pot − rake → winner, rake → project fee address; draws split
   50/50 − rake
 - Per-move on-chain anchor tx (payload = match/ply/move/board-hash), tiny fee
+  — every move a player makes is recorded on Kaspa L1, not just settlement
+- Challenges: direct challenge to a specific opponent for an agreed KAS
+  stake, or a 0/near-0-stake "gas-only" friendly; per-account toggle to
+  accept or block incoming challenges (see §7)
+- Tournaments: auto-starting bracket once a fee tier's lobby fills (see §8)
+- Learn page: chess-basics curriculum with gas-gated levels + optional AI
+  teacher (see §9)
 - Telegram alert bot: challenge received, your move, clock warning, match
   settled — notifications only, no wallet access, no game logic
 - Kill switch, idempotency, stake caps, owner gate before any public launch
+- Clean, minimal flat-2D board visual design (see §10) — not gamified
 
 **OUT (later phases):**
-- Tournaments (same match engine, bracket layer on top)
 - Discord alerts (planned, phase 2 — many Kaspa users are there)
 - Trustless covenant chess-clock (removes the arbiter entirely — needs
   Silverscript / KIP-16 vprogs, testnet-10 first)
+- Trustless covenant tournament pot (see §8's open design question — a true
+  single shared N-way pot needs either pre-signed delegated settlement or a
+  real covenant; v1 tournaments ship without it)
 
 ---
 
@@ -230,14 +240,101 @@ an ABORT + refund, not a win (stops instant-flag griefs on accept).
 
 ---
 
-## 6. Later phases (park, don't build yet)
+## 7. Challenges & settings
 
-- **Tournaments:** entry fees to one arbiter escrow, single-elim bracket of
-  normal matches, payout 70/20/10 − rake.
+Two ways to start a match:
+- **Direct challenge** — pick an opponent (search / recent opponents on the
+  site), propose a KAS stake, they accept or decline. Same escrow/settlement
+  path as the rest of the spec.
+- **Gas-only challenge** — stake is 0 or dust; the point isn't the wager,
+  it's a free/near-free way to play with every move still anchored on-chain
+  (each move still costs the small anchor fee, paid from DAGmate's own
+  operating address per §2.3/§3 — never the player's wallet).
+
+**Accept challenges toggle** — a profile setting (`accept_challenges:
+on|off`, default on). When off, this account cannot be challenged by anyone
+(site rejects the attempt with a clear "not accepting challenges" message).
+Doesn't affect tournaments (those are opt-in by joining a lobby, not
+challenge-based).
+
+---
+
+## 8. Tournaments
+
+Auto-running, fee-tiered brackets — no manual "start tournament" step.
+
+- **Fee tiers:** 20 / 100 / 250 / 500 KAS entry (config-driven list, not
+  hardcoded — easy to add/remove tiers later).
+- **Auto-start:** each tier has its own lobby; once it reaches the
+  configured minimum entrant count (default **8**), it locks and the
+  bracket pairs off automatically.
+- **Payout:** winner takes the pot (entry fees × entrants) minus rake. No
+  placed (2nd/3rd) payout in v1 — confirm with GoonBoy if that's still wanted,
+  since it's a change from the old placeholder split.
+
+**⚠️ Open design question — how the pot is actually escrowed.** A literal
+single shared pot that only the eventual sole winner can sweep is *not* the
+same problem as the 1v1 2-of-3 escrow: an eliminated entrant has zero
+incentive to help co-sign their stake away to someone else, and the arbiter
+should never get unilateral spend authority over a non-custodial deposit.
+Two realistic v1 paths:
+
+  - **A — bracket-of-matches (reuses the 1v1 engine as-is, zero new escrow
+    code):** each round is a normal 2-of-3 stake-tier match; each round's
+    winner is paid out immediately via the existing settlement path, then
+    re-stakes into a fresh escrow for the next round. Fast to ship, zero new
+    trust assumptions, but it's a *compounding bracket*, not one literal
+    shared pot sitting in a single address the whole time.
+  - **B — true shared pot:** every entrant's stake sits in one place until
+    the bracket resolves. Doing this non-custodially needs either (i) each
+    entrant pre-signing a conditional/delegated settlement authorization at
+    entry time (one extra wallet-connect signature at signup — needs
+    verifying Kasware/Kastle actually support that shape of pre-auth), or
+    (ii) a real covenant (KIP-16/Silverscript) holding the pot
+    programmatically, which isn't available yet.
+
+**Recommendation:** ship **A** first — it matches the non-custodial
+guarantee already built for 1v1 with no new escrow design, and can be
+reframed later as **B** once covenants or a verified pre-auth flow land.
+Needs GoonBoy's sign-off before building either way.
+
+---
+
+## 9. Learn page
+
+- Structured curriculum: rules → tactics → openings → endgames, difficulty
+  ramps as levels progress.
+- Each level unlocks with a small KAS "gas" fee — a plain one-way send from
+  the player's own wallet to DAGmate's operating address, **not** an escrow
+  (there's no wager, no counterparty, nothing to settle).
+- Free practice mode: play against a bundled low-skill engine (e.g. a weak
+  Stockfish level) before any gated content.
+- Optional **AI teacher**: chat-based hints/explanations per lesson
+  (LLM-backed). Needs its own design pass before building — model choice,
+  per-call cost, rate limits/abuse controls — flagged here, not scoped yet.
+- Funnel: learn → practice vs bot → gas-only friendly → real-stake
+  challenge/tournament.
+
+---
+
+## 10. Visual design
+
+Clean, minimal flat-2D board — classic green/cream squares, flat-shaded
+white/black piece set (reference: GoonBoy's supplied board image, chess.com/
+lichess-default style). No 3D pieces, no heavy skinning, no game-y clutter.
+Board is the hero element; wallet-connect status, clock, and match controls
+stay small and out of the way.
+
+---
+
+## 11. Later phases (park, don't build yet)
+
 - **Discord alerts** — mirror of the TG alert bot.
 - **Trustless covenant chess-clock:** stateful covenant holds pot +
   board-hash + deadline; mutual-signed off-chain states, on-chain flag
   claims — removes the arbiter key entirely. Needs Silverscript / KIP-16
   vprogs.
+- **Trustless covenant tournament pot** — see §8 option B once covenants or
+  a verified wallet pre-auth flow are available.
 - Compliance note before any public launch: wagering real money on skill
   games is jurisdiction-sensitive — sanity-check before opening publicly.
