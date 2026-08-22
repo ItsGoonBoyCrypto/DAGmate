@@ -6,8 +6,9 @@
  * holds the arbiter/operating keys, so it should never be exposed directly
  * to the internet; only the site backend talks to it.
  *
- * Run: `node server.js` — needs DAGMATE_MASTER_MNEMONIC + DAGMATE_KASPA_WRPC
- * (see core.js). DAGMATE_SERVICE_PORT defaults to 8910.
+ * Run: `node server.js` — needs DAGMATE_MASTER_MNEMONIC (see core.js; the node
+ * URL is optional and resolves to a public one). DAGMATE_SERVICE_PORT
+ * defaults to 8910.
  */
 import { randomBytes } from 'node:crypto';
 import express from 'express';

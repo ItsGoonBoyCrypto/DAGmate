@@ -255,6 +255,36 @@ POST /auth/verify-message  { address, pubkey, message, signature }
                                           // normal outcome, not an error
 ```
 
+### 3.0 Which node it talks to
+
+DAGmate runs no node. `DAGMATE_KASPA_WRPC` pins one if you want it; unset, the
+SDK's `Resolver` fetches a public node from the community pool for the
+configured network, and picks a fresh one each connection.
+
+That is safe because the node is a **liveness** dependency, not a trust one.
+Every transaction is fully signed before a node sees it, so a hostile node can
+refuse to answer or refuse to relay — it cannot alter a transaction without
+invalidating the signatures, and it cannot invent a deposit, because deposits
+are re-read and re-checked against the escrow's own address.
+
+What it *can* do is answer wrongly, and two of those answers cost money — so
+`core.withRpc` health-gates every connection and moves on to another node if it
+fails:
+
+1. **`isSynced`** — the virtual DAA score decides deposit confirmation and
+   whether a timelock has opened. A lagging node writes a reclaim DAA that
+   locks funds past 14 days, or never confirms a deposit that landed.
+2. **`hasUtxoIndex`** — `getUtxosByAddresses` is how every deposit is seen and
+   every spend is funded. Without the index the node cannot answer at all.
+3. **`networkId` matches** — only reachable via an explicit URL, since the
+   resolver picks per network. A mainnet service pointed at a testnet node
+   derives mainnet addresses and reads a testnet UTXO set: every escrow looks
+   empty and every deposit it does see is play money.
+
+The retry covers connect and health-check only, never the call itself — once
+the call has run it may have broadcast, and a second attempt on another node
+would double-spend or double-anchor.
+
 ### 3.1 Dev routes — opt-in, and refused on mainnet
 
 `DAGMATE_DEV_ROUTES=1` adds `/dev/demo-keypair` and `/dev/sign-message` here,

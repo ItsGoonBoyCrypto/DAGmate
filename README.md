@@ -51,7 +51,8 @@ Both processes need env; there are no secrets in this repo and no defaults
 that reach a live node.
 
     service/   DAGMATE_MASTER_MNEMONIC   (required)
-               DAGMATE_KASPA_WRPC        (required — no default node URL)
+               DAGMATE_KASPA_WRPC        (optional — pins one node; unset uses
+                                          the SDK's community node resolver)
                DAGMATE_NETWORK_ID        (default mainnet)
     site/      DAGMATE_SERVICE_URL       (default http://127.0.0.1:8910)
                DAGMATE_NETWORK_ID        (default mainnet)

@@ -15,10 +15,9 @@
  *                              never reuse a Dagger seed.
  *   DAGMATE_NETWORK_ID       — 'mainnet' (default) or a testnet id (e.g.
  *                              'testnet-10').
- *   DAGMATE_KASPA_WRPC       — explicit node wRPC URL, required (no silent
- *                              default to some public node we haven't
- *                              ourselves verified is trustworthy/stable for
- *                              this project).
+ *   DAGMATE_KASPA_WRPC       — explicit node wRPC URL. OPTIONAL: unset, the
+ *                              SDK's community Resolver picks a public node
+ *                              (see `withRpc`). Set it to pin one node.
  *   DAGMATE_FEE_ADDRESS      — optional override for where tournament/match
  *                              rake lands; falls back to the operating
  *                              address if unset.
@@ -38,7 +37,6 @@ const WRPC = process.env.DAGMATE_KASPA_WRPC;
 const MNEMONIC = process.env.DAGMATE_MASTER_MNEMONIC;
 
 if (!MNEMONIC) throw new Error('DAGMATE_MASTER_MNEMONIC not set — the HD master seed is required');
-if (!WRPC) throw new Error('DAGMATE_KASPA_WRPC not set — an explicit node URL is required (no silent default)');
 
 export const COVENANT_OPTS = { flags: { covenantsEnabled: true } };
 
@@ -95,18 +93,81 @@ export function feeAddress() {
 // chain so only one runs at a time.
 let _rpcChain = Promise.resolve();
 
-/** Run `fn(rpc)` against a connected RPC client, one session at a time. */
+// How many resolved nodes to try before giving up. Only relevant on the
+// resolver path: it hands back a random member of a community pool, so one bad
+// draw shouldn't fail a settlement when the next node over is fine.
+const NODE_ATTEMPTS = 3;
+
+function newClient() {
+  // An explicit URL pins one node; otherwise the SDK's Resolver fetches a
+  // public one from the community pool for this network. Nothing about DAGmate
+  // needs a node of its own — every call here is a plain read plus
+  // submitTransaction, and the transactions are already signed before they get
+  // near a node. The node choice is a liveness dependency, never a trust one:
+  // a hostile node can refuse to answer or refuse to relay, but it cannot
+  // forge a UTXO set we act on (deposits are re-read and re-checked) and it
+  // cannot alter a tx without invalidating its signatures.
+  return WRPC
+    ? new k.RpcClient({ url: WRPC, networkId: NETWORK_ID, encoding: k.Encoding.Borsh })
+    : new k.RpcClient({ resolver: new k.Resolver(), networkId: NETWORK_ID, encoding: k.Encoding.Borsh });
+}
+
+/** Refuse a node that would quietly give wrong answers.
+ *
+ * All three of these are money-critical rather than cosmetic:
+ *
+ * - **not synced** — its virtual DAA score is in the past. That score is what
+ *   decides whether a deposit is confirmed and whether a timelock has opened,
+ *   so a lagging node writes a wrong reclaim DAA into an escrow that then
+ *   locks funds for longer than 14 days, or reports a deposit unconfirmed
+ *   forever.
+ * - **no utxoindex** — `getUtxosByAddresses` is the only way we see a deposit
+ *   or fund a spend. Without the index it can't answer at all.
+ * - **wrong network** — only reachable via an explicit URL (the resolver picks
+ *   per network). A mainnet-configured service pointed at a testnet node
+ *   derives mainnet addresses and then reads a testnet UTXO set: every escrow
+ *   looks empty, and every "deposit" it does see is play money.
+ */
+async function assertUsable(rpc) {
+  const si = await rpc.getServerInfo();
+  if (!si.isSynced) throw new Error(`node ${rpc.url} is not synced`);
+  if (!si.hasUtxoIndex) throw new Error(`node ${rpc.url} has no utxoindex`);
+  if (si.networkId && String(si.networkId) !== NETWORK_ID) {
+    throw new Error(`node ${rpc.url} is on ${si.networkId}, this service is configured for ${NETWORK_ID}`);
+  }
+}
+
+/** Run `fn(rpc)` against a connected, health-checked RPC client, one session
+ *  at a time. */
 export async function withRpc(fn) {
   const prev = _rpcChain;
   let release;
   _rpcChain = new Promise((r) => { release = r; });
   await prev.catch(() => {}); // wait our turn (ignore the prior job's outcome)
-  const rpc = new k.RpcClient({ url: WRPC, networkId: NETWORK_ID, encoding: k.Encoding.Borsh });
   try {
-    await rpc.connect();
-    return await fn(rpc);
+    // Retry only covers connect + health check — never `fn`. Once fn has run,
+    // it may have broadcast a transaction, and running it twice against a
+    // second node could double-spend or double-anchor.
+    const attempts = WRPC ? 1 : NODE_ATTEMPTS;
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+      const rpc = newClient();
+      try {
+        await rpc.connect();
+        await assertUsable(rpc);
+      } catch (e) {
+        lastErr = e;
+        await rpc.disconnect().catch(() => {});
+        continue;
+      }
+      try {
+        return await fn(rpc);
+      } finally {
+        await rpc.disconnect().catch(() => {});
+      }
+    }
+    throw new Error(`no usable Kaspa node for ${NETWORK_ID}: ${lastErr?.message ?? lastErr}`);
   } finally {
-    await rpc.disconnect();
     release();
   }
 }
