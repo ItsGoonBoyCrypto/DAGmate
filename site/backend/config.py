@@ -43,6 +43,24 @@ TOURNAMENT_MIN_ENTRANTS = int(os.getenv("DAGMATE_TOURNAMENT_MIN_ENTRANTS", "8"))
 # Gas-only challenges: dust-level stake, still anchors every move on-chain.
 GAS_ONLY_STAKE_SOMPI = 1000
 
+# ── clocks (clocks.py) ──────────────────────────────────────────────────
+# Fischer increment, one mechanism for both modes — `daily` is just a very
+# slow rapid game, which is far less to get wrong than a second per-move
+# deadline system. Clocks only run while a match is `live`.
+#
+# Clocks are what stop a losing player simply walking away: without them an
+# abandoned game sits until the 14-day CLTV and both stakes are refunded,
+# which makes quitting a free undo on any lost position.
+CLOCK_MODES = {
+    "rapid": {"label": "Rapid 10+5", "initial_secs": 10 * 60, "increment_secs": 5},
+    "daily": {"label": "Daily 3d+12h", "initial_secs": 3 * 24 * 3600, "increment_secs": 12 * 3600},
+}
+CLOCK_POLL_SECS = int(os.getenv("DAGMATE_CLOCK_POLL_SECS", "5"))
+# Warn a player once when their remaining time drops below this fraction of
+# the mode's starting bank (the alerts bot's notify_clock_warning, which until
+# now was dead code nothing called).
+CLOCK_WARN_FRACTION = float(os.getenv("DAGMATE_CLOCK_WARN_FRACTION", "0.1"))
+
 # Learn page: leveled curriculum, each level a plain gas send (no escrow).
 # The catalogue itself lives in curriculum.py (one source of truth for both the
 # index and the paid bodies) — this is only the index view, which never carries

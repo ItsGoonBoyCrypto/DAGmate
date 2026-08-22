@@ -24,6 +24,11 @@
     profile: null,
     currentMatchId: null,
     currentMatch: null,
+    // When the current match's clock snapshot arrived, by this device's own
+    // Date.now(). Countdowns are driven off the ELAPSED time since then, never
+    // off the device's absolute clock, so a machine set to the wrong date still
+    // shows the right numbers.
+    clockRecvAt: 0,
     selectedSquare: null,
     practiceFen: STANDARD_FEN,
     practiceLegalMoves: [],
@@ -369,6 +374,7 @@
       const m = await api("GET", `/api/matches/${state.currentMatchId}`);
       if (state.currentMatch && state.currentMatch.fen !== m.fen) state.selectedSquare = null;
       state.currentMatch = m;
+      state.clockRecvAt = Date.now();
       renderMatchCard();
     } catch (e) { /* keep last known state on transient error */ }
   }
@@ -383,6 +389,7 @@
     document.getElementById("fundBtn").style.display = m.status === "awaiting_deposit" ? "inline-block" : "none";
     document.getElementById("resignBtn").style.display = m.status === "live" ? "inline-block" : "none";
 
+    renderClocks(m);
     renderEscrowInfo(m);
 
     const moveLog = document.getElementById("moveLog");
@@ -395,6 +402,50 @@
       flipped: color === "black",
       onClick: onBoardSquareClick,
     });
+  }
+
+  // Both clocks, laid out like a real board: opponent above, you below.
+  // Structure is built here and only the digits are touched by the tick, so a
+  // countdown doesn't rebuild DOM four times a second.
+  function renderClocks(m) {
+    const el = document.getElementById("clocks");
+    if (!m.clock) { el.innerHTML = ""; return; }
+    const mine = myColorFor(m);
+    const order = mine === "black" ? ["white", "black"] : ["black", "white"];
+    const who = (col) => (col === "white" ? displayName(m.playerA) : displayName(m.playerB));
+    el.innerHTML = order.map((col) => `
+      <div class="clock" id="clockRow-${col}">
+        <span class="clock-who">${who(col)}${col === mine ? " (you)" : ""} · ${col}</span>
+        <span class="clock-time" id="clockTime-${col}">--:--</span>
+      </div>`).join("") + `<div class="clock-label">${m.clock.label}</div>`;
+    tickClocks();
+  }
+
+  function tickClocks() {
+    const m = state.currentMatch;
+    if (!m || !m.clock) return;
+    const c = m.clock;
+    const since = c.running ? Math.max(0, Date.now() - state.clockRecvAt) : 0;
+    for (const col of ["white", "black"]) {
+      const time = document.getElementById(`clockTime-${col}`);
+      if (!time) continue;
+      const ticking = c.running && c.turn === col;
+      const ms = Math.max(0, (col === "white" ? c.whiteMs : c.blackMs) - (ticking ? since : 0));
+      time.textContent = fmtClock(ms);
+      const row = document.getElementById(`clockRow-${col}`);
+      row.classList.toggle("ticking", ticking);
+      // Cosmetic only. The server decides the flag; this just stops a player
+      // being surprised by it.
+      row.classList.toggle("low", ticking && ms <= 30000);
+    }
+  }
+
+  function fmtClock(ms) {
+    const s = Math.ceil(ms / 1000);
+    const pad = (n) => String(n).padStart(2, "0");
+    if (s >= 86400) return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+    if (s >= 3600) return `${Math.floor(s / 3600)}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
+    return `${Math.floor(s / 60)}:${pad(s % 60)}`;
   }
 
   // Escrow addresses + live deposit progress. The backend watches both
@@ -677,6 +728,19 @@
     refreshMatches();
     if (state.currentMatchId) refreshCurrentMatch();
   }, 4000);
+
+  // The clock redraws far more often than the match is re-fetched — the poll
+  // above only corrects it, it doesn't drive it.
+  setInterval(tickClocks, 250);
+
+  // Browsers freeze timers in a backgrounded tab, so both the countdown and the
+  // 4s poll stop dead there. The server clock never stopped, so on the way back
+  // the page would show time the player no longer has — in a wagered game that
+  // is the difference between "I have two minutes" and "I already lost". Resync
+  // immediately rather than waiting for the next tick.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.currentMatchId) refreshCurrentMatch();
+  });
 
   // ── boot ─────────────────────────────────────────────────────────────
   renderWalletBadge();

@@ -102,6 +102,17 @@ def ensure_schema():
         _add_column(c, "matches", "funded_b_ts", "INTEGER")
         _add_column(c, "matches", "deposit_checked_ts", "INTEGER")
 
+        # Clock state (clocks.py). Kept per COLOUR rather than per player slot:
+        # player A is always white, but naming them white/black means the
+        # timing code never has to remember that mapping to stay correct.
+        # Milliseconds throughout — seconds would visibly drift over a game.
+        _add_column(c, "matches", "clock_white_ms", "INTEGER")
+        _add_column(c, "matches", "clock_black_ms", "INTEGER")
+        _add_column(c, "matches", "clock_increment_ms", "INTEGER")
+        _add_column(c, "matches", "clock_turn_started_ms", "INTEGER")
+        _add_column(c, "matches", "clock_warned_white", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(c, "matches", "clock_warned_black", "INTEGER NOT NULL DEFAULT 0")
+
 
 def _add_column(c: sqlite3.Connection, table: str, column: str, decl: str):
     """Idempotent ALTER TABLE ADD COLUMN (SQLite has no IF NOT EXISTS here)."""
@@ -215,23 +226,6 @@ def list_matches_for_account(account_id: str) -> list[dict]:
             (account_id, account_id)))
 
 
-def apply_move(match_id: str, fen: str, moves: list[str], turn: str):
-    with _lock, _conn() as c:
-        c.execute("UPDATE matches SET fen=?, moves_json=?, turn=? WHERE id=?",
-                   (fen, json.dumps(moves), turn, match_id))
-
-
-def settle_match(match_id: str, *, status: str, result: str, winner_account_id: str | None):
-    with _lock, _conn() as c:
-        c.execute("UPDATE matches SET status=?, result=?, winner_account_id=?, settled_ts=? WHERE id=?",
-                   (status, result, winner_account_id, int(time.time()), match_id))
-
-
-def set_match_status(match_id: str, status: str):
-    with _lock, _conn() as c:
-        c.execute("UPDATE matches SET status=? WHERE id=?", (status, match_id))
-
-
 # ── deposit watching ─────────────────────────────────────────────────────
 def list_matches_awaiting_deposit() -> list[dict]:
     """Only matches whose escrows actually exist — one built with an
@@ -259,14 +253,63 @@ def record_deposits(match_id: str, a_sompi: int, b_sompi: int, stake_sompi: int)
         return _row(c.execute("SELECT * FROM matches WHERE id=?", (match_id,)))
 
 
-def mark_match_live(match_id: str) -> bool:
+def mark_match_live(match_id: str, *, initial_ms: int, increment_ms: int, now_ms: int) -> bool:
     """Guarded transition: only ever fires from awaiting_deposit, and returns
     whether THIS call is the one that made the change. The watcher uses that to
     decide whether to notify, so a re-poll (or two workers) can't double-start
-    a match or double-DM its players."""
+    a match or double-DM its players.
+
+    Starting the clock is part of the SAME statement: a match that is live but
+    has no running clock is exactly the abandonment hole clocks exist to close,
+    so the two must never be separately observable."""
     with _lock, _conn() as c:
-        cur = c.execute("UPDATE matches SET status='live' WHERE id=? AND status='awaiting_deposit'",
-                         (match_id,))
+        cur = c.execute(
+            "UPDATE matches SET status='live', clock_white_ms=?, clock_black_ms=?, "
+            "clock_increment_ms=?, clock_turn_started_ms=? "
+            "WHERE id=? AND status='awaiting_deposit'",
+            (initial_ms, initial_ms, increment_ms, now_ms, match_id))
+        return cur.rowcount == 1
+
+
+def list_live_matches() -> list[dict]:
+    with _lock, _conn() as c:
+        return _rows(c.execute("SELECT * FROM matches WHERE status='live'"))
+
+
+def apply_move_with_clock(match_id: str, fen: str, moves: list[str], turn: str,
+                          *, mover_color: str, mover_remaining_ms: int, now_ms: int) -> bool:
+    """Commit a move and the mover's new clock in one guarded statement.
+
+    The `turn` guard is what makes this safe under concurrent requests: two
+    moves racing for the same position both read `turn='white'`, but only the
+    first UPDATE matches, so the second is rejected rather than silently
+    overwriting the board or double-charging a clock."""
+    col = "clock_white_ms" if mover_color == "white" else "clock_black_ms"
+    with _lock, _conn() as c:
+        cur = c.execute(
+            f"UPDATE matches SET fen=?, moves_json=?, turn=?, {col}=?, clock_turn_started_ms=? "
+            "WHERE id=? AND status='live' AND turn=?",
+            (fen, json.dumps(moves), turn, mover_remaining_ms, now_ms, match_id, mover_color))
+        return cur.rowcount == 1
+
+
+def mark_clock_warned(match_id: str, color: str) -> bool:
+    """Latch so the low-time warning DMs once, not every poll."""
+    col = "clock_warned_white" if color == "white" else "clock_warned_black"
+    with _lock, _conn() as c:
+        cur = c.execute(f"UPDATE matches SET {col}=1 WHERE id=? AND {col}=0", (match_id,))
+        return cur.rowcount == 1
+
+
+def settle_match_if_live(match_id: str, *, result: str, winner_account_id: str | None) -> bool:
+    """Guarded end-of-game write, for endings decided by a background loop
+    (a clock flag) that could otherwise race a move landing in the same
+    instant. Returns whether this call is the one that ended the match."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET status='settled', result=?, winner_account_id=?, settled_ts=? "
+            "WHERE id=? AND status='live'",
+            (result, winner_account_id, int(time.time()), match_id))
         return cur.rowcount == 1
 
 

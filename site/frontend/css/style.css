@@ -290,6 +290,33 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
 }
 
 .board-side { min-width: 220px; flex: 1; }
+
+/* Both clocks, opponent above and you below. Only the side to move is running,
+   so only that one gets any emphasis — a glance should answer "whose time is
+   burning" without having to read the digits. */
+.clocks { margin-bottom: 14px; }
+.clocks:empty { display: none; }
+.clock {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--panel-border-soft);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+}
+.clock + .clock { margin-top: 6px; }
+.clock-who {
+  font-size: 11.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.clock-time {
+  font-family: var(--font-mono); font-size: 20px; font-weight: 700;
+  color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.clock.ticking { border-color: var(--accent); }
+.clock.ticking .clock-time { color: var(--text); }
+.clock.low .clock-time { color: var(--danger); }
+.clock-label { font-size: 10.5px; color: var(--muted); opacity: 0.7; margin-top: 6px; text-align: right; }
+
 .escrow-info {
   font-family: var(--font-mono);
   font-size: 11px;

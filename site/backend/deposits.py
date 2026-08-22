@@ -30,6 +30,7 @@ import logging
 import time
 
 import bot_client
+import clocks
 import config
 import database as db
 from service_client import ServiceError, escrow_balances
@@ -75,7 +76,9 @@ async def _check_match(m: dict, balances: dict[str, dict]) -> bool:
     # once seen fully funded stays funded even if this poll under-reports it.
     both_funded = row["funded_a_ts"] is not None and row["funded_b_ts"] is not None
     if both_funded:
-        if db.mark_match_live(m["id"]):
+        initial_ms, increment_ms = clocks.settings_for(m["mode"])
+        if db.mark_match_live(m["id"], initial_ms=initial_ms, increment_ms=increment_ms,
+                              now_ms=clocks.now_ms()):
             log.info(f"match {m['id']} funded ({a}+{b} sompi, stake {stake}) — live")
             await _notify_both(m, "Both stakes are in — your match is live.")
             return True

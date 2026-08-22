@@ -57,5 +57,20 @@ def status_of(board: chess.Board) -> dict:
     }
 
 
+def timeout_result(fen: str, flagged_color: str) -> tuple[str, str | None]:
+    """What running out of time actually means. Returns (result, winner_color).
+
+    FIDE 6.9: flagging normally loses, but NOT if the opponent has no way to
+    deliver mate — a lone king can't win on time, it's a draw. Worth getting
+    right rather than defaulting to "flag = loss": in a wagered game that
+    distinction is the difference between taking the pot and splitting it.
+    """
+    board = board_from(fen)
+    opponent = chess.BLACK if flagged_color == "white" else chess.WHITE
+    if board.has_insufficient_material(opponent):
+        return "draw_timeout", None
+    return "timeout", ("black" if flagged_color == "white" else "white")
+
+
 # The practice opponent lives in engine.py — this module stays purely the rules
 # authority so there is exactly one place that decides what is legal.

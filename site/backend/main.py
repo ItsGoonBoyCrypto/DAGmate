@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 import bot_client
 import chess_logic
+import clocks
 import config
 import curriculum
 import database as db
@@ -53,6 +54,7 @@ async def _startup():
         asyncio.create_task(deposits.watch_loop())
     else:
         log.warning("deposit watcher DISABLED — matches will never go live on their own")
+    asyncio.create_task(clocks.watch_loop())
 
 
 def _short(addr: str) -> str:
@@ -128,6 +130,7 @@ def _match_public(m: dict) -> dict:
             "deadlineTs": m["created_ts"] + config.DEPOSIT_DEADLINE_SECS,
             "windowMins": config.DEPOSIT_DEADLINE_SECS // 60,
         },
+        "clock": clocks.public(m),
     }
 
 
@@ -283,11 +286,16 @@ def get_match(match_id: str):
 @app.post("/api/matches/{match_id}/dev-mark-funded")
 def dev_mark_funded(match_id: str):
     """Dev/testing convenience only — see module docstring. Flips a match
-    from awaiting_deposit to live without any real on-chain check."""
+    from awaiting_deposit to live without any real on-chain check. Goes
+    through the same guarded transition as the deposit watcher so the clock
+    still starts: a live match with no running clock is precisely the
+    abandonment hole clocks exist to close."""
     m = db.get_match(match_id)
     if not m:
         raise HTTPException(404, "match not found")
-    db.set_match_status(match_id, "live")
+    initial_ms, increment_ms = clocks.settings_for(m["mode"])
+    db.mark_match_live(match_id, initial_ms=initial_ms, increment_ms=increment_ms,
+                       now_ms=clocks.now_ms())
     return {"ok": True}
 
 
@@ -310,6 +318,13 @@ async def make_move(match_id: str, body: MoveBody):
     if m["turn"] != my_color:
         raise HTTPException(400, "not your move")
 
+    # One timestamp for the whole request: the flag check and the time charged
+    # must agree, or a move made right on the boundary could be both accepted
+    # and forfeited.
+    at_ms = clocks.now_ms()
+    if await clocks.forfeit_if_flagged(m, at_ms):
+        raise HTTPException(400, "your clock ran out")
+
     try:
         status = chess_logic.apply_uci(m["fen"], body.uci)
     except ValueError as e:
@@ -317,7 +332,12 @@ async def make_move(match_id: str, body: MoveBody):
 
     import json
     moves = json.loads(m["moves_json"]) + [body.uci]
-    db.apply_move(match_id, status["fen"], moves, status["turn"])
+    if not db.apply_move_with_clock(
+            match_id, status["fen"], moves, status["turn"], mover_color=my_color,
+            mover_remaining_ms=clocks.charge_move(m, my_color, at_ms), now_ms=at_ms):
+        # The guarded UPDATE didn't match, so the position moved under us —
+        # a duplicate submission, or the clock loop settled the match first.
+        raise HTTPException(409, "the match moved on — reload the board")
 
     opponent_id = m["player_b_account_id"] if is_a else m["player_a_account_id"]
     await bot_client.notify_your_move(opponent_id, match_id, f"/play/{match_id}")
@@ -353,14 +373,19 @@ async def resign(match_id: str, body: ResignBody):
 
 async def _settle_game_over(match_id: str, result: str, winner_color: str | None):
     """Records the result. Does NOT yet move real funds — see module
-    docstring's settlement gap."""
+    docstring's settlement gap.
+
+    Guarded, because the clock loop can be deciding the same match at the same
+    moment: whoever gets there first ends it, and the loser of that race stays
+    quiet rather than overwriting the result or sending a second DM."""
     m = db.get_match(match_id)
     winner_id = None
     if winner_color == "white":
         winner_id = m["player_a_account_id"]
     elif winner_color == "black":
         winner_id = m["player_b_account_id"]
-    db.settle_match(match_id, status="settled", result=result, winner_account_id=winner_id)
+    if not db.settle_match_if_live(match_id, result=result, winner_account_id=winner_id):
+        return
     summary = f"{result}" + (" — you won" if winner_id else " — draw")
     for pid in (m["player_a_account_id"], m["player_b_account_id"]):
         await bot_client.notify_settled(pid, match_id, summary)
