@@ -25,3 +25,6 @@ __pycache__/
 state/
 *-snapshot.json
 *_card.png
+# Internal security audits stay local — never in a public repo (they map past
+# weaknesses and can carry local paths). Kept on disk, out of git.
+docs/AUDIT_*.md
