@@ -561,13 +561,16 @@ async def make_move(match_id: str, body: MoveBody, a: dict = Depends(require_acc
     if await clocks.forfeit_if_flagged(m, at_ms):
         raise HTTPException(400, "your clock ran out")
 
+    import json
+    prior_moves = json.loads(m["moves_json"])
     try:
-        status = chess_logic.apply_uci(m["fen"], body.uci)
+        # Pass the full move history so repetition draws (threefold/fivefold) are
+        # actually detected — rebuilding from the FEN alone can't see them.
+        status = chess_logic.apply_uci(m["fen"], body.uci, history=prior_moves)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    import json
-    moves = json.loads(m["moves_json"]) + [body.uci]
+    moves = prior_moves + [body.uci]
     if not db.apply_move_with_clock(
             match_id, status["fen"], moves, status["turn"], mover_color=my_color,
             mover_remaining_ms=clocks.charge_move(m, my_color, at_ms), now_ms=at_ms):
