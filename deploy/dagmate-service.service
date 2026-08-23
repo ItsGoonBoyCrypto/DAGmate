@@ -16,6 +16,14 @@ User=dagmate-svc
 Group=dagmate-svc
 WorkingDirectory=/opt/dagmate/service
 EnvironmentFile=/etc/dagmate/service.env
+# The master seed is delivered as a systemd CREDENTIAL, not an env var: systemd
+# reads /etc/dagmate/mnemonic as root and exposes it at
+# $CREDENTIALS_DIRECTORY/mnemonic in a per-service tmpfs readable only by this
+# process. It never enters the environment, so it can't be lifted from
+# /proc/<pid>/environ — the one gap a plain env var leaves even with a
+# dedicated user. core.js reads it from there (falling back to the env var for
+# local dev). Keep /etc/dagmate/mnemonic 0400 root:root.
+LoadCredential=mnemonic:/etc/dagmate/mnemonic
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=5

@@ -9,10 +9,17 @@
  * serialization queue below) are the same ones Dagger's kron-service uses,
  * because they're facts about the SDK/protocol, not about Dagger.
  *
+ * The master seed (BIP39 phrase) backs every derived key below. In production
+ * it's delivered through systemd's credential store (LoadCredential=mnemonic),
+ * which places it in a per-service tmpfs readable only by this process and
+ * NEVER in the environment — so it can't be read out of /proc/<pid>/environ
+ * the way a plain env var can. DAGMATE_MASTER_MNEMONIC remains as a fallback
+ * for local dev and non-systemd hosts. Generate a FRESH seed for DAGmate —
+ * never reuse a Dagger seed.
+ *
  * Env vars (all DAGmate-specific, nothing shared with Dagger):
- *   DAGMATE_MASTER_MNEMONIC  — BIP39 phrase backing every derived key below.
- *                              Required. Generate a FRESH one for DAGmate —
- *                              never reuse a Dagger seed.
+ *   DAGMATE_MASTER_MNEMONIC  — fallback seed source when not run under systemd
+ *                              with a `mnemonic` credential (see above).
  *   DAGMATE_NETWORK_ID       — 'mainnet' (default) or a testnet id (e.g.
  *                              'testnet-10').
  *   DAGMATE_KASPA_WRPC       — explicit node wRPC URL. OPTIONAL: unset, the
@@ -31,12 +38,29 @@
  *                          derived from its matchId — nothing to persist.
  */
 import { loadKaspa } from '@kronsdk/kron-sdk/wasm';
+import { readFileSync } from 'node:fs';
 
 const NETWORK_ID = process.env.DAGMATE_NETWORK_ID || 'mainnet';
 const WRPC = process.env.DAGMATE_KASPA_WRPC;
-const MNEMONIC = process.env.DAGMATE_MASTER_MNEMONIC;
 
-if (!MNEMONIC) throw new Error('DAGMATE_MASTER_MNEMONIC not set — the HD master seed is required');
+/** Load the master seed, preferring systemd's credential store over the
+ *  environment. `LoadCredential=mnemonic:...` exposes the seed in a per-service
+ *  tmpfs at $CREDENTIALS_DIRECTORY/mnemonic, readable only by this process and
+ *  absent from its environment — closing the /proc/<pid>/environ exposure a
+ *  plain env var has. Falls back to DAGMATE_MASTER_MNEMONIC for local dev and
+ *  non-systemd hosts. */
+function loadMnemonic() {
+  const dir = process.env.CREDENTIALS_DIRECTORY;
+  if (dir) {
+    try { return readFileSync(`${dir}/mnemonic`, 'utf8').trim(); }
+    catch (e) { /* not provided as a credential — fall through to the env var */ }
+  }
+  return process.env.DAGMATE_MASTER_MNEMONIC;
+}
+const MNEMONIC = loadMnemonic();
+
+if (!MNEMONIC) throw new Error('master seed not set — provide it via systemd LoadCredential '
+  + '(mnemonic) or, for local dev, DAGMATE_MASTER_MNEMONIC');
 
 export const COVENANT_OPTS = { flags: { covenantsEnabled: true } };
 
@@ -65,7 +89,14 @@ export function network() {
 
 /** Deterministically derive the per-match arbiter co-signing key. */
 export function deriveArbiter(matchId) {
-  const key = new k.PrivateKeyGenerator(xprv, false, ACCOUNT_ARBITER).receiveKey(Number(matchId));
+  const idx = Number(matchId);
+  // The index is a server-assigned rowid, never user input — but a non-hardened
+  // BIP-32 index must be an integer in [0, 2^31). Reject anything outside that
+  // rather than silently derive a key from a garbage/overflowed index.
+  if (!Number.isInteger(idx) || idx < 0 || idx >= 2 ** 31) {
+    throw new Error(`invalid matchId for key derivation: ${matchId}`);
+  }
+  const key = new k.PrivateKeyGenerator(xprv, false, ACCOUNT_ARBITER).receiveKey(idx);
   const address = key.toPublicKey().toAddress(netType()).toString();
   return { key, address };
 }

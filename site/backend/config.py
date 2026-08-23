@@ -46,8 +46,27 @@ if BOT_WEBHOOK_SECRET and len(BOT_WEBHOOK_SECRET) < 32:
 # ever turned on the UI says so rather than quietly shaving the payout.
 RAKE_BPS = int(os.getenv("DAGMATE_RAKE_BPS", "0"))
 
-# CLTV reclaim window: ~14 days of DAA at Kaspa's ~10 blocks/sec cadence.
-RECLAIM_DAA_WINDOW = 14 * 24 * 3600 * 10
+# CLTV reclaim window, expressed in DAA-score ticks. The escrow's timelock
+# branch opens at (funding DAA + this), after which a depositor can sweep their
+# OWN stake with their key alone.
+#
+# It's ~14 days at Kaspa's ~10 blocks/sec cadence — but DAA is a BLOCK count,
+# not a wall-clock, so the real elapsed time drifts with the block rate. If BPS
+# ever rose, the same tick count would open sooner in wall-clock; if it fell,
+# later. That drift is harmless in practice: a decisive game settles (arbiter +
+# winner) within seconds of ending, thousands of times faster than even a
+# shrunken window, so the timelock never races settlement. The window only has
+# to be comfortably longer than "how long until someone gets around to
+# settling", and 14 days is. Env-overridable so an operator can retune it if
+# Kaspa's cadence ever changes materially — keep it generous.
+#
+# ⚠️ Disaster-path note: the timelock guarantees each depositor can recover
+# their OWN stake, NOT that a winner can collect their winnings. Collecting a
+# decisive pot needs the arbiter (sidecar) online to co-sign; if the service is
+# permanently gone, the winner can only reclaim their own stake here, not the
+# loser's. That's inherent to the 2-of-3 model (see spec §11 for the covenant
+# endgame that removes the arbiter).
+RECLAIM_DAA_WINDOW = int(os.getenv("DAGMATE_RECLAIM_DAA_WINDOW", str(14 * 24 * 3600 * 10)))
 
 # ── auth (auth.py) ──────────────────────────────────────────────────────
 # Connecting a wallet is a CLAIM; signing a nonce with it is the proof. Until

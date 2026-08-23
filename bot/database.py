@@ -23,9 +23,18 @@ _LINK_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I ambiguity
 def _conn() -> sqlite3.Connection:
     d = os.path.dirname(config.DB_PATH)
     if d:
-        os.makedirs(d, exist_ok=True)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    existed = os.path.exists(config.DB_PATH)
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
+    if not existed:
+        # This DB maps Telegram user ids to site accounts — not a wallet secret,
+        # but not for other local users to read either. Owner-only from creation;
+        # the parent dir is 0700 too. (No-op on Windows, where mode is ignored.)
+        try:
+            os.chmod(config.DB_PATH, 0o600)
+        except OSError:
+            pass
     return conn
 
 
@@ -60,10 +69,16 @@ def get_by_site_account(site_account_id: str) -> dict | None:
         return _row(c.execute("SELECT * FROM links WHERE site_account_id=?", (str(site_account_id),)))
 
 
-def new_link_code(telegram_user_id: int) -> str:
+def new_link_code(telegram_user_id: int) -> str | None:
     """Mint a fresh one-time code for this Telegram user and (re)arm its TTL.
-    Safe to call again before a code is claimed — it just replaces the old
-    one, so a stale /start press can't leave two live codes for one user."""
+    Safe to call again before a code is claimed — it just replaces the old one,
+    so a stale /start press can't leave two live codes for one user.
+
+    Returns None if the user is ALREADY linked: the upsert's
+    `WHERE site_account_id IS NULL` makes it a no-op in that case, so the code
+    was never stored and would be unclaimable — the caller must not hand the
+    user a phantom code (this also closes the check-then-mint race in cmd_start,
+    where the account could get linked between the two)."""
     code = "".join(secrets.choice(_LINK_CODE_ALPHABET) for _ in range(8))
     now = int(time.time())
     with _lock, _conn() as c:
@@ -74,7 +89,11 @@ def new_link_code(telegram_user_id: int) -> str:
             "link_code=excluded.link_code, link_code_expires_ts=excluded.link_code_expires_ts "
             "WHERE site_account_id IS NULL",
             (telegram_user_id, code, now + config.LINK_CODE_TTL_S, now))
-    return code
+        # Confirm the code actually landed (an already-linked row won't have been
+        # touched) rather than trusting rowcount semantics across drivers.
+        row = c.execute("SELECT link_code FROM links WHERE telegram_user_id=?",
+                         (telegram_user_id,)).fetchone()
+    return code if (row and row["link_code"] == code) else None
 
 
 def claim_link_code(code: str, site_account_id: str) -> bool:

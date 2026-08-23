@@ -21,10 +21,18 @@ _lock = threading.Lock()
 def _conn() -> sqlite3.Connection:
     d = os.path.dirname(config.DB_PATH)
     if d:
-        os.makedirs(d, exist_ok=True)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    existed = os.path.exists(config.DB_PATH)
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    if not existed:
+        # The match database (stakes, results, escrow addresses) is owner-only
+        # from creation, inside a 0700 dir. No-op on Windows (mode ignored).
+        try:
+            os.chmod(config.DB_PATH, 0o600)
+        except OSError:
+            pass
     return conn
 
 

@@ -51,12 +51,18 @@ Python 3.10+.
 It will fail at the health check on a first run because there is no env file
 yet. That is expected; carry on.
 
-**4. Generate the seed — ON THE SERVER**
+**4. Generate the seed — ON THE SERVER — into its own credential file**
 
     cd /opt/dagmate/service && node tools/genseed.mjs
 
 This prints the master mnemonic and the derived operating address. The mnemonic
 is the one secret in the system: anyone holding it can co-sign any settlement.
+Put ONLY the mnemonic phrase into a root-owned credential file — the sidecar
+receives it through systemd's credential store, never as an env var (so it
+can't be read from /proc/<pid>/environ even by a same-box attacker):
+
+    umask 077 && printf '%s' 'the twelve or twenty-four words' > /etc/dagmate/mnemonic
+    chown root:root /etc/dagmate/mnemonic && chmod 0400 /etc/dagmate/mnemonic
 
 Generate it here rather than on a laptop, because a phrase generated elsewhere
 has already been through a clipboard, a shell history, and possibly a
@@ -68,21 +74,23 @@ Back it up offline. If it is lost, every open escrow can still be reclaimed by
 its own depositor after 14 days (that is the point of the CLTV branch), but no
 match can ever be settled again.
 
-**5. Env files** — one per process, each readable only by its own user:
+**5. Env files** — one per process, each readable only by its own user. NONE of
+them holds the mnemonic (that's the credential file above):
 
     install -o root -g dagmate-svc  -m 0640 /opt/dagmate/deploy/service.env.example /etc/dagmate/service.env
     install -o root -g dagmate-site -m 0640 /opt/dagmate/deploy/site.env.example    /etc/dagmate/site.env
     install -o root -g dagmate-bot  -m 0640 /opt/dagmate/deploy/bot.env.example     /etc/dagmate/bot.env
-    $EDITOR /etc/dagmate/service.env      # the mnemonic (only file that holds it)
-    $EDITOR /etc/dagmate/site.env         # webhook secret, public URL
+    $EDITOR /etc/dagmate/service.env      # network / node (no secret)
+    $EDITOR /etc/dagmate/site.env         # webhook secret, public URL, bot handle
     $EDITOR /etc/dagmate/bot.env          # bot token, webhook secret
 
-Only `service.env` holds the mnemonic, and only `dagmate-svc` can read it — the
-site and bot users cannot, so an RCE in either can't lift the arbiter seed. The
-webhook secret is shared between `site.env` and `bot.env`: the **same** value in
-both, at least 32 chars (`openssl rand -hex 32`) — the processes refuse to start
-on a shorter one. Then clear the scrollback the mnemonic was printed into
-(`clear && history -c`, or just close the session).
+The seed lives only in `/etc/dagmate/mnemonic` (0400 root), reached by the
+sidecar through `LoadCredential=` — the site and bot users can't read it, and
+it's not in any process's environment, so an RCE in any service can't lift the
+arbiter seed. The webhook secret is shared between `site.env` and `bot.env`: the
+**same** value in both, at least 32 chars (`openssl rand -hex 32`) — the
+processes refuse to start on a shorter one. Then clear the scrollback the
+mnemonic was printed into (`clear && history -c`, or just close the session).
 
 **6. Fund the operating address** with a small KAS float — it pays the network
 fee on any tx the sidecar sends from it (and, if you turn on `DAGMATE_ANCHOR_MOVES`

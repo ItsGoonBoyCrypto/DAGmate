@@ -54,6 +54,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "\u2659 DAGmate alerts are already linked to your account.\n"
             "Use /alerts on|off to toggle, or /unlink to disconnect.")
     code = await asyncio.to_thread(db.new_link_code, user.id)
+    if code is None:
+        # Got linked between the check above and now (or already linked) — don't
+        # hand out a code that was never stored.
+        return await update.effective_message.reply_text(
+            "♙ DAGmate alerts are already linked to your account.\n"
+            "Use /alerts on|off to toggle, or /unlink to disconnect.")
     ttl_min = max(1, config.LINK_CODE_TTL_S // 60)
     await update.effective_message.reply_text(
         f"\u2659 <b>DAGmate alerts</b>\n\n"
@@ -112,7 +118,10 @@ async def _notify(request: web.Request, render) -> web.Response:
     try:
         body = await request.json()
         site_account_id = str(body["site_account_id"])
-    except Exception:
+    except (KeyError, ValueError, TypeError, web.HTTPException) as e:
+        # Malformed JSON, missing field, or wrong content-type — a client error,
+        # logged so a real integration bug isn't invisible, not swallowed whole.
+        log.warning(f"bad notify request on {request.path}: {e!r}")
         return web.json_response({"error": "bad_request"}, status=400)
 
     row = await asyncio.to_thread(db.get_by_site_account, site_account_id)
@@ -175,16 +184,30 @@ async def route_claim_link(request: web.Request) -> web.Response:
         body = await request.json()
         code = str(body["code"]).strip().upper()
         site_account_id = str(body["site_account_id"])
-    except Exception:
+    except (KeyError, ValueError, TypeError, web.HTTPException) as e:
+        log.warning(f"bad link/claim request: {e!r}")
         return web.json_response({"error": "bad_request"}, status=400)
     ok = await asyncio.to_thread(db.claim_link_code, code, site_account_id)
     return web.json_response({"linked": ok} if ok else {"linked": False, "reason": "invalid_or_expired"})
 
 
-def _build_webhook_app(bot) -> web.Application:
+async def route_health(request: web.Request) -> web.Response:
+    """Liveness probe (no auth — it reveals nothing). 200 only when BOTH halves
+    are alive: this aiohttp server AND the Telegram poller. A silent poller death
+    (updater stops but the HTTP server keeps listening) would otherwise go
+    unnoticed; here it flips this to 503 so a monitor can catch it."""
+    app = request.app.get("application")
+    polling = bool(app and app.updater and app.updater.running)
+    status = 200 if polling else 503
+    return web.json_response({"ok": polling, "polling": polling}, status=status)
+
+
+def _build_webhook_app(application) -> web.Application:
     app = web.Application()
-    app["bot"] = bot
+    app["bot"] = application.bot
+    app["application"] = application  # for the health check's poller-liveness probe
     app.add_routes([
+        web.get("/health", route_health),
         web.post("/link/claim", route_claim_link),
         web.post("/notify/challenge", route_notify_challenge),
         web.post("/notify/your-move", route_notify_your_move),
@@ -210,7 +233,7 @@ async def main():
     application.add_handler(CommandHandler("alerts", cmd_alerts, filters=private))
     application.add_handler(CommandHandler("unlink", cmd_unlink, filters=private))
 
-    runner = web.AppRunner(_build_webhook_app(application.bot))
+    runner = web.AppRunner(_build_webhook_app(application))
     await runner.setup()
     site = web.TCPSite(runner, config.WEBHOOK_HOST, config.WEBHOOK_PORT)
     await site.start()
