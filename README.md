@@ -1,7 +1,8 @@
 # DAGmate
 
-P2P wagered chess on Kaspa L1 — real 2-of-3 P2SH escrow on mainnet, pay-per-move
-on-chain anchors, arbiter-settled payouts.
+P2P wagered chess on Kaspa L1 — real 2-of-3 P2SH escrow on mainnet,
+arbiter-settled payouts, and optional per-move on-chain anchoring
+(operator-enabled; see `DAGMATE_ANCHOR_MOVES`).
 
 **Standalone product.** Own domain (dagmate.org), own repo, own bot, own
 service, own database. Shares no code, infrastructure, users, or funds with

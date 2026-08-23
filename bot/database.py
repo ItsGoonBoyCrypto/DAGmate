@@ -83,12 +83,18 @@ def claim_link_code(code: str, site_account_id: str) -> bool:
     claim-row pattern: the UPDATE's WHERE clause IS the check, so a raced or
     replayed claim can't double-link two site accounts to one code."""
     now = int(time.time())
-    with _lock, _conn() as c:
-        cur = c.execute(
-            "UPDATE links SET site_account_id=?, link_code=NULL, link_code_expires_ts=NULL, "
-            "linked_ts=? WHERE link_code=? AND link_code_expires_ts>=? AND site_account_id IS NULL",
-            (str(site_account_id), now, code, now))
-        return cur.rowcount == 1
+    try:
+        with _lock, _conn() as c:
+            cur = c.execute(
+                "UPDATE links SET site_account_id=?, link_code=NULL, link_code_expires_ts=NULL, "
+                "linked_ts=? WHERE link_code=? AND link_code_expires_ts>=? AND site_account_id IS NULL",
+                (str(site_account_id), now, code, now))
+            return cur.rowcount == 1
+    except sqlite3.IntegrityError:
+        # That site account is already linked to a DIFFERENT Telegram (the
+        # UNIQUE index on site_account_id). This is a clean "no" — not a 500 —
+        # so a player who already linked elsewhere gets a rejection, not a crash.
+        return False
 
 
 def set_alerts(telegram_user_id: int, enabled: bool):

@@ -13,10 +13,20 @@ DB_PATH = os.getenv("DAGMATE_SITE_DB", "state/dagmate_site.db")
 
 SERVICE_URL = os.getenv("DAGMATE_SERVICE_URL", "http://127.0.0.1:8910")
 
-BOT_WEBHOOK_URL = os.getenv("DAGMATE_BOT_WEBHOOK_URL", "http://127.0.0.1:8901")
-BOT_WEBHOOK_SECRET = os.getenv("DAGMATE_WEBHOOK_SECRET", "")
+# Public origin, used to turn an in-app path like /play/<id> into an absolute
+# link in a Telegram alert (a bare path isn't clickable there). No trailing
+# slash — bot_client joins it to a leading-slash path.
+PUBLIC_URL = os.getenv("DAGMATE_PUBLIC_URL", "https://dagmate.org").rstrip("/")
 
-FEE_ADDRESS = os.getenv("DAGMATE_FEE_ADDRESS")  # optional; service falls back to operating address
+BOT_WEBHOOK_URL = os.getenv("DAGMATE_BOT_WEBHOOK_URL", "http://127.0.0.1:8901")
+# Empty = no alerts bot in this deployment (bot_client skips silently). If it IS
+# set, it must be long enough to be a real secret — a 4-char value would pass
+# the bot's check but is not a secret. Matches the bot's own >=32 requirement.
+BOT_WEBHOOK_SECRET = os.getenv("DAGMATE_WEBHOOK_SECRET", "")
+if BOT_WEBHOOK_SECRET and len(BOT_WEBHOOK_SECRET) < 32:
+    raise RuntimeError("DAGMATE_WEBHOOK_SECRET is set but shorter than 32 chars — "
+                       "use a real secret (openssl rand -hex 32) or leave it unset")
+
 
 # ⚠️ PLATFORM TAKES NO CUT OF A POT — GoonBoy, 2026-08-22: "no fees taken by the
 # platform - just gas, entries or challenges charged." The winner receives the
@@ -65,12 +75,13 @@ DEPOSIT_CONFIRM_DAA = int(os.getenv("DAGMATE_DEPOSIT_CONFIRM_DAA", "100"))
 DEPOSIT_DEADLINE_SECS = int(os.getenv("DAGMATE_DEPOSIT_DEADLINE_SECS", str(60 * 60)))
 
 # ── settlement (settlement.py) ──────────────────────────────────────────
-# ⚠️ MUST match `priorityFee` in service/escrow.js buildSettleUnsigned(). It's
-# duplicated because the backend has to decide whether a pot is even worth
-# settling BEFORE it asks the sidecar to build a tx — otherwise the only way a
-# player learns their pot is too small is a raw sidecar error. If you change
-# one, change the other.
-SETTLE_FEE_SOMPI_PER_INPUT = 60_000_000
+# ⚠️ MUST match SETTLE_FEE_SOMPI_PER_INPUT in service/escrow.js
+# buildSettleUnsigned(). It's duplicated because the backend has to decide
+# whether a pot is even worth settling BEFORE it asks the sidecar to build a tx
+# — otherwise the only way a player learns their pot is too small is a raw
+# sidecar error. If you change one, change the other, and re-prove the settle
+# build on a funded mainnet escrow.
+SETTLE_FEE_SOMPI_PER_INPUT = 3_000_000
 # A settle spends at least one input per escrow, so this is the floor below
 # which releasing the pot would cost more than the pot. Gas-only matches sit
 # under it by design: they exist for the on-chain move record, not the money.
@@ -90,6 +101,54 @@ TOURNAMENT_MIN_ENTRANTS = int(os.getenv("DAGMATE_TOURNAMENT_MIN_ENTRANTS", "8"))
 
 # Gas-only challenges: dust-level stake, still anchors every move on-chain.
 GAS_ONLY_STAKE_SOMPI = 1000
+
+# Stake bounds for a real (non-gas-only) challenge. The floor keeps a "money"
+# match above the settle fee so the winner actually nets something — a stake
+# below SETTLE_MIN_POT_SOMPI would cost more to release than it pays out. The
+# ceiling is a blast-radius limit, not a business rule: this is wallet-connect
+# P2P with no platform custody, and a fat-fingered 10,000,000-KAS challenge
+# should bounce at the form rather than mint an escrow nobody meant to fund.
+# Both are env-overridable so a deployment can tune them without a code change.
+MIN_STAKE_SOMPI = int(os.getenv("DAGMATE_MIN_STAKE_SOMPI", str(1 * SOMPI_PER_KAS)))
+MAX_STAKE_SOMPI = int(os.getenv("DAGMATE_MAX_STAKE_SOMPI", str(1_000_000 * SOMPI_PER_KAS)))
+
+# ── move anchoring (main.make_move → service/escrow.js anchor) ──────────
+# Every ply, when on, is written to Kaspa L1 as a dust tx carrying a DGMT
+# move payload, paid from DAGmate's OWN operating address (never a player's
+# wallet — see escrow.js anchor()). That makes it a real, recurring operating
+# cost: an N-ply game is N dust txs out of the operating address.
+#
+# ⚠️ DEFAULT OFF, and deliberately so. Whether to anchor at all, whether it's
+# every ply or only the result, and who ultimately funds it are GoonBoy's calls,
+# not something a code change should quietly commit real KAS to. The mechanism
+# is fully built and mainnet-proven (spike S1); this switch is the one place
+# that decides if it runs. While it's off, the site says so (see /api/meta →
+# anchorsMoves and the frontend copy) rather than advertising a feature that
+# isn't happening. Turn it on only once the operating address is funded and
+# the per-move cost is a decision you've made on purpose.
+ANCHOR_MOVES = os.getenv("DAGMATE_ANCHOR_MOVES", "0") == "1"
+
+# ── practice engine (engine.py, main.practice_bot_move) ─────────────────
+# The negamax search is the one CPU-bound endpoint, and it runs in the
+# threadpool of the SAME single-worker process that hosts the deposit watcher
+# and the clock watcher. Under the GIL, CPU-bound threads starve the event
+# loop, and a stalled deposit watcher past DEPOSIT_DEADLINE_SECS expires funded
+# matches — a money outcome. So the number of searches allowed to run at once
+# is capped; requests over the cap get a fast 429 instead of piling into the
+# pool. (bot-move also now requires a session — the practice board is behind a
+# wallet connect anyway — so this is a ceiling on authenticated use, not the
+# only line of defence.)
+PRACTICE_MAX_CONCURRENCY = int(os.getenv("DAGMATE_PRACTICE_MAX_CONCURRENCY", "2"))
+
+# ── learn payments (main.unlock_level) ──────────────────────────────────
+# On-chain gas-payment verification for paid learn levels is NOT wired. Until
+# it is, levels unlock free and the UI is told to say "free" rather than
+# advertise a price DAGmate never collects (GoonBoy, 2026-08-22: "unlocks free,
+# just gas fees would be good"). Flip this on only once a real payment check
+# exists — while it's on, the unlock endpoint refuses paid levels rather than
+# hand them out for free under a price tag. Surfaced in /api/meta so the
+# frontend price copy follows the same switch.
+LEARN_REQUIRE_PAYMENT = os.getenv("DAGMATE_LEARN_REQUIRE_PAYMENT", "0") == "1"
 
 # ── clocks (clocks.py) ──────────────────────────────────────────────────
 # Fischer increment, one mechanism for both modes — `daily` is just a very

@@ -18,16 +18,23 @@ community pool and health-checks it on every connection (see spec §3.0).
 
 Everything below is on the server, as root.
 
-**1. User, directories, and where the secrets live**
+**1. Users, directories, and where the secrets live**
 
-    adduser --system --group --home /opt/dagmate dagmate
-    mkdir -p /opt/dagmate /var/lib/dagmate /etc/dagmate
-    chown dagmate:dagmate /var/lib/dagmate
-    chmod 700 /var/lib/dagmate
+Three service users, one per process, so the key-holding sidecar, the web
+backend, and the alerts bot cannot read each other's secrets or databases — an
+RCE in the internet-facing bot must not be a path to the arbiter seed:
 
-The databases live in `/var/lib/dagmate` and the secrets in `/etc/dagmate` —
-both outside `/opt/dagmate`, which is the deploy root and gets `rsync --delete`d
-on every push. Nothing you cannot regenerate should ever sit in the deploy root.
+    for u in dagmate-svc dagmate-site dagmate-bot; do adduser --system --group --home /opt/dagmate "$u"; done
+    mkdir -p /opt/dagmate /etc/dagmate /var/lib/dagmate/site /var/lib/dagmate/bot
+    chown dagmate-site:dagmate-site /var/lib/dagmate/site
+    chown dagmate-bot:dagmate-bot   /var/lib/dagmate/bot
+    chmod 700 /var/lib/dagmate/site /var/lib/dagmate/bot
+
+The databases live under `/var/lib/dagmate/<proc>` and the secrets in
+`/etc/dagmate` — both outside `/opt/dagmate`, the deploy root that gets
+`rsync --delete`d on every push. The sidecar writes nothing, so it has no state
+dir. The code in `/opt/dagmate` stays owned by **root**: no service user can
+rewrite the code it executes under `Restart=always`.
 
 **2. Runtimes**
 
@@ -61,19 +68,27 @@ Back it up offline. If it is lost, every open escrow can still be reclaimed by
 its own depositor after 14 days (that is the point of the CLTV branch), but no
 match can ever be settled again.
 
-**5. Env file**
+**5. Env files** — one per process, each readable only by its own user:
 
-    cp /opt/dagmate/deploy/env.example /etc/dagmate/dagmate.env
-    chmod 600 /etc/dagmate/dagmate.env && chown root:root /etc/dagmate/dagmate.env
-    $EDITOR /etc/dagmate/dagmate.env      # mnemonic, webhook secret, bot token
+    install -o root -g dagmate-svc  -m 0640 /opt/dagmate/deploy/service.env.example /etc/dagmate/service.env
+    install -o root -g dagmate-site -m 0640 /opt/dagmate/deploy/site.env.example    /etc/dagmate/site.env
+    install -o root -g dagmate-bot  -m 0640 /opt/dagmate/deploy/bot.env.example     /etc/dagmate/bot.env
+    $EDITOR /etc/dagmate/service.env      # the mnemonic (only file that holds it)
+    $EDITOR /etc/dagmate/site.env         # webhook secret, public URL
+    $EDITOR /etc/dagmate/bot.env          # bot token, webhook secret
 
-Then clear the scrollback the mnemonic was printed into (`clear && history -c`,
-or just close the session).
+Only `service.env` holds the mnemonic, and only `dagmate-svc` can read it — the
+site and bot users cannot, so an RCE in either can't lift the arbiter seed. The
+webhook secret is shared between `site.env` and `bot.env`: the **same** value in
+both, at least 32 chars (`openssl rand -hex 32`) — the processes refuse to start
+on a shorter one. Then clear the scrollback the mnemonic was printed into
+(`clear && history -c`, or just close the session).
 
-**6. Fund the operating address** with a small KAS float — it pays for on-chain
-move anchors. Check the balance at the address `genseed.mjs` printed; if it
-shows nothing after you have sent to it, the phrase in the env file is not the
-phrase the address came from.
+**6. Fund the operating address** with a small KAS float — it pays the network
+fee on any tx the sidecar sends from it (and, if you turn on `DAGMATE_ANCHOR_MOVES`
+in `site.env`, one dust anchor per move). Check the balance at the address
+`genseed.mjs` printed; if it shows nothing after you have sent to it, the phrase
+in the env file is not the phrase the address came from.
 
 **7. Units**
 
@@ -123,8 +138,9 @@ The other order produces version skew, whose symptom is
       the rate limits removed.
 - [ ] Log in with a real wallet (Kasware or Kastle) and check the signature
       popup names `dagmate.org`.
-- [ ] Play one gas-only match end to end and confirm the anchor txids resolve
-      on an explorer.
+- [ ] Play one gas-only match end to end. If you enabled `DAGMATE_ANCHOR_MOVES`,
+      confirm the per-move anchor txids resolve on an explorer; if not, confirm
+      the UI does not claim moves are anchored.
 - [ ] Play one real-stake match end to end: deposit, play, settle, and check
       the winner received the whole pot minus network fee — no platform cut.
 - [ ] Let one escrow go unfunded and confirm the funded side can reclaim after

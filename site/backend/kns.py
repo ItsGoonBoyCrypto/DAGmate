@@ -17,6 +17,8 @@ Two call shapes, matching how the frontend uses them:
 from __future__ import annotations
 
 import logging
+import re
+from urllib.parse import quote
 
 import httpx
 
@@ -24,6 +26,21 @@ import config
 import database as db
 
 log = logging.getLogger("dagmate.kns")
+
+# A KNS name is attacker-controlled data from a third-party API, and it's shown
+# to EVERY signed-in player (names ride on open challenges, which are broadcast
+# and re-polled). The frontend HTML-escapes it, but we don't let anything but a
+# real domain-shaped string into the cache in the first place — belt and braces,
+# so a future sink that forgets to escape can't be turned into stored XSS. A
+# .kas domain is lowercase alphanumerics, dot, hyphen, underscore; anything with
+# a "<", quote, space, or other markup character is not a name we'll store.
+_SAFE_NAME = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
+
+
+def _clean(name: str) -> str:
+    """Return the name if it's domain-shaped, else "" (dropped)."""
+    name = (name or "").strip()
+    return name if _SAFE_NAME.match(name) else ""
 
 
 def _fetch(address: str) -> tuple[list[str], str]:
@@ -36,14 +53,17 @@ def _fetch(address: str) -> tuple[list[str], str]:
         for a in (payload.get("assets") or []):
             if not a.get("isDomain"):
                 continue
-            name = str(a.get("asset") or "").strip()
+            name = _clean(str(a.get("asset") or ""))
             if name:
                 names.append(name)
         primary = ""
         try:
-            pr = client.get(f"{config.KNS_API_URL}/primary-name/{address}")
+            # Encode the address into the path — it reaches the DB only after
+            # sidecar-verified derivation today, but a raw f-string here would
+            # break (or worse) the moment that invariant changes elsewhere.
+            pr = client.get(f"{config.KNS_API_URL}/primary-name/{quote(address, safe='')}")
             if pr.status_code == 200:
-                primary = str(((pr.json() or {}).get("data") or {}).get("asset") or "").strip()
+                primary = _clean(str(((pr.json() or {}).get("data") or {}).get("asset") or ""))
         except Exception:
             primary = ""  # optional extra — never fail the whole lookup for it
     if primary and primary in names:

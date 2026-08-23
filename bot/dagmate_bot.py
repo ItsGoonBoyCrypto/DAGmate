@@ -25,6 +25,7 @@ DAGMATE_WEBHOOK_SECRET in the environment (see config.py).
 from __future__ import annotations
 
 import asyncio
+import hmac
 import html
 import logging
 
@@ -32,7 +33,7 @@ from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, filters
 
 import config
 import database as db
@@ -47,7 +48,7 @@ def _esc(v) -> str:
 # ── commands ──────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    row = db.get_link(user.id)
+    row = await asyncio.to_thread(db.get_link, user.id)
     if row and row["site_account_id"]:
         return await update.effective_message.reply_text(
             "\u2659 DAGmate alerts are already linked to your account.\n"
@@ -91,7 +92,12 @@ async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── internal HTTP API (localhost-bound, shared-secret auth) ────────────────
 def _authed(request: web.Request) -> bool:
-    return request.headers.get("X-DAGmate-Secret") == config.WEBHOOK_SHARED_SECRET
+    # Constant-time compare so the check doesn't leak the secret byte-by-byte
+    # through timing the moment WEBHOOK_HOST is ever widened past loopback. The
+    # secret is guaranteed non-empty and >=32 chars by config, so a missing or
+    # empty header can never match.
+    provided = request.headers.get("X-DAGmate-Secret", "")
+    return hmac.compare_digest(provided, config.WEBHOOK_SHARED_SECRET)
 
 
 async def _notify(request: web.Request, render) -> web.Response:
@@ -195,9 +201,14 @@ async def main():
     db.ensure_schema()
 
     application = Application.builder().token(config.BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("alerts", cmd_alerts))
-    application.add_handler(CommandHandler("unlink", cmd_unlink))
+    # Private chats only. /start mints a one-time link code, and in a group that
+    # code would be posted for everyone to see — the first person to paste it
+    # into the site binds the victim's account to their own Telegram. The other
+    # two are personal commands with no reason to run in a group either.
+    private = filters.ChatType.PRIVATE
+    application.add_handler(CommandHandler("start", cmd_start, filters=private))
+    application.add_handler(CommandHandler("alerts", cmd_alerts, filters=private))
+    application.add_handler(CommandHandler("unlink", cmd_unlink, filters=private))
 
     runner = web.AppRunner(_build_webhook_app(application.bot))
     await runner.setup()

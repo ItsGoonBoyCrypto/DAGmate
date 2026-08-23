@@ -9,7 +9,7 @@
 # failing in a way that can't be reproduced. What ships here is a commit, so
 # `git log -1` on either side answers "what is actually running".
 #
-# What it will not touch: /etc/dagmate/dagmate.env (the secrets) and
+# What it will not touch: /etc/dagmate/*.env (the per-process secrets) and
 # /var/lib/dagmate (the databases). Both live outside the deploy root on
 # purpose, so no deploy can overwrite a seed or truncate a match history.
 set -euo pipefail
@@ -19,8 +19,13 @@ ROOT="${DAGMATE_DEPLOY_ROOT:-/opt/dagmate}"
 
 cd "$(dirname "$0")/.."
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "!! uncommitted changes — commit them first, or they won't be what deploys" >&2
+# Refuse on ANY dirty state — modified OR untracked. `git archive HEAD` ships
+# only what's committed, so an untracked-but-forgotten file (e.g. a new
+# deploy/*.env.example the server's setup steps reference) would silently not
+# ship. `git status --porcelain` catches modified, staged, and untracked alike.
+if [ -n "$(git status --porcelain)" ]; then
+    echo "!! uncommitted or untracked changes — commit (and 'git add') them first," >&2
+    echo "   or they won't be what deploys ('git archive HEAD' ships only committed files)" >&2
     git status --short >&2
     exit 1
 fi
@@ -41,10 +46,18 @@ rsync -az --delete \
     "$TMP/" "${HOST}:${ROOT}/"
 
 ssh "$HOST" bash -euo pipefail <<EOF
-    cd "${ROOT}/service" && npm ci --omit=dev
+    # --ignore-scripts: do NOT run any package's install lifecycle scripts.
+    # These installs run as root on the box that holds the arbiter seed, so one
+    # compromised transitive dependency with a postinstall hook would otherwise
+    # execute as root on every deploy. --omit=dev drops build-only deps too.
+    cd "${ROOT}/service" && npm ci --omit=dev --ignore-scripts
     "${ROOT}/venv/bin/pip" install -q -r "${ROOT}/site/backend/requirements.txt"
     "${ROOT}/venv/bin/pip" install -q -r "${ROOT}/bot/requirements.txt"
-    chown -R dagmate:dagmate "${ROOT}"
+
+    # The code is left owned by root (the deploy user), NOT by any service
+    # account: none of the three service users can rewrite the code they execute
+    # under Restart=always. State dirs under /var/lib/dagmate are owned by their
+    # respective users at provisioning time and are not touched here.
 
     # Sidecar first: the backend calls routes on it, so restarting the backend
     # against an older sidecar is exactly the version skew that produces
@@ -66,10 +79,12 @@ echo "$HEALTH"
 # without chain data. That is right for an uptime monitor and wrong for a
 # deploy gate: a deploy where the sidecar can't reach a node has shipped a site
 # that can't take a deposit or pay anyone out, so check the field, not the code.
-case "$HEALTH" in
-    *'"service_ok":true'*) ;;
-    *) echo "!! site is up but the Kaspa sidecar is not answering — no deposits, no settlement." >&2
-       echo "   journalctl -u dagmate-service -n 50" >&2
-       exit 1 ;;
-esac
+# Match the field tolerantly — don't depend on the serializer's exact spacing
+# (a `"service_ok": true` with a space would slip past a literal glob and pass a
+# broken deploy). grep -E allows optional whitespace around the colon.
+if ! printf '%s' "$HEALTH" | grep -qE '"service_ok"[[:space:]]*:[[:space:]]*true'; then
+    echo "!! site is up but the Kaspa sidecar is not answering — no deposits, no settlement." >&2
+    echo "   journalctl -u dagmate-service -n 50" >&2
+    exit 1
+fi
 echo "==> ${REV} live"

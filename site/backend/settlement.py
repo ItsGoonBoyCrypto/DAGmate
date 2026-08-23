@@ -235,6 +235,18 @@ def _public(m: dict, address: str, a: dict, b: dict) -> dict:
     pot = m["settle_pot_sompi"] or 0
     rake = m["settle_rake_sompi"] or 0
     fee = config.SETTLE_FEE_SOMPI_PER_INPUT * len(inputs)
+    distributable = max(0, pot - rake - fee)
+    is_draw = m["winner_account_id"] is None
+    # On a draw the sidecar splits the odd sompi to A (halfA = distributable −
+    # distributable//2, halfB = distributable//2), so the exact amount this
+    # caller receives depends on which side they are. Show THAT number, not a
+    # rounded half, so the display matches the on-chain output to the sompi.
+    if is_draw:
+        half_b = distributable // 2
+        half_a = distributable - half_b
+        payout = half_a if a["address"] == address else half_b
+    else:
+        payout = distributable
     return {
         "state": "broadcast" if m["settle_txid"] else ("ready" if not mine else "needs_signature"),
         "txid": m["settle_txid"],
@@ -246,9 +258,19 @@ def _public(m: dict, address: str, a: dict, b: dict) -> dict:
         "platformFeeKas": rake / config.SOMPI_PER_KAS,
         # What actually lands in a wallet, so the claim button can state the
         # number rather than the player discovering it after signing.
-        "payoutKas": max(0, pot - rake - fee) / config.SOMPI_PER_KAS
-                     / (2 if m["winner_account_id"] is None else 1),
-        "isDraw": m["winner_account_id"] is None,
+        "payoutKas": payout / config.SOMPI_PER_KAS,
+        # Exact integer sompi, as decimal strings (never JS floats — a KAS float
+        # divided by 2 on a draw prints 4.999999999999999). The client formats
+        # from these, and verifies the tx it's about to sign against them: the
+        # sum of every output in txJson MUST equal expectedOutputSompi (= pot −
+        # miner fee), so a substituted tx that pays a different total or routes
+        # money elsewhere can't be signed with a correct-looking amount on screen.
+        "potSompi": str(pot),
+        "networkFeeSompi": str(fee),
+        "platformFeeSompi": str(rake),
+        "payoutSompi": str(payout),
+        "expectedOutputSompi": str(max(0, pot - fee)),
+        "isDraw": is_draw,
         "youWon": m["winner_account_id"] is not None
                   and (a if m["winner_account_id"] == a["id"] else b)["address"] == address,
     }

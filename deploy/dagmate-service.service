@@ -6,10 +6,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=dagmate
-Group=dagmate
+# Its OWN user, not the shared "dagmate". The mnemonic lives only in this
+# process's environment (service.env, 0640 root:dagmate-svc) and nowhere the
+# site or bot user can reach it: a separate UID means the alerts bot — which
+# holds no keys — cannot read /proc/<this-pid>/environ to lift the arbiter seed.
+# That separation is the whole point of B1; ProtectProc below closes the /proc
+# path even against a same-box attacker.
+User=dagmate-svc
+Group=dagmate-svc
 WorkingDirectory=/opt/dagmate/service
-EnvironmentFile=/etc/dagmate/dagmate.env
+EnvironmentFile=/etc/dagmate/service.env
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=5
@@ -29,6 +35,11 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+# Hide every other process, and expose only pids (not the security-relevant
+# fields) — so nothing on the box can walk /proc to read this process's
+# environment or memory maps looking for the seed. Needs systemd v247+.
+ProtectProc=invisible
+ProcSubset=pid
 MemoryDenyWriteExecute=no
 # ^ node's JIT needs W+X pages. Everything else above still applies.
 

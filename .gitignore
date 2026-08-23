@@ -1,11 +1,22 @@
 .env
 .env.*
+# Real env files the operator handles are named like dagmate.env / service.env /
+# site.env / bot.env — none of which .env.* catches. `*.env` does. The committed
+# templates end in .env.example and are NOT matched by this.
+*.env
 *.db
 *.db-journal
 *.db-wal
+*.sqlite
+*.sqlite3
 *.key
 *.pem
 *mnemonic*
+*.mnemonic
+# Seed material dumped to a file. Kept narrow on purpose — a broad `*seed*`
+# would swallow committed source like service/tools/genseed.mjs.
+seed.txt
+*.seed
 node_modules/
 dist/
 venv/

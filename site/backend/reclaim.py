@@ -62,17 +62,28 @@ def _never_settles(m: dict) -> bool:
     since before the timelock opened, since the funding deadline (an hour) is
     two weeks short of it. Still definitionally never went live.
 
-    `settled` with no txid and a pot under the settle fee — the gas-only case.
-    The 2-of-3 branch is open but useless: releasing the pot costs more than
-    the pot. Reclaim is the only way those coins ever move, so it's offered
-    even though a winner nominally exists.
+    `settled` with no txid — two sub-cases:
+      * A DRAW (no winner) is released as ONE joint tx spending both escrows, so
+        it needs BOTH players' signatures. If one agrees the draw and then never
+        signs, the pot can never move through the 2-of-3 branch no matter its
+        size — the honest player would otherwise be stuck. The CLTV branch is
+        then the only way each depositor gets their own stake back, which is
+        exactly what it exists for, so reclaim is offered (the sidecar still
+        gates the actual spend on the timelock).
+      * A decisive result under the settle fee — the gas-only case. The 2-of-3
+        branch is open but useless: releasing costs more than the pot. Reclaim
+        is the only way those coins move, so it's offered even though a winner
+        nominally exists.
 
-    Everything else — a live game, or a settled match whose pot is still
-    claimable — is a no. A slow winner has not forfeited anything.
+    Everything else — a live game, or a decisive settled match whose pot is
+    still claimable by its winner alone — is a no. A slow winner has not
+    forfeited anything.
     """
     if m["status"] in ("expired", "awaiting_deposit"):
         return True
     if m["status"] == "settled" and not m["settle_txid"]:
+        if m["winner_account_id"] is None:
+            return True  # stalled draw — needs both sigs, one side can block it
         pot = (m["funded_a_sompi"] or 0) + (m["funded_b_sompi"] or 0)
         return pot < config.SETTLE_MIN_POT_SOMPI
     return False
@@ -157,6 +168,15 @@ async def prepare(match_id: str, address: str) -> dict:
         "totalKas": int(built["totalSompi"]) / config.SOMPI_PER_KAS,
         "networkFeeKas": int(built["feeSompi"]) / config.SOMPI_PER_KAS,
         "payoutKas": int(built["payoutSompi"]) / config.SOMPI_PER_KAS,
+        # Exact integer sompi as strings — the client formats from these and
+        # checks the tx before signing: a reclaim has one output (the depositor's
+        # own stake back), so the single output MUST equal payoutSompi = total −
+        # fee. Reclaim is single-sig on the depositor, so this browser-side check
+        # is what makes "your stake is yours alone" verifiable rather than trusted.
+        "totalSompi": str(int(built["totalSompi"])),
+        "networkFeeSompi": str(int(built["feeSompi"])),
+        "payoutSompi": str(int(built["payoutSompi"])),
+        "expectedOutputSompi": str(int(built["payoutSompi"])),
         "txid": None,
     }
 

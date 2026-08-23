@@ -98,6 +98,28 @@ let _rpcChain = Promise.resolve();
 // draw shouldn't fail a settlement when the next node over is fine.
 const NODE_ATTEMPTS = 3;
 
+// Every rpc session runs through the single serialized `_rpcChain` below, so a
+// call that never returns doesn't just fail one operation — it wedges the whole
+// sidecar, and because the site backend is the only thing that talks to it,
+// that wedges settlement, reclaim and deposit-watching platform-wide. A hung
+// socket must therefore be bounded. Connect + health are retryable (we move to
+// the next node); the fn timeout is NOT retried — fn may already have broadcast
+// a tx — it only exists to release the chain and surface a transport failure.
+const CONNECT_TIMEOUT_MS = Number(process.env.DAGMATE_RPC_CONNECT_TIMEOUT_MS || 15000);
+const CALL_TIMEOUT_MS = Number(process.env.DAGMATE_RPC_CALL_TIMEOUT_MS || 60000);
+
+/** Reject with a transport-shaped error ("timed out …", matched by
+ *  isTransportError) if `promise` hasn't settled within `ms`. The underlying
+ *  operation isn't cancellable, but withRpc's `finally` disconnects the client
+ *  and releases the queue, so a stuck node can't hold the sidecar hostage. */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // ── which node, and STAYING on it ───────────────────────────────────────
 //
 // An explicit URL pins one node; otherwise the SDK's Resolver fetches a public
@@ -202,12 +224,13 @@ export async function withRpc(fn) {
     for (let i = 0; i < attempts; i++) {
       const rpc = newClient();
       try {
-        await rpc.connect();
-        await assertUsable(rpc);
+        await withTimeout(rpc.connect(), CONNECT_TIMEOUT_MS, 'node connect');
+        await withTimeout(assertUsable(rpc), CONNECT_TIMEOUT_MS, 'node health check');
       } catch (e) {
         lastErr = e;
-        // The pinned node is gone or has gone out of sync. Let it go, so the
-        // next attempt resolves a fresh one rather than retrying a corpse.
+        // The pinned node is gone, hung, or out of sync. Let it go, so the next
+        // attempt resolves a fresh one rather than retrying a corpse. (A connect
+        // timeout lands here and is retried, which is safe — nothing broadcast.)
         _pinnedUrl = null;
         await rpc.disconnect().catch(() => {});
         continue;
@@ -216,7 +239,10 @@ export async function withRpc(fn) {
       // is what keeps a chain of move anchors on one mempool.
       if (!WRPC) _pinnedUrl = rpc.url;
       try {
-        return await fn(rpc);
+        // NOT retried on timeout: fn may already have submitted a transaction,
+        // so running it a second time could double-spend/double-anchor. The
+        // timeout only bounds how long a stuck node can hold the queue.
+        return await withTimeout(fn(rpc), CALL_TIMEOUT_MS, 'rpc call');
       } catch (e) {
         // ⚠️ Only unpin if the NODE failed. A rejected transaction is the chain
         // disagreeing with us, and moving nodes over it orphans our own

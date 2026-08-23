@@ -50,7 +50,7 @@
           </div>
           <label class="checkbox">
             <input type="checkbox" id="chGasOnly">
-            Gas-only (no stake, moves still anchored on-chain)
+            <span id="gasOnlyLabel">Gas-only (no stake)</span>
           </label>
           <button type="submit" class="btn btn-primary full">Create challenge</button>
           <p class="fee-note" id="challengeFeeNote"></p>
@@ -61,6 +61,16 @@
             <input type="checkbox" id="acceptChallengesToggle">
             Accept incoming challenges
           </label>
+        </div>
+
+        <div class="settings-row">
+          <form id="telegramLinkForm" class="row">
+            <label class="grow">Telegram alerts
+              <input type="text" id="tgLinkCode" placeholder="Paste code from /start" autocomplete="off" maxlength="32">
+            </label>
+            <button type="submit" class="btn">Link</button>
+          </form>
+          <p class="muted">Message the DAGmate bot <code>/start</code>, then paste the code here to get match alerts. The bot never sees your wallet.</p>
         </div>
       </div>
 
@@ -121,7 +131,7 @@
   <section class="tab-panel" id="panel-tournaments">
     <div class="card">
       <h2>Tournaments</h2>
-      <p class="muted">Winner-takes-pot. Auto-starts once a tier reaches its minimum entrants.</p>
+      <p class="muted">Seeded 1v1 pairings — once a tier reaches its minimum entrants, players are paired and each pair plays a normal match for their own two stakes.</p>
       <div id="tournamentList" class="list"></div>
     </div>
   </section>

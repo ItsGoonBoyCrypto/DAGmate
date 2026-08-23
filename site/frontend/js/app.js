@@ -20,10 +20,44 @@
 
   const STANDARD_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
   const PIECE_NAME = { p: "pawn", n: "knight", b: "bishop", r: "rook", q: "queen", k: "king" };
+  // Above this stake, creating a challenge asks for a confirmation naming the
+  // amount (F12). A UX guard only — the backend enforces the real stake bounds.
+  const STAKE_CONFIRM_ABOVE_KAS = 100;
 
   function displayName(obj) {
     if (!obj) return "?";
     return obj.knsName || obj.shortAddress || obj.address || "?";
+  }
+
+  /* HTML-escape anything before it goes into an innerHTML string. The one
+   * value here that comes from OUTSIDE our own server is the KNS name — it's
+   * fetched from a third-party naming API, attached to every account, and open
+   * challenges (with their names) are broadcast to every signed-in player and
+   * re-rendered every few seconds. So one hostile ".kas" name would otherwise
+   * land in everyone's DOM with zero interaction, and the obvious payload reads
+   * the session token out of localStorage. Every place a name (or any string we
+   * didn't generate) is interpolated into innerHTML runs through esc(). Nodes
+   * built with textContent/createElement don't need it — the browser doesn't
+   * parse those as markup. */
+  function esc(v) {
+    return String(v == null ? "" : v)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  /* Format an integer sompi amount (as a decimal string) into a KAS string
+   * WITHOUT floating point. Dividing sompi by 1e8 in JS gives things like
+   * 4.999999999999999 on a halved pot, or 0.00001 / exponential notation on
+   * dust — in the biggest number on the screen, next to a "no cut" promise.
+   * BigInt math keeps it exact; trailing zeros are trimmed. Falls back to the
+   * raw input if it isn't a clean integer string. 1 KAS = 100,000,000 sompi. */
+  function kasFromSompi(sompi) {
+    let n;
+    try { n = BigInt(sompi); } catch (_) { return String(sompi == null ? "" : sompi); }
+    const neg = n < 0n; if (neg) n = -n;
+    const whole = (n / 100000000n).toString();
+    const frac = (n % 100000000n).toString().padStart(8, "0").replace(/0+$/, "");
+    return (neg ? "-" : "") + whole + (frac ? "." + frac : "");
   }
 
   const state = {
@@ -46,6 +80,18 @@
     settleFor: null,
     reclaim: null,
     reclaimFor: null,
+    // True while a wallet signature popup is open for a payout/reclaim. The 4s
+    // poll skips rebuilding the match card while it's set, so the money button
+    // the signing handler is holding can't be torn out and silently re-enabled
+    // underneath the wallet prompt (a click-through trap on a signing dialog).
+    signing: false,
+    // Monotonic id for match fetches: a slow poll that resolves after a newer
+    // one must not stamp its stale snapshot (with a fresh clockRecvAt) over the
+    // current board — that would show the player more time than they have (F9).
+    pollSeq: 0,
+    // True while a move POST is in flight, so a poll that started before the
+    // move can't overwrite the post-move state with the position it's replacing.
+    moveInFlight: false,
     selectedSquare: null,
     practiceFen: STANDARD_FEN,
     practiceLegalMoves: [],
@@ -188,7 +234,7 @@
     }
     const short = state.address.length > 14 ? `${state.address.slice(0, 8)}…${state.address.slice(-6)}` : state.address;
     const label = state.knsName || short;
-    area.innerHTML = `<span class="wallet-badge">${state.isDemoWallet ? "🧪 demo · " : ""}${label}</span>
+    area.innerHTML = `<span class="wallet-badge">${state.isDemoWallet ? "🧪 demo · " : ""}${esc(label)}</span>
       <button class="btn" id="disconnectBtn">Disconnect</button>`;
     document.getElementById("disconnectBtn").addEventListener("click", disconnectWallet);
   }
@@ -326,6 +372,25 @@
     } catch (err) { toast(err.message); }
   });
 
+  document.getElementById("telegramLinkForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!state.session) { toast("Connect a wallet first."); return; }
+    const input = document.getElementById("tgLinkCode");
+    const code = input.value.trim();
+    if (!code) { toast("Paste the code the bot gave you."); return; }
+    const btn = e.target.querySelector("button");
+    btn.disabled = true;
+    try {
+      await api("POST", "/api/telegram/link", { code });
+      toast("Telegram linked — you'll get match alerts now.");
+      input.value = "";
+    } catch (err) {
+      toast(err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   // ── challenges ───────────────────────────────────────────────────────
   document.getElementById("challengeForm").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -334,6 +399,13 @@
     const gasOnly = document.getElementById("chGasOnly").checked;
     const stakeKas = gasOnly ? 0 : parseFloat(document.getElementById("chStake").value || "0");
     const mode = document.getElementById("chMode").value;
+    // A staked challenge locks real KAS into escrow the moment it's accepted, so
+    // a large one gets a confirm naming the amount (F12) — the backend caps it
+    // too, this just stops a fat-fingered number before it's posted.
+    if (!gasOnly && stakeKas >= STAKE_CONFIRM_ABOVE_KAS &&
+        !window.confirm(`Create a challenge staking ${stakeKas} KAS? You'll need to fund your escrow with that amount if it's accepted.`)) {
+      return;
+    }
     try {
       await api("POST", "/api/challenges", { toAddress, stakeKas, mode, gasOnly });
       toast("Challenge created.");
@@ -348,25 +420,25 @@
     if (!state.session) { el.innerHTML = `<p class="muted">Connect a wallet to see challenges.</p>`; return; }
     let list;
     try { list = await api("GET", "/api/challenges"); }
-    catch (e) { el.innerHTML = `<p class="muted">${e.message}</p>`; return; }
+    catch (e) { el.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
     if (!list.length) { el.innerHTML = `<p class="muted">No open challenges right now.</p>`; return; }
     el.innerHTML = "";
     for (const ch of list) {
       const mine = ch.fromAddress === state.address;
       const div = document.createElement("div");
       div.className = "list-item";
-      const fromLabel = ch.fromKns || ch.fromShort;
-      const toLabel = ch.toKns || ch.toShort;
+      const fromLabel = esc(ch.fromKns || ch.fromShort);
+      const toLabel = esc(ch.toKns || ch.toShort);
       const label = ch.toAddress ? `${fromLabel} → ${toLabel}` : `${fromLabel} (open challenge)`;
       div.innerHTML = `<div><div>${label}</div>
-        <div class="meta">${ch.gasOnly ? "gas-only" : `${ch.stakeKas} KAS`} · ${ch.mode}</div></div>
+        <div class="meta">${ch.gasOnly ? "gas-only" : `${esc(ch.stakeKas)} KAS`} · ${esc(ch.mode)}</div></div>
         <div class="actions"></div>`;
       const actions = div.querySelector(".actions");
       if (!mine) {
         const acceptBtn = document.createElement("button");
         acceptBtn.className = "btn btn-primary";
         acceptBtn.textContent = "Accept";
-        acceptBtn.addEventListener("click", () => acceptChallenge(ch.id));
+        acceptBtn.addEventListener("click", (e) => acceptChallenge(ch.id, e.currentTarget));
         actions.appendChild(acceptBtn);
       }
       const declineBtn = document.createElement("button");
@@ -378,17 +450,25 @@
     }
   }
 
-  async function acceptChallenge(id) {
+  async function acceptChallenge(id, btn) {
     if (state.profile && !state.profile.hasPubkey) {
       toast("This wallet has no pubkey on file — escrow can't be built. Use a demo wallet for local testing.");
     }
+    // Disable immediately so a double-click can't fire two accepts. The server
+    // now also guards this (one open->accepting transition wins; the loser gets
+    // a 409), so a stale re-enabled button from a background poll can't mint a
+    // second match either — this is the fast local half of that guard.
+    if (btn) btn.disabled = true;
     try {
       const match = await api("POST", `/api/challenges/${id}/accept`);
       toast("Challenge accepted — match created.");
       refreshChallenges();
       refreshMatches();
       openMatch(match.id);
-    } catch (e) { toast(e.message); }
+    } catch (e) {
+      toast(e.message);
+      if (btn) btn.disabled = false;
+    }
   }
 
   async function declineChallenge(id) {
@@ -402,15 +482,15 @@
     if (!state.session) { el.innerHTML = `<p class="muted">Connect a wallet to see your matches.</p>`; return; }
     let list;
     try { list = await api("GET", "/api/matches"); }
-    catch (e) { el.innerHTML = `<p class="muted">${e.message}</p>`; return; }
+    catch (e) { el.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
     if (!list.length) { el.innerHTML = `<p class="muted">No matches yet — create or accept a challenge.</p>`; return; }
     el.innerHTML = "";
     for (const m of list) {
       const div = document.createElement("div");
       div.className = "list-item";
       const opp = m.playerA && m.playerA.address === state.address ? m.playerB : m.playerA;
-      div.innerHTML = `<div><div>vs ${displayName(opp)}</div>
-        <div class="meta">${m.stakeKas} KAS · ${m.mode} · ${m.status}${m.result ? " · " + m.result : ""}</div></div>
+      div.innerHTML = `<div><div>vs ${esc(displayName(opp))}</div>
+        <div class="meta">${esc(m.stakeKas)} KAS · ${esc(m.mode)} · ${esc(m.status)}${m.result ? " · " + esc(m.result) : ""}</div></div>
         <div class="actions"><button class="btn">Open</button></div>`;
       div.querySelector("button").addEventListener("click", () => openMatch(m.id));
       el.appendChild(div);
@@ -424,18 +504,53 @@
     return null;
   }
 
+  // The id of the match the board is ACTUALLY showing right now. Every action
+  // button reads this, never state.currentMatchId, so a move/resign/draw can
+  // only ever fire at the game on screen — even if a fetch for a different
+  // match is mid-flight.
+  function shownMatchId() {
+    return state.currentMatch ? state.currentMatch.id : null;
+  }
+
   async function openMatch(id) {
+    // Fetch the target BEFORE binding the board to it. If this fails we must
+    // not switch: leaving the board showing the old match while the id points
+    // at a new one is exactly how Resign/move/draw fire at the wrong game.
+    // currentMatchId and currentMatch are only ever set together, on success.
+    let m;
+    try {
+      m = await api("GET", `/api/matches/${id}`);
+    } catch (e) {
+      toast(`Couldn't open that match: ${e.message}`);
+      return;
+    }
     state.currentMatchId = id;
+    state.currentMatch = m;
     state.selectedSquare = null;
-    await refreshCurrentMatch();
+    state.clockRecvAt = Date.now();
+    // New match on screen — the payout/reclaim panels must recompute for it.
+    state.settleFor = null;
+    state.reclaimFor = null;
+    renderMatchCard();
     document.getElementById("boardCard").style.display = "block";
     document.getElementById("boardCard").scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   async function refreshCurrentMatch() {
     if (!state.currentMatchId) return;
+    // Don't rebuild the board/panels while a wallet signature is in flight —
+    // the poll would tear out the button the signing handler is holding (F5).
+    if (state.signing) return;
+    // Don't fetch a snapshot a move is about to supersede (F9).
+    if (state.moveInFlight) return;
+    const seq = ++state.pollSeq;
     try {
       const m = await api("GET", `/api/matches/${state.currentMatchId}`);
+      // Drop this response if a newer fetch (or a move) has since superseded it,
+      // or if we've navigated to a different match — either way it's stale and
+      // must not stamp its clock snapshot over what's on screen (F9).
+      if (seq !== state.pollSeq) return;
+      if (m.id !== state.currentMatchId) return;
       if (state.currentMatch && state.currentMatch.fen !== m.fen) state.selectedSquare = null;
       state.currentMatch = m;
       state.clockRecvAt = Date.now();
@@ -496,7 +611,10 @@
     }
     el.innerHTML = `<div class="claim-title">Draw offered</div>
       <div class="claim-note">Your opponent offers a draw. Accept and the match ends level —
-        each stake goes back to whoever put it in, minus the network fee.</div>
+        each stake goes back to whoever put it in, minus the network fee.
+        <strong>Both players then sign to release their own stake;</strong> if your
+        opponent doesn't sign, your stake is still yours but waits in escrow until
+        the reclaim timelock.</div>
       <button class="btn btn-primary full" id="drawAcceptBtn">Accept draw</button>
       <button class="btn full" id="drawDeclineBtn">Decline</button>`;
     document.getElementById("drawAcceptBtn")
@@ -510,9 +628,10 @@
   // `legalMoves` (only GET and /move do), so trusting the response would
   // freeze the board until the next poll.
   async function drawAction(what, okMsg) {
-    if (!state.currentMatchId) return;
+    const id = shownMatchId();
+    if (!id) return;
     try {
-      await api("POST", `/api/matches/${state.currentMatchId}/draw/${what}`);
+      await api("POST", `/api/matches/${id}/draw/${what}`);
       await refreshCurrentMatch();
       refreshMatches();
       toast(okMsg);
@@ -530,9 +649,9 @@
     const who = (col) => (col === "white" ? displayName(m.playerA) : displayName(m.playerB));
     el.innerHTML = order.map((col) => `
       <div class="clock" id="clockRow-${col}">
-        <span class="clock-who">${who(col)}${col === mine ? " (you)" : ""} · ${col}</span>
+        <span class="clock-who">${esc(who(col))}${col === mine ? " (you)" : ""} · ${col}</span>
         <span class="clock-time" id="clockTime-${col}">--:--</span>
-      </div>`).join("") + `<div class="clock-label">${m.clock.label}</div>`;
+      </div>`).join("") + `<div class="clock-label">${esc(m.clock.label)}</div>`;
     tickClocks();
   }
 
@@ -567,6 +686,23 @@
   // The game is over and the money is still sitting in escrow. Releasing it
   // needs a signature from a player's own wallet, so this panel is the only
   // place funds ever move.
+  // A prepare() (settle or reclaim) can fail on a transient sidecar blip. The
+  // old code left the *For flag set and never retried, so one blip stranded the
+  // winner's payout panel until a full page reload — which the UI never
+  // suggested. This renders the error with a real "Try again" button and uses
+  // textContent for the message (never innerHTML — a server error string is not
+  // ours to trust as markup). The scoped querySelector avoids id collisions
+  // between the settle and reclaim panels showing errors at once.
+  function showPrepareError(el, title, err, onRetry, extraHtml) {
+    el.innerHTML = `<div class="claim-title">${esc(title)}</div>
+      <div class="claim-note prep-err"></div>
+      <button class="btn full prep-retry">Try again</button>${extraHtml || ""}`;
+    el.querySelector(".prep-err").textContent = err && err.message ? err.message : String(err);
+    el.querySelector(".prep-retry").addEventListener("click", onRetry);
+  }
+  function retrySettle(m) { state.settleFor = null; renderClaim(m); }
+  function retryReclaim(m) { state.reclaimFor = null; renderReclaim(m); }
+
   function renderClaim(m) {
     const el = document.getElementById("claimPanel");
     if (m.status !== "settled" || !myColorFor(m)) { el.innerHTML = ""; return; }
@@ -579,24 +715,26 @@
       el.innerHTML = `<div class="claim-title">Checking the pot…</div>`;
       api("POST", `/api/matches/${m.id}/settle/prepare`)
         .then((s) => { if (state.settleFor === m.id) { state.settle = s; renderClaim(m); } })
-        .catch((e) => { el.innerHTML = `<div class="claim-title">Payout</div>
-          <div class="claim-note">${e.message}</div>`; });
+        .catch((e) => { if (state.settleFor === m.id) showPrepareError(el, "Payout", e, () => retrySettle(m)); });
       return;
     }
     const s = state.settle;
+    // settle is null but the match is still selected → a prepare that failed and
+    // left the error panel up (see showPrepareError). Don't auto-retry every
+    // poll; the "Try again" button drives it.
     if (!s) return;
 
     if (s.state === "broadcast") {
       el.innerHTML = `<div class="claim-title">Paid out</div>
-        <div class="claim-amount">${s.payoutKas} KAS</div>
-        <div class="claim-note">Released on chain. Transaction <code>${s.txid}</code>.</div>`;
+        <div class="claim-amount">${kasFromSompi(s.payoutSompi)} KAS</div>
+        <div class="claim-note">Released on chain. Transaction <code>${esc(s.txid)}</code>.</div>`;
       return;
     }
     const heading = s.isDraw ? "Draw — your half" : (s.youWon ? "You won the pot" : "Payout");
     const needsMe = s.mySignatureInputs && s.mySignatureInputs.length;
     el.innerHTML = `
       <div class="claim-title">${heading}</div>
-      <div class="claim-amount">${s.payoutKas} KAS</div>
+      <div class="claim-amount">${kasFromSompi(s.payoutSompi)} KAS</div>
       ${feeBreakdown(s)}
       ${needsMe ? `<button class="btn btn-primary full" id="claimBtn">Sign &amp; release</button>`
                 : `<div class="claim-note">${s.waitingOnOpponent
@@ -610,11 +748,12 @@
   // above rather than take it on trust. The platform line is driven by the
   // server's own fee config, so it can never say "no cut" while taking one.
   function feeBreakdown(s) {
+    const hasRake = s.platformFeeSompi != null ? s.platformFeeSompi !== "0" : s.platformFeeKas > 0;
     return `<div class="claim-fees">
-      <div><span>Pot</span><span>${s.potKas} KAS</span></div>
-      <div><span>Kaspa network fee</span><span>−${s.networkFeeKas} KAS</span></div>
-      <div><span>DAGmate fee</span><span>${s.platformFeeKas > 0
-        ? `−${s.platformFeeKas} KAS` : "none"}</span></div>
+      <div><span>Pot</span><span>${kasFromSompi(s.potSompi)} KAS</span></div>
+      <div><span>Kaspa network fee</span><span>−${kasFromSompi(s.networkFeeSompi)} KAS</span></div>
+      <div><span>DAGmate fee</span><span>${hasRake
+        ? `−${kasFromSompi(s.platformFeeSompi)} KAS` : "none"}</span></div>
     </div>`;
   }
 
@@ -622,22 +761,30 @@
     const s = state.settle;
     const btn = document.getElementById("claimBtn");
     if (btn) { btn.disabled = true; btn.textContent = "Waiting for your wallet…"; }
-    let sigs;
+    // Freeze the panel rebuild while the wallet popup is open (F5): otherwise
+    // the 4s poll re-renders this panel, resurrects an ENABLED button, and the
+    // handle held here goes stale — training the player to click through a
+    // second signing prompt.
+    state.signing = true;
     try {
-      sigs = await signSettleInputs(s.txJson, s.mySignatureInputs);
-    } catch (e) {
-      toast(`Signing failed: ${e.message}`);
-      if (btn) { btn.disabled = false; btn.textContent = "Sign & release"; }
-      return;
-    }
-    try {
-      state.settle = await api("POST", `/api/matches/${m.id}/settle/submit`,
-                               { sigs });
-      renderClaim(m);
-      toast(state.settle.txid ? "Payout broadcast." : "Signed — waiting on your opponent.");
-    } catch (e) {
-      toast(`Payout failed: ${e.message}`);
-      if (btn) { btn.disabled = false; btn.textContent = "Sign & release"; }
+      let sigs;
+      try {
+        sigs = await signSettleInputs(s.txJson, s.mySignatureInputs, s);
+      } catch (e) {
+        toast(`Signing failed: ${e.message}`);
+        if (btn) { btn.disabled = false; btn.textContent = "Sign & release"; }
+        return;
+      }
+      try {
+        state.settle = await api("POST", `/api/matches/${m.id}/settle/submit`, { sigs });
+        renderClaim(m);
+        toast(state.settle.txid ? "Payout broadcast." : "Signed — waiting on your opponent.");
+      } catch (e) {
+        toast(`Payout failed: ${e.message}`);
+        if (btn) { btn.disabled = false; btn.textContent = "Sign & release"; }
+      }
+    } finally {
+      state.signing = false;
     }
   }
 
@@ -647,7 +794,40 @@
   // produce these signatures. The demo wallet deliberately cannot do it: it
   // exists to click through the game locally, and letting it anywhere near a
   // real payout is exactly the shortcut that ends up shipping.
-  async function signSettleInputs(txJson, indexes) {
+  // Verify a server-supplied tx pays what the panel says BEFORE the wallet
+  // signs it (F7). We can't turn a scriptPublicKey into an address without the
+  // Kaspa WASM SDK (not loaded here), but we can parse the tx and sum its
+  // outputs: the total leaving the escrow must equal the amount on screen (pot
+  // minus the miner fee for a settle; stake minus fee for a reclaim). This is
+  // what makes "DAGmate can never move it alone" checkable instead of trusted.
+  //
+  // Fail-OPEN on any uncertainty (unparseable JSON, unexpected shape, values we
+  // can't read as integers): a real payout must never be bricked by a
+  // serialization detail we guessed wrong. Fail-CLOSED only on a definite
+  // mismatch — outputs we CAN read that sum to something other than expected.
+  function verifyOutputsTotal(txJson, expectedSompi) {
+    if (expectedSompi == null) return;
+    let expected;
+    try { expected = BigInt(expectedSompi); } catch (_) { return; }
+    let tx;
+    try { tx = JSON.parse(txJson); } catch (_) { return; }
+    const outs = tx && Array.isArray(tx.outputs) ? tx.outputs : null;
+    if (!outs || !outs.length) return;  // shape we don't recognise — don't block
+    let sum = 0n;
+    for (const o of outs) {
+      let v;
+      try { v = BigInt(o.value); } catch (_) { return; }  // can't read a value — skip the check
+      if (v < 0n) return;
+      sum += v;
+    }
+    if (sum !== expected) {
+      throw new Error("this transaction doesn't pay the amount shown — refusing to sign. "
+        + "Reload and try again; if it persists, do not sign.");
+    }
+  }
+
+  async function signSettleInputs(txJson, indexes, ctx) {
+    verifyOutputsTotal(txJson, ctx && ctx.expectedOutputSompi);
     const provider = window.kasware || window.kastle;
     if (!provider) throw new Error("connect Kasware or Kastle to release the pot");
     const out = {};
@@ -680,7 +860,7 @@
     const txid = color === "white" ? r.aTxid : r.bTxid;
     if (txid) {
       el.innerHTML = `<div class="claim-title">Stake reclaimed</div>
-        <div class="claim-note">Returned to your wallet. Transaction <code>${txid}</code>.</div>`;
+        <div class="claim-note">Returned to your wallet. Transaction <code>${esc(txid)}</code>.</div>`;
       return;
     }
     // Same once-per-match guard as renderClaim: prepare() builds a real
@@ -692,8 +872,12 @@
       el.innerHTML = `<div class="claim-title">Checking your escrow…</div>`;
       api("POST", `/api/matches/${m.id}/reclaim/prepare`)
         .then((s) => { if (state.reclaimFor === m.id) { state.reclaim = s; renderReclaim(m); } })
-        .catch((e) => { el.innerHTML = `<div class="claim-title">Reclaim your stake</div>
-          <div class="claim-note">${e.message}</div>${escapeHatch(m, color)}`; });
+        .catch((e) => {
+          if (state.reclaimFor !== m.id) return;
+          // The escape hatch stays visible even on failure — its whole point is
+          // to work when the server path doesn't (append it after the retry).
+          showPrepareError(el, "Reclaim your stake", e, () => retryReclaim(m), escapeHatch(m, color));
+        });
       return;
     }
     const s = state.reclaim;
@@ -701,15 +885,15 @@
 
     if (s.state === "broadcast") {
       el.innerHTML = `<div class="claim-title">Stake reclaimed</div>
-        <div class="claim-note">Returned to your wallet. Transaction <code>${s.txid}</code>.</div>`;
+        <div class="claim-note">Returned to your wallet. Transaction <code>${esc(s.txid)}</code>.</div>`;
       return;
     }
     el.innerHTML = `
       <div class="claim-title">Reclaim your stake</div>
-      <div class="claim-amount">${s.payoutKas} KAS</div>
+      <div class="claim-amount">${kasFromSompi(s.payoutSompi)} KAS</div>
       <div class="claim-fees">
-        <div><span>In your escrow</span><span>${s.totalKas} KAS</span></div>
-        <div><span>Kaspa network fee</span><span>−${s.networkFeeKas} KAS</span></div>
+        <div><span>In your escrow</span><span>${kasFromSompi(s.totalSompi)} KAS</span></div>
+        <div><span>Kaspa network fee</span><span>−${kasFromSompi(s.networkFeeSompi)} KAS</span></div>
         <div><span>DAGmate fee</span><span>none</span></div>
       </div>
       <button class="btn btn-primary full" id="reclaimBtn">Sign &amp; reclaim</button>
@@ -726,34 +910,39 @@
     if (!redeem) return "";
     return `<div class="claim-note" style="margin-top:10px;">
       This stake is yours with or without DAGmate. After DAA
-      <code>${m.reclaim.reclaimDaa}</code> the escrow's timelock branch is
-      spendable by your key alone — escrow <code>${addr}</code>, redeem script
-      <code>${redeem}</code>.</div>`;
+      <code>${esc(m.reclaim.reclaimDaa)}</code> the escrow's timelock branch is
+      spendable by your key alone — escrow <code>${esc(addr)}</code>, redeem script
+      <code>${esc(redeem)}</code>.</div>`;
   }
 
   async function doReclaim(m) {
     const s = state.reclaim;
     const btn = document.getElementById("reclaimBtn");
     if (btn) { btn.disabled = true; btn.textContent = "Waiting for your wallet…"; }
-    let sigMap;
+    state.signing = true;  // freeze the panel rebuild while the popup is open (F5)
     try {
-      // Identical wallet call to a settlement: same custom-script signing API,
-      // same P2SH input. Only the branch the signature ends up selecting
-      // differs, and that's decided server-side when the witness is built.
-      sigMap = await signSettleInputs(s.txJson, s.mySignatureInputs);
-    } catch (e) {
-      toast(`Signing failed: ${e.message}`);
-      if (btn) { btn.disabled = false; btn.textContent = "Sign & reclaim"; }
-      return;
-    }
-    try {
-      state.reclaim = await api("POST", `/api/matches/${m.id}/reclaim/submit`,
-                                { txJson: s.txJson, sigs: s.mySignatureInputs.map((i) => sigMap[i]) });
-      renderReclaim(m);
-      toast("Stake reclaimed.");
-    } catch (e) {
-      toast(`Reclaim failed: ${e.message}`);
-      if (btn) { btn.disabled = false; btn.textContent = "Sign & reclaim"; }
+      let sigMap;
+      try {
+        // Identical wallet call to a settlement: same custom-script signing API,
+        // same P2SH input. Only the branch the signature ends up selecting
+        // differs, and that's decided server-side when the witness is built.
+        sigMap = await signSettleInputs(s.txJson, s.mySignatureInputs, s);
+      } catch (e) {
+        toast(`Signing failed: ${e.message}`);
+        if (btn) { btn.disabled = false; btn.textContent = "Sign & reclaim"; }
+        return;
+      }
+      try {
+        state.reclaim = await api("POST", `/api/matches/${m.id}/reclaim/submit`,
+                                  { txJson: s.txJson, sigs: s.mySignatureInputs.map((i) => sigMap[i]) });
+        renderReclaim(m);
+        toast("Stake reclaimed.");
+      } catch (e) {
+        toast(`Reclaim failed: ${e.message}`);
+        if (btn) { btn.disabled = false; btn.textContent = "Sign & reclaim"; }
+      }
+    } finally {
+      state.signing = false;
     }
   }
 
@@ -764,21 +953,21 @@
     const el = document.getElementById("escrowInfo");
     const f = m.funding;
     if (!f || m.status !== "awaiting_deposit") {
-      el.innerHTML = `escrow A: ${m.escrowA || "(pending)"}<br>escrow B: ${m.escrowB || "(pending)"}`;
+      el.innerHTML = `escrow A: ${esc(m.escrowA || "(pending)")}<br>escrow B: ${esc(m.escrowB || "(pending)")}`;
       return;
     }
     const side = (label, addr, paid, got) => `
       <div class="deposit-row">
         <span class="deposit-tick ${paid ? "ok" : ""}">${paid ? "✓" : "…"}</span>
         <div>
-          <div>${label} — ${paid ? "stake received" : `${got} / ${f.stakeKas} KAS`}</div>
-          <div class="deposit-addr">${addr || "(pending)"}</div>
+          <div>${label} — ${paid ? "stake received" : `${esc(got)} / ${esc(f.stakeKas)} KAS`}</div>
+          <div class="deposit-addr">${esc(addr || "(pending)")}</div>
         </div>
       </div>`;
     el.innerHTML =
-      side(`${displayName(m.playerA)} (white)`, m.escrowA, f.aFunded, f.aKas) +
-      side(`${displayName(m.playerB)} (black)`, m.escrowB, f.bFunded, f.bKas) +
-      `<div class="meta">Send at least ${f.stakeKas} KAS to your own escrow address. The match
+      side(`${esc(displayName(m.playerA))} (white)`, m.escrowA, f.aFunded, f.aKas) +
+      side(`${esc(displayName(m.playerB))} (black)`, m.escrowB, f.bFunded, f.bKas) +
+      `<div class="meta">Send at least ${esc(f.stakeKas)} KAS to your own escrow address. The match
        starts automatically once both stakes confirm. If both sides haven't funded within
        ${f.windowMins} minutes the match is cancelled, and any stake you sent stays yours.</div>`;
   }
@@ -802,31 +991,51 @@
   }
 
   async function submitMove(uci) {
+    const id = shownMatchId();
+    if (!id) return;
+    state.moveInFlight = true;
     try {
-      const m = await api("POST", `/api/matches/${state.currentMatchId}/move`, { uci });
+      const m = await api("POST", `/api/matches/${id}/move`, { uci });
+      // Guard against a move response landing after we've navigated away.
+      if (shownMatchId() !== m.id) return;
+      // Bump the poll sequence so any in-flight GET that started before this
+      // move is discarded when it resolves, rather than reverting the board.
+      state.pollSeq++;
       state.currentMatch = m;
+      state.clockRecvAt = Date.now();
       renderMatchCard();
       refreshMatches();
     } catch (e) { toast(e.message); }
+    finally { state.moveInFlight = false; }
   }
 
   document.getElementById("drawBtn").addEventListener("click",
     () => drawAction("offer", "Draw offered — your opponent has to agree."));
 
-  document.getElementById("resignBtn").addEventListener("click", async () => {
-    if (!state.currentMatchId) return;
+  document.getElementById("resignBtn").addEventListener("click", async (e) => {
+    const m = state.currentMatch;
+    if (!m) return;
+    // Resigning hands the whole pot to the opponent and cannot be undone —
+    // every other money decision in the app is spelled out, so this one is too.
+    // The confirm names the stake at risk (and sits behind the browser's own
+    // dialog, which a clickjacking frame can't drive).
+    const stake = m.gasOnly ? "this gas-only game" : `your ${m.stakeKas} KAS stake`;
+    if (!window.confirm(`Resign and forfeit ${stake} to your opponent? This can't be undone.`)) return;
+    const btn = e.currentTarget;
+    btn.disabled = true;
     try {
-      const m = await api("POST", `/api/matches/${state.currentMatchId}/resign`);
-      state.currentMatch = m;
-      renderMatchCard();
+      const r = await api("POST", `/api/matches/${m.id}/resign`);
+      if (shownMatchId() === r.id) { state.currentMatch = r; renderMatchCard(); }
       refreshMatches();
-    } catch (e) { toast(e.message); }
+    } catch (err) { toast(err.message); }
+    finally { btn.disabled = false; }
   });
 
   document.getElementById("fundBtn").addEventListener("click", async () => {
-    if (!state.currentMatchId) return;
+    const id = shownMatchId();
+    if (!id) return;
     try {
-      await api("POST", `/api/matches/${state.currentMatchId}/dev-mark-funded`);
+      await api("POST", `/api/matches/${id}/dev-mark-funded`);
       toast("Marked funded (dev-only — no real deposit check).");
       refreshCurrentMatch();
       refreshMatches();
@@ -838,7 +1047,7 @@
     const el = document.getElementById("tournamentList");
     let list;
     try { list = await api("GET", "/api/tournaments"); }
-    catch (e) { el.innerHTML = `<p class="muted">${e.message}</p>`; return; }
+    catch (e) { el.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
     el.innerHTML = "";
     for (const t of list) {
       const div = document.createElement("div");
@@ -855,7 +1064,7 @@
     if (!state.session) { toast("Connect a wallet first."); return; }
     try {
       const r = await api("POST", `/api/tournaments/${tierKas}/join`);
-      toast(r.alreadyJoined ? "Already in this lobby." : r.started ? "Lobby full — tournament started!" : "Joined lobby.");
+      toast(r.alreadyJoined ? "Already in this lobby." : r.started ? "Lobby full — pairings created!" : "Joined lobby.");
       refreshTournaments();
       if (r.started) refreshMatches();
     } catch (e) { toast(e.message); }
@@ -884,8 +1093,10 @@
       for (const lv of levels) {
         const div = document.createElement("div");
         div.className = "list-item";
+        const priceNote = (lv.gas_kas && state.meta && state.meta.learnRequiresPayment)
+          ? "· " + lv.gas_kas + " KAS gas" : "· free";
         div.innerHTML = `<div><div>${lv.title}</div>
-          <div class="meta">${lv.summary} ${lv.gas_kas ? "· " + lv.gas_kas + " KAS gas" : "· free"}</div></div>
+          <div class="meta">${lv.summary} ${priceNote}</div></div>
           <div class="actions"><span class="badge ${lv.unlocked ? "unlocked" : "locked"}">${lv.unlocked ? "unlocked" : "locked"}</span>
             <button class="btn">${lv.unlocked ? "Open" : "Unlock"}</button></div>`;
         div.querySelector("button").addEventListener("click", () => lv.unlocked ? openLevel(lv) : unlockLevel(lv));
@@ -905,14 +1116,14 @@
       const r = await api("GET", `/api/learn/levels/${lv.id}/content`);
       body.innerHTML = r.body;
     } catch (e) {
-      body.innerHTML = `<p class="muted">${e.message}</p>`;
+      body.innerHTML = `<p class="muted">${esc(e.message)}</p>`;
     }
   }
 
   async function unlockLevel(lv) {
     try {
       await api("POST", `/api/learn/levels/${lv.id}/unlock`);
-      toast(lv.gas_kas ? `Unlocked (${lv.gas_kas} KAS gas — recorded, not yet chain-verified in this test build).` : "Unlocked.");
+      toast("Unlocked.");
       await refreshLearn();
     } catch (e) { toast(e.message); }
   }
@@ -1078,6 +1289,15 @@
     document.getElementById("challengeFeeNote").textContent = f.takesCut
       ? `You pay your stake. DAGmate takes ${(f.platformFeeBps / 100).toFixed(2)}% of the pot on settlement.`
       : "You pay your stake and nothing else — DAGmate takes no cut of the pot.";
+    // Only claim on-chain anchoring when the server says it's actually running.
+    document.getElementById("gasOnlyLabel").textContent = meta.anchorsMoves
+      ? "Gas-only (no stake — every move is anchored on-chain)"
+      : "Gas-only (no stake)";
+    // Cap the stake field to the server's accepted range (F12) — the backend
+    // still enforces it, this just stops a bad amount at the form.
+    const stakeEl = document.getElementById("chStake");
+    if (meta.minStakeKas != null) stakeEl.min = meta.minStakeKas;
+    if (meta.maxStakeKas != null) stakeEl.max = meta.maxStakeKas;
   }
 
   // ── boot ─────────────────────────────────────────────────────────────

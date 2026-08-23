@@ -6,10 +6,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=dagmate
-Group=dagmate
+# The "no keys" process gets its own user precisely BECAUSE it's the most
+# exposed (it talks to Telegram). It can't read service.env (the mnemonic) and
+# can't write the site's match DB — so an RCE here is an RCE in a notification
+# relay, not a path to the arbiter key or the pot.
+User=dagmate-bot
+Group=dagmate-bot
 WorkingDirectory=/opt/dagmate/bot
-EnvironmentFile=/etc/dagmate/dagmate.env
+EnvironmentFile=/etc/dagmate/bot.env
 ExecStart=/opt/dagmate/venv/bin/python dagmate_bot.py
 Restart=always
 RestartSec=10
@@ -30,8 +34,12 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+ProtectProc=invisible
+ProcSubset=pid
 
-ReadWritePaths=/var/lib/dagmate
+# Only the bot's OWN link database, in its own subdir. DAGMATE_BOT_DB in
+# bot.env points here.
+ReadWritePaths=/var/lib/dagmate/bot
 
 StandardOutput=journal
 StandardError=journal

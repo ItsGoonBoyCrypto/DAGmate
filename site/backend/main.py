@@ -33,8 +33,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import random
+import threading
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -59,6 +61,44 @@ log = logging.getLogger("dagmate.site")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = FastAPI(title="DAGmate")
+
+
+# Security headers on EVERY response, including the static HTML page. In
+# production nginx also sets a CSP, but a local/dev `uvicorn main:app` run has
+# no nginx in front — and DAGmate is meant to be run and poked at by hostile
+# eyes on testnet — so the app must carry its own baseline rather than rely on
+# a reverse proxy that isn't always there.
+#
+# The policy is deliberately tight: scripts and XHR/fetch only from our own
+# origin (so a stored-XSS payload in, say, a hostile KNS name can't beacon a
+# stolen session token to an attacker's host), the page can't be framed
+# (clickjacking on the one-click Resign button), and only Google Fonts is
+# allowed off-origin. 'unsafe-inline' is granted for STYLE only — the app uses a
+# handful of inline style attributes and the Google Fonts stylesheet — never for
+# script; there are no inline <script> blocks or on* handlers to need it.
+_CSP = (
+    "default-src 'none'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "base-uri 'none'; "
+    "object-src 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'none'"
+)
+
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault("Content-Security-Policy", _CSP)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Permissions-Policy", "geolocation=(), camera=(), microphone=(), payment=()")
+    return resp
 
 
 @app.on_event("startup")
@@ -126,17 +166,19 @@ def optional_account(authorization: str | None = Header(default=None)) -> dict |
     return auth.account_for_token(_token(authorization))
 
 
-async def _reclaim_daa() -> tuple[int, str]:
-    """Best-effort live DAA score + the standard 14-day CLTV window. Falls
-    back to a clearly-fake placeholder if the sidecar/node is unreachable —
-    good enough to demo the escrow-building UI locally, NOT good enough for
-    a real deposit (see module docstring)."""
-    try:
-        current = await service_client.daa_score()
-        return current + config.RECLAIM_DAA_WINDOW, "live"
-    except ServiceError as e:
-        log.warning(f"DAA lookup failed, using placeholder reclaim window: {e}")
-        return config.RECLAIM_DAA_WINDOW, "fallback"
+async def _reclaim_daa() -> int:
+    """Live DAA score + the standard 14-day CLTV window, as the ABSOLUTE DAA at
+    which a stranded stake becomes reclaimable.
+
+    There is deliberately NO fallback. A placeholder window (just
+    RECLAIM_DAA_WINDOW with no live baseline) is millions of DAA below the real
+    chain height, so an escrow built with it has an ALREADY-OPEN timelock — a
+    player could drain their own stake mid-game. If the node can't be reached we
+    let this raise (ServiceError) and refuse to create the match at all, rather
+    than build an unsafe escrow. Failing a match creation is recoverable; a live
+    escrow whose reclaim branch is open from block one is not."""
+    current = await service_client.daa_score()
+    return current + config.RECLAIM_DAA_WINDOW
 
 
 def _challenge_public(ch: dict) -> dict:
@@ -266,6 +308,40 @@ def set_accept_challenges(body: AcceptTogglBody, account: dict = Depends(require
     return {"ok": True}
 
 
+class TelegramLinkBody(BaseModel):
+    code: str
+
+
+@app.post("/api/telegram/link")
+async def telegram_link(body: TelegramLinkBody, account: dict = Depends(require_account)):
+    """Finish the link the bot's /start began: the player pastes the one-time
+    code here (authenticated as themselves — the account comes from the session,
+    never the body), and we hand it to the bot to bind that Telegram to this
+    account. The site never sees the Telegram id; the bot never sees a wallet.
+
+    Bounded to a plausible code so a flood of junk can't be relayed to the bot,
+    and every non-success reason from the bot is surfaced as a distinct message
+    rather than a generic failure — a player whose bot simply isn't running in
+    this deployment should be told that, not "invalid code"."""
+    code = body.code.strip().upper()
+    if not (4 <= len(code) <= 32):
+        raise HTTPException(400, "that doesn't look like a link code — send /start to the bot to get one")
+    result = await bot_client.claim_link(code, account["id"])
+    if result.get("linked"):
+        return {"ok": True}
+    reason = result.get("reason", "invalid_or_expired")
+    msg = {
+        "not_configured": "Telegram alerts aren't set up on this server.",
+        "unreachable": "Couldn't reach the alerts bot — try again in a moment.",
+        "bot_error": "The alerts bot rejected the request — try again in a moment.",
+        "invalid_or_expired": "That code is invalid or has expired — send /start to the bot for a new one.",
+    }.get(reason, "That code is invalid or has expired — send /start to the bot for a new one.")
+    # 502 for a bot-side/transport problem the player can't fix by retyping;
+    # 400 for a bad code, which they can.
+    status = 502 if reason in ("unreachable", "bot_error") else 400
+    raise HTTPException(status, msg)
+
+
 # ── challenges ───────────────────────────────────────────────────────────
 class NewChallengeBody(BaseModel):
     toAddress: str | None = None
@@ -278,18 +354,36 @@ class NewChallengeBody(BaseModel):
 def new_challenge(body: NewChallengeBody, account: dict = Depends(require_account)):
     if body.mode not in ("rapid", "daily"):
         raise HTTPException(400, "mode must be 'rapid' or 'daily'")
-    stake_sompi = config.GAS_ONLY_STAKE_SOMPI if body.gasOnly else round(body.stakeKas * config.SOMPI_PER_KAS)
-    if stake_sompi <= 0:
-        raise HTTPException(400, "stake must be above zero (or tick gas-only)")
+    if body.gasOnly:
+        stake_sompi = config.GAS_ONLY_STAKE_SOMPI
+    else:
+        # stakeKas is a float off the wire: NaN/inf survive JSON and would sail
+        # past a `<= 0` check (NaN comparisons are all false), minting an escrow
+        # for a garbage amount. Reject anything that isn't a finite number first,
+        # then clamp to the configured band so a fat-fingered stake bounces at
+        # the form rather than on-chain.
+        if not math.isfinite(body.stakeKas):
+            raise HTTPException(400, "stake must be a real number")
+        stake_sompi = round(body.stakeKas * config.SOMPI_PER_KAS)
+        if stake_sompi < config.MIN_STAKE_SOMPI:
+            raise HTTPException(400, f"minimum stake is {config.MIN_STAKE_SOMPI / config.SOMPI_PER_KAS:g} KAS "
+                                      "(or tick gas-only)")
+        if stake_sompi > config.MAX_STAKE_SOMPI:
+            raise HTTPException(400, f"maximum stake is {config.MAX_STAKE_SOMPI / config.SOMPI_PER_KAS:g} KAS")
     to_id = None
     if body.toAddress:
         to = db.get_account_by_address(body.toAddress)
-        if to:
-            if to["id"] == account["id"]:
-                raise HTTPException(400, "you can't challenge yourself")
-            if not to["accept_challenges"]:
-                raise HTTPException(400, "that player isn't accepting challenges right now")
-            to_id = to["id"]
+        # A named challenge to an address that has never played must NOT quietly
+        # become an open challenge to the whole board — the creator picked a
+        # specific opponent and would never see it went public. Bounce it.
+        if not to:
+            raise HTTPException(400, "that address hasn't played DAGmate yet — "
+                                      "leave the opponent blank for an open challenge")
+        if to["id"] == account["id"]:
+            raise HTTPException(400, "you can't challenge yourself")
+        if not to["accept_challenges"]:
+            raise HTTPException(400, "that player isn't accepting challenges right now")
+        to_id = to["id"]
     c = db.create_challenge(account["id"], to_id, stake_sompi, body.mode, body.gasOnly)
     return _challenge_public(c)
 
@@ -315,10 +409,30 @@ async def accept_challenge(challenge_id: str, accepter: dict = Depends(require_a
         raise HTTPException(400, "both players need a connected wallet pubkey to build the escrow "
                                   "(use a real wallet, or a demo wallet for local testing)")
 
-    match = await _create_match_from_pair(
-        challenge_id=challenge_id, tournament_id=None, round_no=None,
-        player_a_id=creator["id"], player_b_id=accepter["id"],
-        pk_a=pk_a, pk_b=pk_b, stake_sompi=ch["stake_sompi"], mode=ch["mode"])
+    # Claim the challenge before building anything: only the caller that wins
+    # this atomic open->accepting transition proceeds, so a double-submit (or two
+    # racing acceptors) can't turn one stake into two escrows / two matches.
+    if not db.claim_challenge_for_accept(challenge_id):
+        raise HTTPException(409, "challenge was just accepted or withdrawn")
+
+    try:
+        match = await _create_match_from_pair(
+            challenge_id=challenge_id, tournament_id=None, round_no=None,
+            player_a_id=creator["id"], player_b_id=accepter["id"],
+            pk_a=pk_a, pk_b=pk_b, stake_sompi=ch["stake_sompi"], mode=ch["mode"])
+    except ServiceError as e:
+        # No escrow was built and no match survives (see _create_match_from_pair)
+        # — hand the challenge back to 'open' so it can be accepted again once the
+        # node is back, rather than being stranded 'accepting' with no match.
+        db.release_challenge_to_open(challenge_id)
+        raise HTTPException(503, f"Kaspa service unavailable, try again: {e}")
+    except Exception:
+        # Any other failure between the claim and the status flip would otherwise
+        # leave the challenge stuck in the transient 'accepting' state —
+        # invisible to the board, un-acceptable, un-declinable. Release it and
+        # re-raise; no escrow was funded, so nothing is at risk.
+        db.release_challenge_to_open(challenge_id)
+        raise
     db.set_challenge_status(challenge_id, "accepted")
 
     stake_kas = ch["stake_sompi"] / config.SOMPI_PER_KAS
@@ -337,13 +451,16 @@ def decline_challenge(challenge_id: str, account: dict = Depends(require_account
         raise HTTPException(404, "not found")
     if account["id"] not in (ch["from_account_id"], ch["to_account_id"]):
         raise HTTPException(403, "that challenge isn't yours to decline")
-    db.set_challenge_status(challenge_id, "declined")
+    if not db.decline_challenge_if_open(challenge_id):
+        raise HTTPException(409, "challenge is already being accepted or is no longer open")
     return {"ok": True}
 
 
 async def _create_match_from_pair(*, challenge_id, tournament_id, round_no, player_a_id, player_b_id,
                                    pk_a, pk_b, stake_sompi, mode) -> dict:
-    reclaim_daa, daa_source = await _reclaim_daa()
+    # Raises ServiceError if the node is unreachable — no match row is created,
+    # so we never build an escrow with an unsafe (already-open) timelock.
+    reclaim_daa = await _reclaim_daa()
     match = db.create_match(
         challenge_id=challenge_id, tournament_id=tournament_id, round_no=round_no,
         player_a_account_id=player_a_id, player_b_account_id=player_b_id,
@@ -355,11 +472,14 @@ async def _create_match_from_pair(*, challenge_id, tournament_id, round_no, play
         escrow_b = await service_client.build_escrow(
             match_id=match["hd_index"], pk_a=pk_a, pk_b=pk_b, depositor_is_a=False, reclaim_daa=reclaim_daa)
         db.set_match_escrows(match["id"], escrow_a, escrow_b)
-        match = db.get_match(match["id"])
-    except ServiceError as e:
-        log.warning(f"escrow build failed for match {match['id']} (service unreachable?): {e}")
-    match["_daa_source"] = daa_source
-    return match
+        return db.get_match(match["id"])
+    except ServiceError:
+        # Roll the just-created match back rather than leave a zombie with NULL
+        # escrows that a challenge already points at as "accepted" and that no
+        # one can ever fund. The hd_index had to exist first (the arbiter key is
+        # derived from it), so the row could only be created before this build.
+        db.delete_match(match["id"])
+        raise
 
 
 # ── matches ──────────────────────────────────────────────────────────────
@@ -407,6 +527,20 @@ class MoveBody(BaseModel):
     uci: str
 
 
+async def _anchor_move(match_id: str, ply: int, uci: str):
+    """Write one ply to L1 via the sidecar, swallowing every failure. The
+    payload is a compact, self-describing record — `DGMT` magic, the match id,
+    the ply number, and the move in UCI — so the tx is legible on-chain as a
+    DAGmate move and not just opaque bytes. feeSompi is left at 0: the anchor is
+    a dust carrier, not a payment, and the sidecar adds only the network mass
+    fee. Never raises: called after the move is already committed."""
+    payload = f"DGMT|{match_id}|{ply}|{uci}".encode("utf-8").hex()
+    try:
+        await service_client.anchor(match_id=match_id, ply=ply, payload_hex=payload)
+    except ServiceError as e:
+        log.warning(f"move anchor failed (non-fatal) match={match_id} ply={ply}: {e}")
+
+
 @app.post("/api/matches/{match_id}/move")
 async def make_move(match_id: str, body: MoveBody, a: dict = Depends(require_account)):
     m = db.get_match(match_id)
@@ -443,6 +577,14 @@ async def make_move(match_id: str, body: MoveBody, a: dict = Depends(require_acc
 
     opponent_id = m["player_b_account_id"] if is_a else m["player_a_account_id"]
     await bot_client.notify_your_move(opponent_id, match_id, f"/play/{match_id}")
+
+    # Anchor the ply on L1 if the operator has turned it on. Best-effort by
+    # design: the move is already committed and the clock already charged, so an
+    # anchor failure (node down, operating address unfunded) must never undo a
+    # legal move or hand the player a 500 — it's the same "nobody to tell right
+    # now" posture as the alerts. The ply number is len(moves) after appending.
+    if config.ANCHOR_MOVES:
+        await _anchor_move(match_id, len(moves), body.uci)
 
     if status["game_over"]:
         await _settle_game_over(match_id, status["result"], status["winner_color"])
@@ -666,10 +808,15 @@ async def _start_tournament(tournament_id: str) -> bool:
     accounts = [a for a in accounts if a and a["pubkey"]]
     if len(accounts) < config.TOURNAMENT_MIN_ENTRANTS:
         return False
+    # Win the open->running transition before building any brackets. Two
+    # entrants filling the last seats at once could both reach here; only the
+    # caller that claims the start proceeds, so the bracket (and its escrows) is
+    # built exactly once.
+    if not db.claim_tournament_start(tournament_id):
+        return False
     random.shuffle(accounts)
     t = db.get_tournament(tournament_id)
     stake_sompi = t["tier_kas"] * config.SOMPI_PER_KAS
-    db.set_tournament_status(tournament_id, "running")
     for i in range(0, len(accounts) - 1, 2):
         p_a, p_b = accounts[i], accounts[i + 1]
         try:
@@ -679,6 +826,19 @@ async def _start_tournament(tournament_id: str) -> bool:
                 pk_a=p_a["pubkey"], pk_b=p_b["pubkey"], stake_sompi=stake_sompi, mode="rapid")
         except Exception as e:
             log.error(f"failed to build round-1 match for tournament {tournament_id}: {e}")
+    # An odd entrant count leaves one player unpaired. They never funded
+    # anything (no escrow is built for a player with no pairing), so no money is
+    # at risk — but they'd otherwise sit in a started tournament with no match
+    # and no explanation. Tell them so it isn't a silent dead end. Best-effort,
+    # like every other alert. (min entrants defaults to an even 8, so this is an
+    # edge case tied to an odd config, not the normal path.)
+    if len(accounts) % 2 == 1:
+        odd = accounts[-1]
+        log.info(f"tournament {tournament_id}: odd entrant {odd['id']} left unpaired this run")
+        await bot_client.notify_settled(
+            odd["id"], tournament_id,
+            "You weren't paired this round — the lobby had an odd number of players. "
+            "Your stake was never taken; join the next lobby to play.")
     return True
 
 
@@ -688,8 +848,13 @@ def unlock_level(level_id: str, account: dict = Depends(require_account)):
     level = next((lv for lv in config.LEARN_LEVELS if lv["id"] == level_id), None)
     if not level:
         raise HTTPException(404, "unknown level")
-    # Real flow: verify a matching on-chain gas payment to the operating
-    # address before unlocking (see module docstring — not yet wired).
+    # A paid level cannot be unlocked while payment enforcement is on, because
+    # the on-chain gas-payment check isn't wired yet — better to refuse than to
+    # hand a "paid" level out for free under a price tag. With enforcement off
+    # (the default), levels unlock free and the UI is told to present them as
+    # free (see /api/meta learnRequiresPayment + config.LEARN_REQUIRE_PAYMENT).
+    if config.LEARN_REQUIRE_PAYMENT and curriculum.gas_for(level_id) > 0:
+        raise HTTPException(402, "paid levels aren't available yet — check back soon")
     db.unlock_level(account["id"], level_id)
     return {"ok": True}
 
@@ -732,7 +897,13 @@ def practice_apply_move(body: PracticeMoveBody):
 
 @app.get("/api/practice/legal-moves")
 def practice_legal_moves(fen: str):
-    return {"legalMoves": chess_logic.legal_uci_moves(fen)}
+    # A hand-supplied FEN can be malformed; python-chess raises ValueError.
+    # Answer 400 rather than letting it become an unauthenticated 500 (matches
+    # how /api/practice/apply-move already handles it).
+    try:
+        return {"legalMoves": chess_logic.legal_uci_moves(fen)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.get("/api/practice/start-fen")
@@ -750,11 +921,32 @@ def practice_levels():
     return {"levels": engine.level_list(), "default": engine.DEFAULT_LEVEL}
 
 
+# Ceiling on concurrent engine searches (see config.PRACTICE_MAX_CONCURRENCY).
+# A plain counting semaphore acquired non-blocking: the CPU-bound search runs in
+# the threadpool, so blocking on the semaphore would just tie up a pool thread —
+# instead an over-cap request returns 429 immediately and frees the thread.
+_practice_engine_slots = threading.Semaphore(config.PRACTICE_MAX_CONCURRENCY)
+
+
 @app.post("/api/practice/bot-move")
-def practice_bot_move(body: PracticeBotBody):
+def practice_bot_move(body: PracticeBotBody, account: dict = Depends(require_account)):
     # Sync `def` on purpose: FastAPI runs these in a threadpool, so the engine's
     # wall-clock budget can't stall the event loop for every other request.
-    uci = engine.best_move(body.fen, body.level)
+    # Requires a session (the practice board is behind a wallet connect) and is
+    # concurrency-capped so a burst can't starve the deposit/clock watchers that
+    # share this process — a stalled deposit watcher is a money problem, not a
+    # slow page.
+    if not _practice_engine_slots.acquire(blocking=False):
+        raise HTTPException(429, "practice engine busy — try again in a moment")
+    try:
+        # A malformed FEN is a 400, not a 500 — the search and the status/move
+        # helpers all raise ValueError on a bad position.
+        try:
+            uci = engine.best_move(body.fen, body.level)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    finally:
+        _practice_engine_slots.release()
     if not uci:
         return {"uci": None, "status": chess_logic.status_of(chess_logic.board_from(body.fen))}
     status = chess_logic.apply_uci(body.fen, uci)
@@ -809,6 +1001,19 @@ def meta():
             "networkFeeKasPerInput": config.SETTLE_FEE_SOMPI_PER_INPUT / config.SOMPI_PER_KAS,
         },
         "gasOnlyKas": config.GAS_ONLY_STAKE_SOMPI / config.SOMPI_PER_KAS,
+        # Stake bounds so the form can cap the input and confirm large stakes,
+        # matching what the backend enforces (a fat-fingered amount should bounce
+        # at the field, not mint an escrow). The backend is still the authority.
+        "minStakeKas": config.MIN_STAKE_SOMPI / config.SOMPI_PER_KAS,
+        "maxStakeKas": config.MAX_STAKE_SOMPI / config.SOMPI_PER_KAS,
+        # Whether moves are actually being written to L1 right now. The frontend
+        # copy about on-chain anchoring is driven by this so it can never claim a
+        # feature the operator hasn't switched on (see config.ANCHOR_MOVES).
+        "anchorsMoves": config.ANCHOR_MOVES,
+        # Whether paid learn levels actually charge. Off (default) means levels
+        # unlock free and the UI shows "free" instead of a price the server
+        # doesn't collect (see config.LEARN_REQUIRE_PAYMENT).
+        "learnRequiresPayment": config.LEARN_REQUIRE_PAYMENT,
         "reclaimDays": config.RECLAIM_DAA_WINDOW // (24 * 3600 * 10),
         # Same reasoning as the fee copy: the UI asks what's available rather
         # than keeping its own guess about it. The demo-wallet fallback and the

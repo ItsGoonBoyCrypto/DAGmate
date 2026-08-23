@@ -296,6 +296,41 @@ def set_challenge_status(challenge_id: str, status: str):
         c.execute("UPDATE challenges SET status=? WHERE id=?", (status, challenge_id))
 
 
+def claim_challenge_for_accept(challenge_id: str) -> bool:
+    """Atomically move a challenge open -> accepting, returning True only to the
+    single caller that won the transition. Two players hitting /accept at the
+    same instant both read status='open' a moment earlier; without this guard
+    both would go on to build an escrow and the challenge would spawn two
+    matches for one stake. The guarded UPDATE lets exactly one through — the
+    loser gets False and a clean 409. We move to a transient 'accepting' rather
+    than straight to 'accepted' so a failed escrow build can hand the challenge
+    back to 'open' (see release_challenge_to_open) instead of stranding it."""
+    with _lock, _conn() as c:
+        cur = c.execute("UPDATE challenges SET status='accepting' WHERE id=? AND status='open'",
+                         (challenge_id,))
+        return cur.rowcount == 1
+
+
+def release_challenge_to_open(challenge_id: str):
+    """Undo claim_challenge_for_accept when the match never got built (node down
+    mid-accept). Only ever called on a challenge this process just moved to
+    'accepting', so it can't clobber a real acceptance."""
+    with _lock, _conn() as c:
+        c.execute("UPDATE challenges SET status='open' WHERE id=? AND status='accepting'",
+                   (challenge_id,))
+
+
+def decline_challenge_if_open(challenge_id: str) -> bool:
+    """Decline only a still-open challenge. Guarded so a withdraw can't race an
+    acceptance: if the other side already claimed it ('accepting'/'accepted'),
+    the UPDATE misses and the caller gets False rather than marking a challenge
+    declined out from under a match that's already being built."""
+    with _lock, _conn() as c:
+        cur = c.execute("UPDATE challenges SET status='declined' WHERE id=? AND status='open'",
+                         (challenge_id,))
+        return cur.rowcount == 1
+
+
 # ── matches ──────────────────────────────────────────────────────────────
 def create_match(*, challenge_id: str | None, tournament_id: str | None, round_no: int | None,
                   player_a_account_id: str, player_b_account_id: str, stake_sompi: int, mode: str,
@@ -323,6 +358,15 @@ def create_match(*, challenge_id: str | None, tournament_id: str | None, round_n
 def get_match(match_id: str) -> dict | None:
     with _lock, _conn() as c:
         return _row(c.execute("SELECT * FROM matches WHERE id=?", (match_id,)))
+
+
+def delete_match(match_id: str):
+    """Roll back a match that could not finish being created (escrow build
+    failed on an unreachable sidecar). Only ever called before any deposit
+    could exist — a funded match is never deleted. hd_index is never reused for
+    a new arbiter key because SQLite rowids are monotonic."""
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM matches WHERE id=?", (match_id,))
 
 
 def list_matches_for_account(account_id: str) -> list[dict]:
@@ -599,6 +643,19 @@ def list_entrants(tournament_id: str) -> list[dict]:
 def set_tournament_status(tournament_id: str, status: str):
     with _lock, _conn() as c:
         c.execute("UPDATE tournaments SET status=? WHERE id=?", (status, tournament_id))
+
+
+def claim_tournament_start(tournament_id: str) -> bool:
+    """Atomically move a tournament open -> running, returning True only to the
+    caller that won it. The start can be triggered by whatever fills the last
+    seat, and two entrants joining near-simultaneously could both see the lobby
+    full and both call the starter — building the bracket (and its escrows)
+    twice. The guarded UPDATE admits one; the loser gets False and does
+    nothing."""
+    with _lock, _conn() as c:
+        cur = c.execute("UPDATE tournaments SET status='running' WHERE id=? AND status='open'",
+                         (tournament_id,))
+        return cur.rowcount == 1
 
 
 def list_tournaments() -> list[dict]:

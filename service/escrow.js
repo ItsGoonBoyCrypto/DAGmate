@@ -31,6 +31,13 @@
  */
 import * as core from './core.js';
 
+/** Flat fee for a settle input, per input. Covers the mass a signed 2-of-3
+ *  CHECKMULTISIG input carries (redeem script + two sigs) — larger than the
+ *  single-sig reclaim input below, smaller than the old 0.6-KAS placeholder.
+ *  ⚠️ Mirrored in site/backend/config.py as SETTLE_FEE_SOMPI_PER_INPUT — change
+ *  both together, and re-prove on a funded mainnet escrow before launch. */
+const SETTLE_FEE_SOMPI_PER_INPUT = 3_000_000n; // 0.03 KAS
+
 const H = (h) => Uint8Array.from(Buffer.from(String(h).replace(/^0x/, ''), 'hex'));
 const rawSig = (s) => { const b = Buffer.from(String(s), 'hex'); return b.length === 66 ? b.subarray(1) : b; };
 
@@ -165,35 +172,54 @@ export async function buildSettleUnsigned({ matchId, escrows, winnerAddr, split,
     if (!entries.length) throw new Error('no escrow UTXOs found — has the match been funded?');
     const potSompi = entries.reduce((s, e) => s + BigInt(e.amount), 0n);
 
-    // Generous, fixed priority fee per covenant input — createTransactions()'s
-    // auto-estimate doesn't fully price the extra sigOpCount budget a 2-of-3
-    // CHECKMULTISIG spend costs.
-    const priorityFee = 60_000_000n * BigInt(entries.length);
+    // Explicit, flat fee per covenant input, spent EXACTLY — same model as the
+    // reclaim path (low-level createTransaction, no change address). The old
+    // code used createTransactions with a bare-bigint priorityFee, which the
+    // SDK treats as SenderPays (charged ON TOP of the outputs): with
+    // `outputs = pot - priorityFee` the build needed `pot >= pot + massFee` and
+    // failed "insufficient funds" on every settlement — decisive and draw
+    // alike. It also routed change to feeAddress(), silently raking ~0.6 KAS a
+    // game against the no-fee disclaimer. Here the outputs sum to exactly
+    // `pot - fee`, so nothing is left to become change and nothing leaks.
+    //
+    // Sized to cover the extra mass a signed 2-of-3 CHECKMULTISIG input carries
+    // once its redeem script + both signatures are filled at broadcast — mass
+    // the auto-estimate can't see while the inputs are still unsigned.
+    // ⚠️ Re-prove on a FUNDED mainnet escrow before launch, and keep in step
+    // with SETTLE_FEE_SOMPI_PER_INPUT in site/backend/config.py.
+    const fee = SETTLE_FEE_SOMPI_PER_INPUT * BigInt(entries.length);
 
     let outputs;
     if (winnerAddr) {
-      const payout = potSompi - rake - priorityFee;
+      const payout = potSompi - rake - fee;
       if (payout <= 0n) throw new Error('pot too small to cover rake + fee');
       outputs = rake > 0n
         ? [{ address: winnerAddr, amount: payout }, { address: core.feeAddress(), amount: rake }]
         : [{ address: winnerAddr, amount: payout }];
     } else {
-      const half = (potSompi - rake - priorityFee) / 2n;
-      if (half <= 0n) throw new Error('pot too small to cover rake + fee');
+      const distributable = potSompi - rake - fee;
+      if (distributable <= 1n) throw new Error('pot too small to cover rake + fee');
+      // Even split; any odd sompi goes to A so the outputs sum EXACTLY to
+      // `distributable` — createTransaction has no change output, so an unspent
+      // remainder would be silently donated to a miner.
+      const halfB = distributable / 2n;
+      const halfA = distributable - halfB;
       const aAddr = escrows[0].depositorAddr, bAddr = escrows[1].depositorAddr;
       outputs = rake > 0n
-        ? [{ address: aAddr, amount: half }, { address: bAddr, amount: half }, { address: core.feeAddress(), amount: rake }]
-        : [{ address: aAddr, amount: half }, { address: bAddr, amount: half }];
+        ? [{ address: aAddr, amount: halfA }, { address: bAddr, amount: halfB }, { address: core.feeAddress(), amount: rake }]
+        : [{ address: aAddr, amount: halfA }, { address: bAddr, amount: halfB }];
     }
 
-    const { transactions } = await k.createTransactions({
-      entries, outputs, changeAddress: core.feeAddress(), priorityFee, networkId: core.network(),
-      sigOpCount: 3, // CHECKMULTISIG billed by pubkey-count (n=3), not required-sig-count (m=2)
-    });
-    const tx = transactions[0];
-    // Arbiter signatures, one per input — computed now, held server-side
-    // until the site returns the matching player signature(s) to broadcast.
-    const sigsArb = entries.map((_, i) => tx.createInputSignature(i, arbKey));
+    // Low-level createTransaction: exact fee, no change, full control of every
+    // output. sigOpCount 3 because CHECKMULTISIG is billed by pubkey-count
+    // (n=3), not required-sig-count (m=2).
+    const tx = k.createTransaction(entries, outputs, fee, undefined, 3);
+    // Arbiter signatures, one per input — computed now (we hold that key), held
+    // server-side until the site returns the matching player signature(s) to
+    // broadcast. Standalone createInputSignature: the low-level Transaction has
+    // no instance method for it (unlike the PendingTransaction the old
+    // high-level builder returned).
+    const sigsArb = entries.map((_, i) => k.createInputSignature(tx, i, arbKey));
 
     return {
       matchId: Number(matchId), potSompi: potSompi.toString(), rakeSompi: rake.toString(),
