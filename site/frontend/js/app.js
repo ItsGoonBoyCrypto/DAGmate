@@ -1298,6 +1298,19 @@
     const stakeEl = document.getElementById("chStake");
     if (meta.minStakeKas != null) stakeEl.min = meta.minStakeKas;
     if (meta.maxStakeKas != null) stakeEl.max = meta.maxStakeKas;
+    // One-tap link to the alerts bot, only when a handle is configured. When it
+    // is, the link replaces the plain "open the DAGmate bot" text.
+    const botLink = document.getElementById("tgBotLink");
+    const botHint = document.getElementById("tgBotHint");
+    if (meta.botUsername) {
+      botLink.href = `https://t.me/${encodeURIComponent(meta.botUsername)}`;
+      botLink.textContent = `open @${meta.botUsername},`;
+      botLink.style.display = "";
+      botHint.style.display = "none";
+    } else {
+      botLink.style.display = "none";
+      botHint.style.display = "";
+    }
   }
 
   // ── boot ─────────────────────────────────────────────────────────────

@@ -1013,6 +1013,10 @@ def meta():
         # copy about on-chain anchoring is driven by this so it can never claim a
         # feature the operator hasn't switched on (see config.ANCHOR_MOVES).
         "anchorsMoves": config.ANCHOR_MOVES,
+        # The bot's public handle, so the (optional) alerts settings can show a
+        # one-tap link to it. Empty when no bot is configured — the site never
+        # requires Telegram to play.
+        "botUsername": config.BOT_USERNAME,
         # Whether paid learn levels actually charge. Off (default) means levels
         # unlock free and the UI shows "free" instead of a price the server
         # doesn't collect (see config.LEARN_REQUIRE_PAYMENT).

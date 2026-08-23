@@ -18,6 +18,12 @@ SERVICE_URL = os.getenv("DAGMATE_SERVICE_URL", "http://127.0.0.1:8910")
 # slash — bot_client joins it to a leading-slash path.
 PUBLIC_URL = os.getenv("DAGMATE_PUBLIC_URL", "https://dagmate.org").rstrip("/")
 
+# The bot's public @handle (without the @), e.g. "DAGmateBot". Used ONLY to
+# render a "open the bot" link (https://t.me/<handle>) in the optional alerts
+# settings — the bot is never required to play. Empty = the site shows no bot
+# link (and, with no webhook secret, no alerts UI pressure at all).
+BOT_USERNAME = os.getenv("DAGMATE_BOT_USERNAME", "").lstrip("@")
+
 BOT_WEBHOOK_URL = os.getenv("DAGMATE_BOT_WEBHOOK_URL", "http://127.0.0.1:8901")
 # Empty = no alerts bot in this deployment (bot_client skips silently). If it IS
 # set, it must be long enough to be a real secret — a 4-char value would pass

@@ -65,12 +65,17 @@
 
         <div class="settings-row">
           <form id="telegramLinkForm" class="row">
-            <label class="grow">Telegram alerts
+            <label class="grow">Telegram alerts <span class="muted">(optional)</span>
               <input type="text" id="tgLinkCode" placeholder="Paste code from /start" autocomplete="off" maxlength="32">
             </label>
             <button type="submit" class="btn">Link</button>
           </form>
-          <p class="muted">Message the DAGmate bot <code>/start</code>, then paste the code here to get match alerts. The bot never sees your wallet.</p>
+          <p class="muted">
+            Optional — you can play without it. To get match alerts (a challenge, your move, low clock, the result):
+            <a id="tgBotLink" href="#" target="_blank" rel="noopener" style="display:none;"></a>
+            <span id="tgBotHint">open the DAGmate bot,</span> send <code>/start</code>, then paste the code it gives you here.
+            The bot never sees your wallet.
+          </p>
         </div>
       </div>
 
