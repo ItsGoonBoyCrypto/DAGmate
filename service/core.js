@@ -98,18 +98,58 @@ let _rpcChain = Promise.resolve();
 // draw shouldn't fail a settlement when the next node over is fine.
 const NODE_ATTEMPTS = 3;
 
+// ── which node, and STAYING on it ───────────────────────────────────────
+//
+// An explicit URL pins one node; otherwise the SDK's Resolver fetches a public
+// one from the community pool. Nothing about DAGmate needs a node of its own:
+// every call is a read plus submitTransaction, and transactions are fully
+// signed before a node sees them. The node is a liveness dependency, never a
+// trust one — a hostile one can refuse to answer or refuse to relay, but it
+// cannot alter a signed tx and it cannot invent a deposit at an address we
+// re-read and re-check ourselves.
+//
+// ⚠️ But we must STICK to one node once we have found a good one, and that is
+// not a performance nicety. Two reasons, both learned the hard way in Dagger's
+// kron-service:
+//
+// 1. **Mempool ancestry.** `withRpc` opens and closes a connection per call, so
+//    without a pin, consecutive calls land on different nodes. Move anchors
+//    chain — anchor N+1 spends the change from anchor N — so a fast game
+//    submits a child to a node that has never heard of its parent, and it
+//    orphans. Dagger hit exactly this on 2026-08-20 after a swap.
+// 2. **Cost per call.** Resolving is an HTTP round-trip before the WebSocket
+//    handshake, and `withRpc` serializes, so every operation queues behind the
+//    last one's discovery. Dagger blew a 30s withdraw timeout this way.
+//
+// So: resolve once, remember the URL, and only let go of it when the node
+// itself is the thing that failed.
+let _resolver = null;
+let _pinnedUrl = null;
+
 function newClient() {
-  // An explicit URL pins one node; otherwise the SDK's Resolver fetches a
-  // public one from the community pool for this network. Nothing about DAGmate
-  // needs a node of its own — every call here is a plain read plus
-  // submitTransaction, and the transactions are already signed before they get
-  // near a node. The node choice is a liveness dependency, never a trust one:
-  // a hostile node can refuse to answer or refuse to relay, but it cannot
-  // forge a UTXO set we act on (deposits are re-read and re-checked) and it
-  // cannot alter a tx without invalidating its signatures.
-  return WRPC
-    ? new k.RpcClient({ url: WRPC, networkId: NETWORK_ID, encoding: k.Encoding.Borsh })
-    : new k.RpcClient({ resolver: new k.Resolver(), networkId: NETWORK_ID, encoding: k.Encoding.Borsh });
+  if (WRPC) return new k.RpcClient({ url: WRPC, networkId: NETWORK_ID, encoding: k.Encoding.Borsh });
+  if (_pinnedUrl) return new k.RpcClient({ url: _pinnedUrl, networkId: NETWORK_ID, encoding: k.Encoding.Borsh });
+  // No config object: `new Resolver({ tls: true })` throws "Invalid or missing
+  // resolver URL" despite `urls` being typed optional — the tls flag is only
+  // usable alongside your own resolver list. TLS is enforced on the resolved
+  // URL instead (see assertUsable), which is the stronger check anyway: it
+  // asserts what we actually got rather than what we asked for.
+  _resolver ??= new k.Resolver();
+  return new k.RpcClient({ resolver: _resolver, networkId: NETWORK_ID, encoding: k.Encoding.Borsh });
+}
+
+/** Is this the node failing, as opposed to the chain rejecting what we sent?
+ *
+ * ⚠️ The distinction is the whole point. Re-resolving on a *rejected
+ * transaction* is what strands mempool ancestry: the rejection is usually the
+ * node correctly telling us something about our own tx, and hopping to a
+ * different node in response means the next tx we build is a child of a parent
+ * that node has never seen. Only transport failures — the node is gone, not
+ * disagreeing — are allowed to drop the pin.
+ */
+function isTransportError(e) {
+  const m = String(e?.message ?? e).toLowerCase();
+  return /connect|websocket|socket|timed out|timeout|unreachable|not synced|utxoindex|is on /.test(m);
 }
 
 /** Refuse a node that would quietly give wrong answers.
@@ -127,8 +167,17 @@ function newClient() {
  *   per network). A mainnet-configured service pointed at a testnet node
  *   derives mainnet addresses and then reads a testnet UTXO set: every escrow
  *   looks empty, and every "deposit" it does see is play money.
+ * - **plaintext transport** — the resolver may hand back a `ws://` endpoint.
+ *   Every address this service queries goes over that link, which is the full
+ *   set of live match escrows: readable by anyone on the path, and their
+ *   answers tamperable. Refused unless the operator asked for it explicitly by
+ *   setting DAGMATE_KASPA_WRPC themselves (a private/localhost node is a
+ *   legitimate reason to run without TLS).
  */
 async function assertUsable(rpc) {
+  if (!WRPC && !String(rpc.url).startsWith('wss://')) {
+    throw new Error(`resolver returned a plaintext endpoint (${rpc.url}) — refusing to query escrows over it`);
+  }
   const si = await rpc.getServerInfo();
   if (!si.isSynced) throw new Error(`node ${rpc.url} is not synced`);
   if (!si.hasUtxoIndex) throw new Error(`node ${rpc.url} has no utxoindex`);
@@ -157,11 +206,23 @@ export async function withRpc(fn) {
         await assertUsable(rpc);
       } catch (e) {
         lastErr = e;
+        // The pinned node is gone or has gone out of sync. Let it go, so the
+        // next attempt resolves a fresh one rather than retrying a corpse.
+        _pinnedUrl = null;
         await rpc.disconnect().catch(() => {});
         continue;
       }
+      // Healthy. Remember it — subsequent calls reconnect straight here, which
+      // is what keeps a chain of move anchors on one mempool.
+      if (!WRPC) _pinnedUrl = rpc.url;
       try {
         return await fn(rpc);
+      } catch (e) {
+        // ⚠️ Only unpin if the NODE failed. A rejected transaction is the chain
+        // disagreeing with us, and moving nodes over it orphans our own
+        // children — see isTransportError.
+        if (isTransportError(e)) _pinnedUrl = null;
+        throw e;
       } finally {
         await rpc.disconnect().catch(() => {});
       }

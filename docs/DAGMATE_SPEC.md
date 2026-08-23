@@ -259,7 +259,8 @@ POST /auth/verify-message  { address, pubkey, message, signature }
 
 DAGmate runs no node. `DAGMATE_KASPA_WRPC` pins one if you want it; unset, the
 SDK's `Resolver` fetches a public node from the community pool for the
-configured network, and picks a fresh one each connection.
+configured network — **once**, after which that URL is reused (see "staying
+put" below).
 
 That is safe because the node is a **liveness** dependency, not a trust one.
 Every transaction is fully signed before a node sees it, so a hostile node can
@@ -280,10 +281,36 @@ fails:
    resolver picks per network. A mainnet service pointed at a testnet node
    derives mainnet addresses and reads a testnet UTXO set: every escrow looks
    empty and every deposit it does see is play money.
+4. **`wss://`, not `ws://`** — the resolver may return a plaintext endpoint.
+   Every address this service queries crosses that link, which is the full set
+   of live match escrows. Refused on the resolver path; allowed if the operator
+   set an explicit URL, since a private or localhost node is a fair reason to
+   skip TLS. (Note the SDK's `Resolver({ tls: true })` is not usable here — it
+   throws unless you also supply your own resolver list, despite `urls` being
+   typed optional. Asserting on the URL we got is stronger anyway.)
 
 The retry covers connect and health-check only, never the call itself — once
 the call has run it may have broadcast, and a second attempt on another node
 would double-spend or double-anchor.
+
+**Staying put.** Having found a good node, `withRpc` reuses its URL rather than
+re-resolving. That is correctness, not speed:
+
+- **Mempool ancestry.** `withRpc` opens and closes a connection per call, so
+  unpinned, consecutive calls land on different nodes. Move anchors chain —
+  anchor N+1 spends the change from anchor N — so a fast game submits a child
+  to a node that never saw its parent, and it orphans.
+- **Cost per call.** Resolving is an HTTP round-trip before the WebSocket
+  handshake, and `withRpc` serializes, so every operation would queue behind
+  the previous one's discovery.
+
+⚠️ The pin is dropped **only when the node is what failed** — connect failure,
+health-gate failure, or a transport-shaped error from the call. A *rejected
+transaction* must never drop it: a rejection is usually the node correctly
+telling us something about our own transaction, and switching nodes in response
+means the next transaction we build is a child of a parent the new node has
+never seen. Both of these are Dagger `kron-service` lessons, reproduced here
+rather than re-learned.
 
 ### 3.1 Dev routes — opt-in, and refused on mainnet
 
