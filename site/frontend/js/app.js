@@ -454,7 +454,13 @@
     const fundBtn = document.getElementById("fundBtn");
     if (fundBtn) fundBtn.style.display = m.status === "awaiting_deposit" ? "inline-block" : "none";
     document.getElementById("resignBtn").style.display = m.status === "live" ? "inline-block" : "none";
+    // Hidden while an offer is on the board: whoever made it can't make it
+    // twice, and whoever received it should be answering the panel below
+    // rather than firing a second offer back.
+    document.getElementById("drawBtn").style.display =
+      m.status === "live" && myColorFor(m) && !m.drawOffer ? "inline-block" : "none";
 
+    renderDrawOffer(m);
     renderClocks(m);
     renderClaim(m);
     renderReclaim(m);
@@ -470,6 +476,47 @@
       flipped: color === "black",
       onClick: onBoardSquareClick,
     });
+  }
+
+  // ── draw offers ──────────────────────────────────────────────────────
+  // A draw splits the pot, so the panel says so out loud: Accept is a money
+  // decision, not a UI convenience, and a player should never click it
+  // thinking it only ends the game.
+  function renderDrawOffer(m) {
+    const el = document.getElementById("drawPanel");
+    const mine = myColorFor(m);
+    if (m.status !== "live" || !mine || !m.drawOffer) { el.innerHTML = ""; return; }
+    if (m.drawOffer.byColor === mine) {
+      el.innerHTML = `<div class="claim-title">Draw offered</div>
+        <div class="claim-note">Waiting for your opponent. Playing a move withdraws it.</div>
+        <button class="btn full" id="drawWithdrawBtn">Withdraw offer</button>`;
+      document.getElementById("drawWithdrawBtn")
+        .addEventListener("click", () => drawAction("decline", "Offer withdrawn."));
+      return;
+    }
+    el.innerHTML = `<div class="claim-title">Draw offered</div>
+      <div class="claim-note">Your opponent offers a draw. Accept and the match ends level —
+        each stake goes back to whoever put it in, minus the network fee.</div>
+      <button class="btn btn-primary full" id="drawAcceptBtn">Accept draw</button>
+      <button class="btn full" id="drawDeclineBtn">Decline</button>`;
+    document.getElementById("drawAcceptBtn")
+      .addEventListener("click", () => drawAction("accept", "Draw agreed."));
+    document.getElementById("drawDeclineBtn")
+      .addEventListener("click", () => drawAction("decline", "Draw declined."));
+  }
+
+  // Re-reads the match rather than keeping the POST's own body: offering and
+  // declining leave the game LIVE, and the mutating endpoints don't return
+  // `legalMoves` (only GET and /move do), so trusting the response would
+  // freeze the board until the next poll.
+  async function drawAction(what, okMsg) {
+    if (!state.currentMatchId) return;
+    try {
+      await api("POST", `/api/matches/${state.currentMatchId}/draw/${what}`);
+      await refreshCurrentMatch();
+      refreshMatches();
+      toast(okMsg);
+    } catch (e) { toast(e.message); }
   }
 
   // Both clocks, laid out like a real board: opponent above, you below.
@@ -762,6 +809,9 @@
       refreshMatches();
     } catch (e) { toast(e.message); }
   }
+
+  document.getElementById("drawBtn").addEventListener("click",
+    () => drawAction("offer", "Draw offered — your opponent has to agree."));
 
   document.getElementById("resignBtn").addEventListener("click", async () => {
     if (!state.currentMatchId) return;

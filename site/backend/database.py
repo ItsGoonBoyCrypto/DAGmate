@@ -149,6 +149,14 @@ def ensure_schema():
         _add_column(c, "matches", "settle_txid", "TEXT")
         _add_column(c, "matches", "settle_broadcast_ts", "INTEGER")
 
+        # Draw offers. `draw_offer_by` is the standing offer (NULL = none);
+        # `draw_offer_ply` is the move number it was made at and is NOT cleared
+        # when the offer goes away, because it doubles as the anti-spam latch:
+        # one offer per position, so a declined offer can't be re-sent
+        # immediately and turn the board into a nag box.
+        _add_column(c, "matches", "draw_offer_by", "TEXT")
+        _add_column(c, "matches", "draw_offer_ply", "INTEGER")
+
         # Reclaim receipts (reclaim.py). A record only — the chain is the
         # authority on whether an escrow still holds anything. Reclaim keeps no
         # built-tx state on purpose: one signer, one visit, so a rebuild costs
@@ -381,11 +389,17 @@ def apply_move_with_clock(match_id: str, fen: str, moves: list[str], turn: str,
     The `turn` guard is what makes this safe under concurrent requests: two
     moves racing for the same position both read `turn='white'`, but only the
     first UPDATE matches, so the second is rejected rather than silently
-    overwriting the board or double-charging a clock."""
+    overwriting the board or double-charging a clock.
+
+    Clearing `draw_offer_by` is part of the SAME statement, and has to be:
+    playing on is how you decline an offer, and an offer that outlived the
+    position it was made in could be accepted twenty moves later by whoever
+    turned out to be losing."""
     col = "clock_white_ms" if mover_color == "white" else "clock_black_ms"
     with _lock, _conn() as c:
         cur = c.execute(
-            f"UPDATE matches SET fen=?, moves_json=?, turn=?, {col}=?, clock_turn_started_ms=? "
+            f"UPDATE matches SET fen=?, moves_json=?, turn=?, {col}=?, clock_turn_started_ms=?, "
+            "draw_offer_by=NULL "
             "WHERE id=? AND status='live' AND turn=?",
             (fen, json.dumps(moves), turn, mover_remaining_ms, now_ms, match_id, mover_color))
         return cur.rowcount == 1
@@ -408,6 +422,55 @@ def settle_match_if_live(match_id: str, *, result: str, winner_account_id: str |
             "UPDATE matches SET status='settled', result=?, winner_account_id=?, settled_ts=? "
             "WHERE id=? AND status='live'",
             (result, winner_account_id, int(time.time()), match_id))
+        return cur.rowcount == 1
+
+
+# ── draw offers ──────────────────────────────────────────────────────────
+# A draw splits the pot, so agreeing to one is a money decision by both
+# players and every statement here is guarded accordingly. `ply` is the number
+# of moves played when the offer was made — the caller passes it so the
+# one-offer-per-position rule is enforced by the same UPDATE that stores the
+# offer, not by a read-then-write the opponent could slip between.
+def offer_draw(match_id: str, account_id: str, ply: int) -> bool:
+    """Put a draw offer on the board. False if one already stands (either
+    player's) or if this position has already had its offer."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET draw_offer_by=?, draw_offer_ply=? "
+            "WHERE id=? AND status='live' AND draw_offer_by IS NULL "
+            "AND (draw_offer_ply IS NULL OR draw_offer_ply < ?)",
+            (account_id, ply, match_id, ply))
+        return cur.rowcount == 1
+
+
+def clear_draw_offer(match_id: str) -> bool:
+    """Decline (opponent) or withdraw (offerer). `draw_offer_ply` deliberately
+    survives: it's what stops the offer being re-sent in the same position."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET draw_offer_by=NULL "
+            "WHERE id=? AND status='live' AND draw_offer_by IS NOT NULL", (match_id,))
+        return cur.rowcount == 1
+
+
+def accept_draw_if_offered(match_id: str, accepter_id: str) -> bool:
+    """Agree to a standing draw offer and end the match, in ONE statement.
+
+    Checking the offer and settling separately would leave a window where the
+    offerer's move (which withdraws the offer) or a clock flag lands between
+    the two, and the match would be recorded as an agreed draw that nobody
+    currently agreed to — with the pot split accordingly. So the offer's
+    existence is a WHERE clause on the settlement itself.
+
+    `draw_offer_by <> ?` is the other half of "both must agree": without it,
+    the player who made the offer could accept it themselves and take half the
+    pot out of a game they were losing."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET status='settled', result='draw_agreed', winner_account_id=NULL, "
+            "settled_ts=?, draw_offer_by=NULL "
+            "WHERE id=? AND status='live' AND draw_offer_by IS NOT NULL AND draw_offer_by <> ?",
+            (int(time.time()), match_id, accepter_id))
         return cur.rowcount == 1
 
 

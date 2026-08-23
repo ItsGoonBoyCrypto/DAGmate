@@ -65,7 +65,8 @@ minutes, forgetting to switch it off puts a free-money button on a public
 host. `site/backend/dev.cmd` turns it on for local work.
 
 Tests are dependency-free — `python site/backend/tools/test_auth.py` (and
-`test_settlement`, `test_reclaim`, `test_deposits`, `test_clocks`). Real
+`test_settlement`, `test_reclaim`, `test_deposits`, `test_clocks`,
+`test_draw`). Real
 schema, real DB accessors, throwaway database; only the chain is stubbed.
 
 `deploy/` has the server side: systemd units, the nginx vhost, an annotated env

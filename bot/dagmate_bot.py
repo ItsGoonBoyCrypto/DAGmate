@@ -16,6 +16,7 @@ site backend calls to push alerts and to claim a link code:
   POST /notify/challenge     {site_account_id, challenger_name, stake, mode, url}
   POST /notify/your-move     {site_account_id, match_id, url}
   POST /notify/clock-warning {site_account_id, match_id, remaining, url}
+  POST /notify/draw-offer    {site_account_id, match_id, url}
   POST /notify/settled       {site_account_id, match_id, summary}
 
 Run: `python dagmate_bot.py` — needs DAGMATE_BOT_TOKEN and
@@ -143,6 +144,16 @@ async def route_notify_clock_warning(request: web.Request) -> web.Response:
     return await _notify(request, render)
 
 
+async def route_notify_draw_offer(request: web.Request) -> web.Response:
+    """Worth its own alert rather than folding into your-move: in daily mode a
+    player has three days per move, so an offer sitting unseen on the board is
+    an offer that expires the moment the offerer plays on."""
+    def render(b):
+        return (f"\u00bd Draw offered in match #{_esc(b.get('match_id', '?'))} \u2014 "
+                f"accept and the pot splits back to you both.\n{_esc(b.get('url', ''))}")
+    return await _notify(request, render)
+
+
 async def route_notify_settled(request: web.Request) -> web.Response:
     def render(b):
         return f"\u2659 Match #{_esc(b.get('match_id', '?'))} settled: {_esc(b.get('summary', ''))}"
@@ -172,6 +183,7 @@ def _build_webhook_app(bot) -> web.Application:
         web.post("/notify/challenge", route_notify_challenge),
         web.post("/notify/your-move", route_notify_your_move),
         web.post("/notify/clock-warning", route_notify_clock_warning),
+        web.post("/notify/draw-offer", route_notify_draw_offer),
         web.post("/notify/settled", route_notify_settled),
     ])
     return app

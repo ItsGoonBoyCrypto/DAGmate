@@ -42,5 +42,9 @@ async def notify_clock_warning(site_account_id: str, match_id: str, remaining: s
     })
 
 
+async def notify_draw_offer(site_account_id: str, match_id: str, url: str):
+    await _post("/notify/draw-offer", {"site_account_id": site_account_id, "match_id": match_id, "url": url})
+
+
 async def notify_settled(site_account_id: str, match_id: str, summary: str):
     await _post("/notify/settled", {"site_account_id": site_account_id, "match_id": match_id, "summary": summary})

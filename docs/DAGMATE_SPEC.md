@@ -410,6 +410,31 @@ Illegal moves can't exist (python-chess rejects them before they touch
 state). First 2 plies are grace — a flag before either side has moved once is
 an ABORT + refund, not a win (stops instant-flag griefs on accept).
 
+### 5.1 Draw by agreement
+
+The only ending that needs BOTH players to act, and it splits a pot one side
+would otherwise take whole — so it's a money decision on two clicks, which
+makes it the most attractive ending on the board to forge. Four rules, all
+enforced as WHERE clauses on the statement that acts on them (`database.py`),
+never as a check the route does first:
+
+1. **You cannot accept your own offer** (`draw_offer_by <> accepter`). Without
+   this, a losing player offers a draw and immediately takes half the pot.
+2. **Accepting settles in one statement** — the offer's existence is part of
+   the settlement UPDATE. A check-then-settle would let a move or a clock flag
+   land in the gap and record an agreement nobody currently held.
+3. **Playing on withdraws your offer** — cleared by the same guarded UPDATE
+   that commits the move, because playing on IS how you decline. An offer that
+   outlived its position could be banked and cashed twenty moves later by
+   whoever turned out to be losing.
+4. **One offer per position** — `draw_offer_ply` survives a decline, so the
+   offer can't be re-sent until someone moves. Otherwise "decline" is just a
+   button that makes the nag reappear.
+
+Settlement is unchanged: an agreed draw is `winner_account_id IS NULL`, which
+is the same signal stalemate and a 6.9 flag already produce, so it takes the
+existing two-signer draw path (§2.3) with no special case.
+
 ---
 
 ## 7. Challenges & settings

@@ -187,8 +187,21 @@ def _match_public(m: dict) -> dict:
             "deadlineTs": m["created_ts"] + config.DEPOSIT_DEADLINE_SECS,
             "windowMins": config.DEPOSIT_DEADLINE_SECS // 60,
         },
+        # A standing draw offer, by colour rather than account id — the client
+        # already knows which colour it is (it has to, to move) and never sees
+        # account ids, so colour is the whole answer without leaking one.
+        "drawOffer": {"byColor": _color_of(m, m["draw_offer_by"])} if m["draw_offer_by"] else None,
         "clock": clocks.public(m),
     }
+
+
+def _color_of(m: dict, account_id: str | None) -> str | None:
+    """Player A is always white, player B always black."""
+    if account_id and account_id == m["player_a_account_id"]:
+        return "white"
+    if account_id and account_id == m["player_b_account_id"]:
+        return "black"
+    return None
 
 
 # ── auth ─────────────────────────────────────────────────────────────────
@@ -455,6 +468,73 @@ async def resign(match_id: str, a: dict = Depends(require_account)):
         raise HTTPException(403, "you're not a player in this match")
     winner_color = "black" if is_a else "white"
     await _settle_game_over(match_id, "resign", winner_color)
+    return _match_public(db.get_match(match_id))
+
+
+# ── draw offers ──────────────────────────────────────────────────────────
+# Agreeing a draw splits the pot, so it is a money decision — and it is the
+# only ending that needs BOTH players to say yes. Every route here takes its
+# player from the session for the same reason /resign does: an address is
+# printed on the match view, so a body-supplied one would let a stranger
+# accept a draw in a game someone else was winning.
+#
+# The rules that make it safe live in database.py, not here, because they must
+# be enforced by the same UPDATE that acts on them:
+#   - you cannot accept your own offer      (draw_offer_by <> accepter)
+#   - accepting settles in one statement    (no read-then-write window)
+#   - playing on withdraws your offer       (cleared by apply_move_with_clock)
+#   - one offer per position                (draw_offer_ply survives a decline)
+def _my_live_match(match_id: str, account: dict) -> dict:
+    m = db.get_match(match_id)
+    if not m or m["status"] != "live":
+        raise HTTPException(400, "match isn't live")
+    if account["id"] not in (m["player_a_account_id"], m["player_b_account_id"]):
+        raise HTTPException(403, "you're not a player in this match")
+    return m
+
+
+def _opponent_of(m: dict, account: dict) -> str:
+    return (m["player_b_account_id"] if account["id"] == m["player_a_account_id"]
+            else m["player_a_account_id"])
+
+
+@app.post("/api/matches/{match_id}/draw/offer")
+async def draw_offer(match_id: str, account: dict = Depends(require_account)):
+    import json
+    m = _my_live_match(match_id, account)
+    ply = len(json.loads(m["moves_json"]))
+    if not db.offer_draw(match_id, account["id"], ply):
+        if m["draw_offer_by"] and m["draw_offer_by"] != account["id"]:
+            raise HTTPException(400, "your opponent has already offered a draw — accept or decline it")
+        if m["draw_offer_by"] == account["id"]:
+            raise HTTPException(400, "your draw offer is already on the board")
+        raise HTTPException(400, "you've already offered a draw in this position — play a move first")
+    await bot_client.notify_draw_offer(_opponent_of(m, account), match_id, f"/play/{match_id}")
+    return _match_public(db.get_match(match_id))
+
+
+@app.post("/api/matches/{match_id}/draw/accept")
+async def draw_accept(match_id: str, account: dict = Depends(require_account)):
+    """Take the standing offer. Ends the match as a draw and splits the pot —
+    which is why the offer's existence, and the fact that it wasn't this
+    player's, are WHERE clauses on the settlement rather than checks up here."""
+    m = _my_live_match(match_id, account)
+    if not db.accept_draw_if_offered(match_id, account["id"]):
+        if m["draw_offer_by"] == account["id"]:
+            raise HTTPException(400, "that's your own offer — your opponent has to accept it")
+        raise HTTPException(400, "no draw offer to accept")
+    for pid in (m["player_a_account_id"], m["player_b_account_id"]):
+        await bot_client.notify_settled(pid, match_id, "draw agreed — each stake goes back to its owner")
+    return _match_public(db.get_match(match_id))
+
+
+@app.post("/api/matches/{match_id}/draw/decline")
+def draw_decline(match_id: str, account: dict = Depends(require_account)):
+    """Decline the opponent's offer, or withdraw your own — the same clear
+    either way. Both players may call it: refusing a draw and thinking better
+    of having offered one are the same state change."""
+    _my_live_match(match_id, account)
+    db.clear_draw_offer(match_id)
     return _match_public(db.get_match(match_id))
 
 
