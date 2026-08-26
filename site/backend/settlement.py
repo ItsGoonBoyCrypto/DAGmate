@@ -152,6 +152,14 @@ async def prepare(match_id: str, address: str) -> dict:
                 pot_sompi=int(built["potSompi"]), rake_sompi=int(built["rakeSompi"])):
             log.info(f"settle build for {match_id} lost the race — using the stored one")
         m = db.get_match(match_id)
+
+    # A fully-signed tx that never went out strands the pot: once the last
+    # signature is stored, every player sees "nothing to sign" and no click
+    # path reaches the broadcast. Whoever opens the panel next finishes the
+    # release — it needs no signature from them, only the stored set — so a
+    # failed broadcast self-heals on the next poll instead of deadlocking.
+    if _fully_signed(m):
+        return await _broadcast(match_id, m, address, a, b)
     return _public(m, address, a, b)
 
 
@@ -162,6 +170,41 @@ def _rake_sompi(m: dict) -> int:
     if config.RAKE_BPS <= 0:
         return 0
     return (m["stake_sompi"] * 2 * config.RAKE_BPS) // 10_000
+
+
+def _fully_signed(m: dict) -> bool:
+    """A settle tx that is built, has every player signature, and has not yet
+    been broadcast — i.e. ready to release with no further wallet interaction."""
+    if not m["settle_tx_json"] or m["settle_txid"]:
+        return False
+    stored = json.loads(m["settle_sigs_player_json"])
+    return bool(stored) and all(s is not None for s in stored)
+
+
+async def _broadcast(match_id: str, m: dict, address: str, a: dict, b: dict) -> dict:
+    """Push a fully-signed settle tx and record its txid.
+
+    Called from two places — submit (the player who just added the last
+    signature) and prepare (a player opening a match whose set is already
+    complete but never went out). Both are safe: the broadcast guard keeps the
+    first txid, and a double-spend rejection means the other side released
+    first, which is a success, not an error — but only if a txid really landed,
+    so it checks rather than assumes."""
+    inputs = json.loads(m["settle_inputs_json"])
+    stored = json.loads(m["settle_sigs_player_json"])
+    try:
+        r = await service_client.settle_broadcast(
+            tx_json=m["settle_tx_json"],
+            escrows=_escrows_per_input(m, inputs),
+            sigs_player=stored, sigs_arb=json.loads(m["settle_sigs_arb_json"]))
+    except service_client.ServiceError as e:
+        current = db.get_match(match_id)
+        if current["settle_txid"]:
+            return _public(current, address, a, b)
+        raise SettlementError(str(e))
+    if not db.mark_settlement_broadcast(match_id, r["txid"]):
+        log.warning(f"settle for {match_id} broadcast twice — keeping the first txid")
+    return _public(db.get_match(match_id), address, a, b)
 
 
 async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
@@ -203,31 +246,16 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
             # the other player completed the set first. Their broadcast covers us.
             return _public(db.get_match(match_id), address, a, b)
 
+    # Re-read so the broadcast works off the just-saved signature set (and picks
+    # up a txid if the other player's submit landed in between).
+    m = db.get_match(match_id)
     # Whether or not this call added a signature, if the set is now complete but
     # a previous broadcast attempt failed (e.g. a transient sidecar error), a
     # re-submit gets us here and retries the broadcast rather than sitting on a
     # fully-signed tx that never went out.
-    if any(s is None for s in stored):
-        return _public(db.get_match(match_id), address, a, b)
-
-    try:
-        r = await service_client.settle_broadcast(
-            tx_json=m["settle_tx_json"],
-            escrows=_escrows_per_input(m, inputs),
-            sigs_player=stored, sigs_arb=json.loads(m["settle_sigs_arb_json"]))
-    except service_client.ServiceError as e:
-        # Both players can complete the set in the same instant, in which case
-        # the second submission is a double-spend of an escrow that's already
-        # been spent and the node rejects it. That's a success, not an error —
-        # but only if a txid really did land, so check rather than assume.
-        current = db.get_match(match_id)
-        if current["settle_txid"]:
-            return _public(current, address, a, b)
-        raise SettlementError(str(e))
-
-    if not db.mark_settlement_broadcast(match_id, r["txid"]):
-        log.warning(f"settle for {match_id} broadcast twice — keeping the first txid")
-    return _public(db.get_match(match_id), address, a, b)
+    if not _fully_signed(m):
+        return _public(m, address, a, b)
+    return await _broadcast(match_id, m, address, a, b)
 
 
 def _public(m: dict, address: str, a: dict, b: dict) -> dict:

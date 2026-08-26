@@ -290,6 +290,25 @@ async def main() -> int:
           ["SIGNED-A#0", "SIGNED-A#1"])
     check("txid finally returned", r["txid"], "txid-abc")
 
+    print("prepare releases a fully-signed match no one has left to sign")
+    # The deadlock from the browser's side: once the last signature is stored,
+    # NEITHER player's panel shows a button (nothing left to sign), so a failed
+    # broadcast would strand the pot forever. Whoever opens the panel next must
+    # finish the release from prepare itself.
+    stub_sidecar(broadcast_error="node down")
+    mid, a, b = new_match(winner="a")
+    await settlement.prepare(mid, a["address"])
+    await err(settlement.submit(mid, a["address"], "SIGNED-A"))  # sigs stored, broadcast failed
+    check("stuck: complete but unbroadcast", db.get_match(mid)["settle_txid"], None)
+    stub_sidecar()  # sidecar healthy again
+    # The loser opens their panel. They have nothing to sign, but prepare
+    # releases on their behalf — the broadcast needs no signature from them.
+    p = await settlement.prepare(mid, b["address"])
+    check("prepare broadcast the stuck tx", p["state"], "broadcast")
+    check("txid now recorded", db.get_match(mid)["settle_txid"], "txid-abc")
+    check("released the stored signature set", _calls["broadcast"][0]["sigs_player"],
+          ["SIGNED-A#0", "SIGNED-A#1"])
+
     print("the build guard: only the first concurrent claim writes")
     stub_sidecar()
     mid, a, b = new_match(winner="a")
