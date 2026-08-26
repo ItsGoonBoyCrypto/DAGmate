@@ -278,6 +278,18 @@ async def main() -> int:
     check("signatures kept for the retry",
           json.loads(db.get_match(mid)["settle_sigs_player_json"]), ["SIGNED-A#0", "SIGNED-A#1"])
 
+    print("a retry re-broadcasts a fully-signed tx that never went out")
+    # Same match as above: every signature is stored but the first broadcast
+    # failed, so no txid landed. The player clicks again. With nothing left to
+    # sign, submit must still reach the broadcast — not sit on a signed tx.
+    stub_sidecar()  # sidecar is healthy again
+    r = await settlement.submit(mid, a["address"], "SIGNED-A")
+    check("broadcast retried", len(_calls["broadcast"]), 1)
+    check("nothing re-extracted", len(_calls["extract"]), 0)
+    check("reuses the stored signatures", _calls["broadcast"][0]["sigs_player"],
+          ["SIGNED-A#0", "SIGNED-A#1"])
+    check("txid finally returned", r["txid"], "txid-abc")
+
     print("the build guard: only the first concurrent claim writes")
     stub_sidecar()
     mid, a, b = new_match(winner="a")

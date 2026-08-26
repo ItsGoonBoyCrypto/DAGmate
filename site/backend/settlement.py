@@ -190,20 +190,23 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
     # Only the inputs that are this player's to sign AND not yet filled.
     my_indexes = [i["index"] for i in inputs
                   if i["signer"] == address and stored[i["index"]] is None]
-    if not my_indexes:
-        return _public(m, address, a, b)  # nothing left for them to sign
-    got = await service_client.extract_sigs(signed_tx_json=signed_tx_json, indexes=my_indexes)
-    extracted = got.get("sigs", {})
-    for i in my_indexes:
-        sig = extracted.get(str(i))
-        if not sig:
-            raise SettlementError(f"your wallet didn't sign input {i} — try again")
-        stored[i] = sig
-    if not db.save_settlement_sigs(match_id, stored):
-        # The guard only fails if a txid landed while we were signing, i.e. the
-        # other player completed the set first. Their broadcast covers us.
-        return _public(db.get_match(match_id), address, a, b)
+    if my_indexes:
+        got = await service_client.extract_sigs(signed_tx_json=signed_tx_json, indexes=my_indexes)
+        extracted = got.get("sigs", {})
+        for i in my_indexes:
+            sig = extracted.get(str(i))
+            if not sig:
+                raise SettlementError(f"your wallet didn't sign input {i} — try again")
+            stored[i] = sig
+        if not db.save_settlement_sigs(match_id, stored):
+            # The guard only fails if a txid landed while we were signing, i.e.
+            # the other player completed the set first. Their broadcast covers us.
+            return _public(db.get_match(match_id), address, a, b)
 
+    # Whether or not this call added a signature, if the set is now complete but
+    # a previous broadcast attempt failed (e.g. a transient sidecar error), a
+    # re-submit gets us here and retries the broadcast rather than sitting on a
+    # fully-signed tx that never went out.
     if any(s is None for s in stored):
         return _public(db.get_match(match_id), address, a, b)
 

@@ -97,13 +97,13 @@ export function buildEscrow({ matchId, pkA, pkB, depositorIsA, reclaimDaa }) {
 /** Fill one escrow input's sigScript for the IF (settle) branch. `sigPlayer`
  *  is always pushed before `sigArb` — pubkey push order is pkA, pkB, pkArb,
  *  so whichever of A/B co-signs, it precedes the arbiter's slot either way. */
-function fillEscrowInput(k, tx, inputIdx, redeemHex, sigPlayer, sigArb) {
+function settleSigScript(k, redeemHex, sigPlayer, sigArb) {
   const redeem = new k.ScriptBuilder(core.COVENANT_OPTS)
     .addData(rawSig(sigPlayer))
     .addData(rawSig(sigArb))
     .addOp(k.Opcodes.OpTrue) // select the IF (settle) branch
     .drain();
-  tx.fillInput(inputIdx, k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem));
+  return k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem);
 }
 
 /** POST /escrow/balances — how much is actually sitting at each address.
@@ -277,14 +277,16 @@ export async function broadcastSettle({ txJson, escrows, sigsPlayer, sigsArb }) 
   const k = core.wasm();
   return core.withRpc(async (rpc) => {
     const tx = k.Transaction.deserializeFromSafeJSON(txJson);
+    const inputs = tx.inputs;  // may be clones — mutate then reassign to commit
     for (let i = 0; i < sigsPlayer.length; i++) {
       // `escrows` here is indexed BY INPUT INDEX, not one entry per escrow —
       // an escrow holding two UTXOs appears twice. The backend expands it
       // (settlement._escrows_per_input); this side trusts the position.
       const escrow = escrows[i];
       if (!escrow) throw new Error(`no escrow mapping for input ${i}`);
-      fillEscrowInput(k, tx, i, escrow.redeemHex, sigsPlayer[i], sigsArb[i]);
+      inputs[i].signatureScript = settleSigScript(k, escrow.redeemHex, sigsPlayer[i], sigsArb[i]);
     }
+    tx.inputs = inputs; // low-level Transaction has no fillInput(); commit the array back
     const txid = await tx.submit(rpc);
     return { txid };
   });
@@ -379,8 +381,9 @@ export async function broadcastReclaim({ txJson, redeemHex, sigs }) {
   const k = core.wasm();
   return core.withRpc(async (rpc) => {
     const tx = k.Transaction.deserializeFromSafeJSON(txJson);
-    if (tx.inputs.length !== sigs.length) {
-      throw new Error(`expected ${tx.inputs.length} signatures, got ${sigs.length}`);
+    const inputs = tx.inputs;  // may be clones — mutate then reassign to commit
+    if (inputs.length !== sigs.length) {
+      throw new Error(`expected ${inputs.length} signatures, got ${sigs.length}`);
     }
     for (let i = 0; i < sigs.length; i++) {
       if (!sigs[i]) throw new Error(`missing signature for input ${i}`);
@@ -388,9 +391,10 @@ export async function broadcastReclaim({ txJson, redeemHex, sigs }) {
         .addData(rawSig(sigs[i]))
         .addOp(k.Opcodes.OpFalse) // select the ELSE (timelock reclaim) branch
         .drain();
-      tx.fillInput(i, k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS)
-        .encodePayToScriptHashSignatureScript(redeem));
+      inputs[i].signatureScript = k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS)
+        .encodePayToScriptHashSignatureScript(redeem);
     }
+    tx.inputs = inputs; // low-level Transaction has no fillInput(); commit the array back
     // Explicit `allowOrphan: false`: a reclaim spends a confirmed UTXO that has
     // been sitting for two weeks, so an orphan here means something is wrong
     // with the tx, not that a parent is in flight.
