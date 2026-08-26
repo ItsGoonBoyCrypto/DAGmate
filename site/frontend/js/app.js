@@ -829,16 +829,26 @@
     verifyOutputsTotal(txJson, ctx && ctx.expectedOutputSompi);
     const provider = window.kasware || window.kastle;
     if (!provider) throw new Error("connect Kasware or Kastle to release the pot");
+    console.log("[DAGmate] signing", { hasSignPskt: typeof provider.signPskt,
+      hasSignTx: typeof provider.signTx, indexes, txJsonPreview: String(txJson).slice(0, 160) });
     const out = {};
     if (typeof provider.signPskt === "function") {
-      for (const i of indexes) out[i] = await provider.signPskt(txJson, { inputIndex: i });
-      return out;
+      // Kasware's real API: signPskt({ txJsonString, options: { signInputs:[{index,sighashType}] } })
+      // → returns the FULLY SIGNED tx JSON (not a per-input signature). We sign
+      // every one of our inputs in a single call and hand the signed tx back.
+      try {
+        const signed = await provider.signPskt({
+          txJsonString: txJson,
+          options: { signInputs: indexes.map((i) => ({ index: i, sighashType: 1 })) },
+        });
+        console.log("[DAGmate] signPskt returned:", String(signed).slice(0, 200));
+        return { signedTxJson: signed };
+      } catch (e) {
+        console.error("[DAGmate] signPskt failed:", e, "message:", e && e.message);
+        throw e;
+      }
     }
-    if (typeof provider.signTx === "function") {
-      for (const i of indexes) out[i] = await provider.signTx(txJson, { inputIndex: i });
-      return out;
-    }
-    throw new Error("this wallet doesn't expose custom-script signing yet");
+    throw new Error("this wallet doesn't expose the signPskt method DAGmate needs to release the pot");
   }
 
   // ── reclaiming a stranded stake ──────────────────────────────────────
