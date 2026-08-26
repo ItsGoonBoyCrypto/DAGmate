@@ -27,6 +27,7 @@ LoadCredential=mnemonic:/etc/dagmate/mnemonic
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=5
+LimitNOFILE=65536
 
 # This is the process that can co-sign a settlement, so it gets the tightest
 # box of the three. It binds 127.0.0.1 in code; these make that structural

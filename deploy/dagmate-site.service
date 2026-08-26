@@ -16,6 +16,10 @@ EnvironmentFile=/etc/dagmate/site.env
 ExecStart=/opt/dagmate/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8800
 Restart=always
 RestartSec=5
+# Headroom over the 1024 default so a stray fd leak can't wedge the process in
+# a couple of hours (the connection-close fix means fds stay flat anyway; this
+# is belt-and-braces).
+LimitNOFILE=65536
 
 # 127.0.0.1 only: nginx terminates TLS and is the only thing that talks to it.
 # Binding 0.0.0.0 here would publish the API on :8800 alongside the TLS site,

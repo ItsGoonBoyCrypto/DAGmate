@@ -17,6 +17,7 @@ EnvironmentFile=/etc/dagmate/bot.env
 ExecStart=/opt/dagmate/venv/bin/python dagmate_bot.py
 Restart=always
 RestartSec=10
+LimitNOFILE=65536
 
 # Deliberately NOT ordered after the site backend, and not Requires= either.
 # Alerts are best-effort by design: the bot being down must never be able to

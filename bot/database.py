@@ -12,6 +12,7 @@ import sqlite3
 import string
 import threading
 import time
+from contextlib import contextmanager
 
 import config
 
@@ -20,7 +21,7 @@ _lock = threading.Lock()
 _LINK_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I ambiguity
 
 
-def _conn() -> sqlite3.Connection:
+def _connect() -> sqlite3.Connection:
     d = os.path.dirname(config.DB_PATH)
     if d:
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -36,6 +37,20 @@ def _conn() -> sqlite3.Connection:
         except OSError:
             pass
     return conn
+
+
+@contextmanager
+def _conn():
+    """Open a connection, run the body as a transaction, and ALWAYS close it.
+    Same fd-leak fix as the site DB: `with sqlite3.connect(...)` commits but does
+    not close, so the old code leaked a descriptor per call. Every call site is
+    `with … _conn() as c`, so behaviour is otherwise unchanged."""
+    conn = _connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def ensure_schema():

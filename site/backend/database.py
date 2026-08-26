@@ -12,13 +12,14 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 import config
 
 _lock = threading.Lock()
 
 
-def _conn() -> sqlite3.Connection:
+def _connect() -> sqlite3.Connection:
     d = os.path.dirname(config.DB_PATH)
     if d:
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -34,6 +35,25 @@ def _conn() -> sqlite3.Connection:
         except OSError:
             pass
     return conn
+
+
+@contextmanager
+def _conn():
+    """Open a connection, run the body as a transaction, and ALWAYS close it.
+
+    ⚠️ `with sqlite3.connect(...) as c` only commits/rolls back the
+    transaction — it does NOT close the connection. The old code relied on that
+    `with`, so every DB call leaked a file descriptor, and the 5s clock watcher
+    + 20s deposit watcher exhausted the process's 1024-fd limit in ~2h — SQLite
+    then failed "unable to open database file" and the site went dead until a
+    restart (seen live 2026-08-26). Closing in a finally is the fix; every call
+    site is `with … _conn() as c`, so the transaction semantics are unchanged."""
+    conn = _connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def ensure_schema():
