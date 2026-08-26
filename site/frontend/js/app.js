@@ -855,7 +855,13 @@
     const el = document.getElementById("reclaimPanel");
     const r = m.reclaim;
     const color = myColorFor(m);
-    if (!r || !r.eligible || !color) { el.innerHTML = ""; state.reclaimFor = null; return; }
+    // While a match is still awaiting its first deposit, the funding panel owns
+    // the screen — showing "Reclaim your stake" there is premature and confusing
+    // (there's nothing deposited to reclaim yet). Reclaim only makes sense once
+    // the match has actually expired/failed, so hold it back until then.
+    if (!r || !r.eligible || !color || m.status === "awaiting_deposit") {
+      el.innerHTML = ""; state.reclaimFor = null; return;
+    }
 
     const txid = color === "white" ? r.aTxid : r.bTxid;
     if (txid) {
@@ -967,9 +973,48 @@
     el.innerHTML =
       side(`${esc(displayName(m.playerA))} (white)`, m.escrowA, f.aFunded, f.aKas) +
       side(`${esc(displayName(m.playerB))} (black)`, m.escrowB, f.bFunded, f.bKas) +
-      `<div class="meta">Send at least ${esc(f.stakeKas)} KAS to your own escrow address. The match
-       starts automatically once both stakes confirm. If both sides haven't funded within
-       ${f.windowMins} minutes the match is cancelled, and any stake you sent stays yours.</div>`;
+      `<div class="meta">The match starts automatically once both stakes confirm. If both sides
+       haven't funded within ${f.windowMins} minutes the match is cancelled, and any stake you
+       sent stays yours.</div>`;
+
+    // One-tap fund: pop the wallet pre-filled to send this player's own stake to
+    // their own escrow. Non-custodial — the player still approves in the wallet;
+    // this just saves the copy-address-and-type dance. Only for a real wallet
+    // (the demo wallet can't send) and only for the viewer's own unfunded side.
+    const mine = myColorFor(m);
+    const myEscrow = mine === "white" ? m.escrowA : (mine === "black" ? m.escrowB : null);
+    const myFunded = mine === "white" ? f.aFunded : f.bFunded;
+    if (mine && myEscrow && !myFunded && !state.isDemoWallet) {
+      const btn = document.createElement("button");
+      btn.className = "btn btn-primary full";
+      btn.style.marginTop = "10px";
+      btn.textContent = `Fund my stake (${f.stakeKas} KAS)`;
+      btn.addEventListener("click", () => fundEscrow(myEscrow, f.stakeSompi, f.stakeKas, btn));
+      el.appendChild(btn);
+    }
+  }
+
+  async function fundEscrow(address, stakeSompi, stakeKas, btn) {
+    const provider = window.kasware || window.kastle;
+    if (!provider || typeof provider.sendKaspa !== "function") {
+      toast(`This wallet has no one-tap send — send ${stakeKas} KAS to ${address} yourself.`);
+      return;
+    }
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Waiting for your wallet…";
+    try {
+      // Kasware/Kastle sendKaspa takes an integer sompi amount and pops its own
+      // confirmation. We pass the exact stake; the deposit watcher starts the
+      // match once it confirms on-chain (~15s) and the opponent has funded too.
+      await provider.sendKaspa(address, Number(stakeSompi));
+      toast("Deposit sent — the match starts automatically once it confirms.");
+      btn.textContent = "Deposit sent ✓";
+    } catch (e) {
+      toast(`Deposit didn't go through: ${e && e.message ? e.message : e}`);
+      btn.disabled = false;
+      btn.textContent = label;
+    }
   }
 
   function onBoardSquareClick(sq) {

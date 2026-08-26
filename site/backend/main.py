@@ -221,6 +221,9 @@ def _match_public(m: dict) -> dict:
         # rather than staring at "awaiting_deposit" with no explanation.
         "funding": {
             "stakeKas": m["stake_sompi"] / config.SOMPI_PER_KAS,
+            # Exact integer sompi so the one-tap fund button sends the precise
+            # stake (never a float-rounded amount) to the wallet.
+            "stakeSompi": str(m["stake_sompi"]),
             "aKas": (m["funded_a_sompi"] or 0) / config.SOMPI_PER_KAS,
             "bKas": (m["funded_b_sompi"] or 0) / config.SOMPI_PER_KAS,
             "aFunded": m["funded_a_ts"] is not None,
