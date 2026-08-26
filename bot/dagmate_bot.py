@@ -221,6 +221,11 @@ def _build_webhook_app(application) -> web.Application:
 async def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx logs every request URL at INFO — and python-telegram-bot puts the bot
+    # token IN the URL (…/bot<TOKEN>/getUpdates), so at INFO the token lands in
+    # the journal on every poll. Lift httpx to WARNING so the token never gets
+    # logged. (The token authenticates the bot; keep it out of logs.)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     db.ensure_schema()
 
     application = Application.builder().token(config.BOT_TOKEN).build()
