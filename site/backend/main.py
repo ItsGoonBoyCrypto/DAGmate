@@ -78,7 +78,13 @@ app = FastAPI(title="DAGmate")
 # script; there are no inline <script> blocks or on* handlers to need it.
 _CSP = (
     "default-src 'none'; "
-    "script-src 'self'; "
+    # 'wasm-unsafe-eval' lets WebAssembly compile/instantiate — the wallet
+    # extensions (Kasware/Kastle) sign with a Kaspa WASM module injected into the
+    # page, and without this the browser blocks the WASM (surfacing as a CSP
+    # "eval blocked" error) and signing dies. It is NARROWER than 'unsafe-eval':
+    # it permits WASM only, NOT eval()/new Function(), so the injection surface
+    # 'self' already closes stays closed.
+    "script-src 'self' 'wasm-unsafe-eval'; "
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
     "font-src 'self' https://fonts.gstatic.com; "
     "img-src 'self' data:; "
