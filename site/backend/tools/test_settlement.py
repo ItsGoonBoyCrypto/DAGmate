@@ -53,6 +53,14 @@ def stub_sidecar(*, utxos_a=1, utxos_b=1, build_error=None, broadcast_error=None
     _calls.clear()
     _calls["build"] = []
     _calls["broadcast"] = []
+    _calls["extract"] = []
+
+    async def _extract(*, signed_tx_json, indexes):
+        # Stand in for the sidecar pulling a player's sigs out of their signed
+        # tx: return one sig per requested input, tagged with the tx it came
+        # from so the test can prove A's sig lands on A's input and B's on B's.
+        _calls["extract"].append({"signed_tx_json": signed_tx_json, "indexes": list(indexes)})
+        return {"sigs": {str(i): f"{signed_tx_json}#{i}" for i in indexes}}
 
     async def _unsigned(*, match_id, escrows, winner_addr, split, rake_sompi):
         _calls["build"].append({"match_id": match_id, "escrows": escrows,
@@ -76,6 +84,7 @@ def stub_sidecar(*, utxos_a=1, utxos_b=1, build_error=None, broadcast_error=None
 
     settlement.service_client.settle_unsigned = _unsigned
     settlement.service_client.settle_broadcast = _broadcast
+    settlement.service_client.extract_sigs = _extract
 
 
 def new_match(*, winner: str | None = "a", status="settled", stake=STAKE, escrows=True):
@@ -144,38 +153,40 @@ async def main() -> int:
     await settlement.prepare(mid, b["address"])
     check("no rebuild on repeat prepare", len(_calls["build"]), before)
 
-    print("the winner signs and it broadcasts")
-    r = await settlement.submit(mid, a["address"], {0: "sigA0", 1: "sigA1"})
+    print("the winner signs (whole tx) and it broadcasts")
+    r = await settlement.submit(mid, a["address"], "SIGNED-A")
     check("broadcast happened", len(_calls["broadcast"]), 1)
-    check("player sigs passed through", _calls["broadcast"][0]["sigs_player"], ["sigA0", "sigA1"])
+    check("only the winner's own inputs were extracted", _calls["extract"][0]["indexes"], [0, 1])
+    check("extracted player sigs passed through", _calls["broadcast"][0]["sigs_player"],
+          ["SIGNED-A#0", "SIGNED-A#1"])
     check("arbiter sigs passed through", _calls["broadcast"][0]["sigs_arb"], ["arb0", "arb1"])
     check("txid recorded", r["txid"], "txid-abc")
     check("state is broadcast", r["state"], "broadcast")
     check("txid persisted", db.get_match(mid)["settle_txid"], "txid-abc")
 
     print("a second claim doesn't broadcast again")
-    r2 = await settlement.submit(mid, a["address"], {0: "sigA0", 1: "sigA1"})
+    r2 = await settlement.submit(mid, a["address"], "SIGNED-A")
     check("still one broadcast", len(_calls["broadcast"]), 1)
     check("returns the same txid", r2["txid"], "txid-abc")
     check("prepare after broadcast doesn't rebuild", len(_calls["build"]), before)
 
-    print("a player can't sign an input that isn't theirs")
+    print("the loser has no inputs to sign, so their submit is a harmless no-op")
     stub_sidecar()
     mid, a, b = new_match(winner="a")
     await settlement.prepare(mid, a["address"])
-    check("loser signing the winner's input is refused",
-          await err(settlement.submit(mid, b["address"], {0: "forged"})),
-          "input 0 isn't yours to sign")
+    # In a decisive win the winner signs every input, so the loser's signer set
+    # is empty — their submit can't touch a thing (it never even asks the
+    # sidecar to extract), which is the structural version of "not yours to sign".
+    r = await settlement.submit(mid, b["address"], "LOSER-TRIES")
+    check("no extraction for the loser", len(_calls["extract"]), 0)
+    check("no broadcast", len(_calls["broadcast"]), 0)
     check("nothing stored", json.loads(db.get_match(mid)["settle_sigs_player_json"]), [None, None])
-    check("out-of-range index refused",
-          await err(settlement.submit(mid, a["address"], {7: "sig"})),
-          "input 7 isn't part of this settlement")
 
     print("a stranger can't touch the settlement at all")
     outsider = db.get_or_create_account(f"kaspatest:evil{time.time_ns()}", "cc")
     check("prepare refused", await err(settlement.prepare(mid, outsider["address"])),
           "you're not a player in this match")
-    check("submit refused", await err(settlement.submit(mid, outsider["address"], {0: "sig"})),
+    check("submit refused", await err(settlement.submit(mid, outsider["address"], "X")),
           "you're not a player in this match")
 
     print("a draw: each player signs their OWN escrow, and only when both have")
@@ -196,17 +207,19 @@ async def main() -> int:
           (STAKE * 2 - 2 * config.SETTLE_FEE_SOMPI_PER_INPUT) / config.SOMPI_PER_KAS / 2)
 
     print("half a draw doesn't move any money")
-    r = await settlement.submit(mid, a["address"], {0: "sigA"})
+    r = await settlement.submit(mid, a["address"], "SIGNED-A")
     check("no broadcast yet", len(_calls["broadcast"]), 0)
+    check("A only extracted their own input", _calls["extract"][-1]["indexes"], [0])
     check("A now waits on B", r["waitingOnOpponent"], True)
     check("A has nothing left to sign", r["mySignatureInputs"], [])
     check("A's signature survives", json.loads(db.get_match(mid)["settle_sigs_player_json"]),
-          ["sigA", None])
+          ["SIGNED-A#0", None])
 
     print("B completes it days later, against the SAME tx")
-    r = await settlement.submit(mid, b["address"], {1: "sigB"})
+    r = await settlement.submit(mid, b["address"], "SIGNED-B")
     check("broadcast now", len(_calls["broadcast"]), 1)
-    check("both signatures used", _calls["broadcast"][0]["sigs_player"], ["sigA", "sigB"])
+    check("A's sig on input 0, B's on input 1", _calls["broadcast"][0]["sigs_player"],
+          ["SIGNED-A#0", "SIGNED-B#1"])
     check("the tx B signed is the one A signed", _calls["broadcast"][0]["tx_json"], "{tx}")
     check("txid returned", r["txid"], "txid-abc")
 
@@ -215,7 +228,7 @@ async def main() -> int:
     mid, a, b = new_match(winner="b")
     p = await settlement.prepare(mid, b["address"])
     check("winner signs all three inputs", p["mySignatureInputs"], [0, 1, 2])
-    await settlement.submit(mid, b["address"], {0: "s0", 1: "s1", 2: "s2"})
+    await settlement.submit(mid, b["address"], "SIGNED-B")
     check("broadcast escrows are per INPUT, not per escrow",
           [e["redeemHex"] for e in _calls["broadcast"][0]["escrows"]], ["aaaa", "aaaa", "bbbb"])
     check("network fee counts every input",
@@ -251,7 +264,7 @@ async def main() -> int:
     await settlement.prepare(mid, a["address"])
     db.mark_settlement_broadcast(mid, "txid-from-the-other-tab")
     # settle_txid is set, so submit short-circuits before it ever broadcasts.
-    r = await settlement.submit(mid, a["address"], {0: "s0", 1: "s1"})
+    r = await settlement.submit(mid, a["address"], "SIGNED-A")
     check("reports the winning txid", r["txid"], "txid-from-the-other-tab")
     check("never tried to broadcast", len(_calls["broadcast"]), 0)
 
@@ -260,10 +273,10 @@ async def main() -> int:
     mid, a, b = new_match(winner="a")
     await settlement.prepare(mid, a["address"])
     check("error reaches the player",
-          await err(settlement.submit(mid, a["address"], {0: "s0", 1: "s1"})), "node unreachable")
+          await err(settlement.submit(mid, a["address"], "SIGNED-A")), "node unreachable")
     check("no txid recorded", db.get_match(mid)["settle_txid"], None)
     check("signatures kept for the retry",
-          json.loads(db.get_match(mid)["settle_sigs_player_json"]), ["s0", "s1"])
+          json.loads(db.get_match(mid)["settle_sigs_player_json"]), ["SIGNED-A#0", "SIGNED-A#1"])
 
     print("the build guard: only the first concurrent claim writes")
     stub_sidecar()

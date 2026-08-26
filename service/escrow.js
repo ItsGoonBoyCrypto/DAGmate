@@ -230,6 +230,43 @@ export async function buildSettleUnsigned({ matchId, escrows, winnerAddr, split,
   });
 }
 
+/** Pull the first pushed data item (the signature) out of a signatureScript hex
+ *  string. A wallet's signPskt fills each input's script with a push of the
+ *  Schnorr sig (65 bytes incl. the sighash byte); we only want that raw sig so
+ *  we can re-assemble it into the covenant's own 2-of-3 sigScript. */
+function firstPushHex(scriptHex) {
+  const b = Buffer.from(String(scriptHex || ''), 'hex');
+  if (!b.length) return null;
+  const op = b[0];
+  if (op >= 0x01 && op <= 0x4b) return b.subarray(1, 1 + op).toString('hex');       // OP_DATA_1..75
+  if (op === 0x4c && b.length >= 2) return b.subarray(2, 2 + b[1]).toString('hex');  // OP_PUSHDATA1
+  return null;
+}
+
+/** POST /escrow/extract-sigs — the wallet-connect path. A player's wallet
+ *  (Kasware signPskt) returns the WHOLE tx with THEIR signature embedded in
+ *  each of their inputs. This pulls the raw signature back out of the given
+ *  input indexes, so the backend can store it and, once every input is signed,
+ *  hand the raw sigs to the existing broadcastSettle assembly — the same
+ *  covenant sigScript path the arbiter sigs already ran through. No key here,
+ *  no broadcast: pure extraction, so a draw's two separate wallet returns each
+ *  contribute only the inputs that were theirs to sign. */
+export async function extractSigs({ signedTxJson, indexes }) {
+  if (!signedTxJson) throw new Error('signedTxJson required');
+  if (!Array.isArray(indexes)) throw new Error('indexes required');
+  const k = core.wasm();
+  const signed = k.Transaction.deserializeFromSafeJSON(signedTxJson);
+  const ins = signed.inputs;
+  const sigs = {};
+  for (const i of indexes) {
+    const sig = firstPushHex(ins[i] && ins[i].signatureScript);
+    if (!sig) throw new Error(`no signature in input ${i} — wallet sigScript was `
+      + `"${ins[i] && ins[i].signatureScript}"`);
+    sigs[String(i)] = sig;
+  }
+  return { sigs };
+}
+
 /** POST /escrow/settle-broadcast — take a tx previously built by
  *  buildSettleUnsigned (site round-tripped it through the winning/depositor
  *  wallet(s) for a signature per input) and the matching player signatures,

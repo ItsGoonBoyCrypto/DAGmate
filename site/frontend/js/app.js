@@ -766,16 +766,16 @@
     // second signing prompt.
     state.signing = true;
     try {
-      let sigs;
+      let signedTxJson;
       try {
-        sigs = await signSettleInputs(s.txJson, s.mySignatureInputs, s);
+        ({ signedTxJson } = await signSettleInputs(s.txJson, s.mySignatureInputs, s));
       } catch (e) {
         toast(`Signing failed: ${e.message}`);
         if (btn) { btn.disabled = false; btn.textContent = "Sign & release"; }
         return;
       }
       try {
-        state.settle = await api("POST", `/api/matches/${m.id}/settle/submit`, { sigs });
+        state.settle = await api("POST", `/api/matches/${m.id}/settle/submit`, { signedTxJson });
         renderClaim(m);
         toast(state.settle.txid ? "Payout broadcast." : "Signed — waiting on your opponent.");
       } catch (e) {

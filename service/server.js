@@ -59,6 +59,8 @@ app.post('/escrow/settle-unsigned', wrap((req) => escrow.buildSettleUnsigned(req
 
 app.post('/escrow/settle-broadcast', wrap((req) => escrow.broadcastSettle(req.body)));
 
+app.post('/escrow/extract-sigs', wrap((req) => escrow.extractSigs(req.body)));
+
 app.post('/escrow/reclaim-unsigned', wrap((req) => escrow.buildReclaimUnsigned(req.body)));
 
 app.post('/escrow/reclaim-broadcast', wrap((req) => escrow.broadcastReclaim(req.body)));

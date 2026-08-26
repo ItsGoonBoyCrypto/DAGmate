@@ -724,22 +724,19 @@ async def settle_prepare(match_id: str, account: dict = Depends(require_account)
 
 
 class SettleSubmitBody(BaseModel):
-    # {input index: signature}. JSON object keys are strings, so this is typed
-    # as such and converted below rather than silently dropping entries.
-    sigs: dict[str, str]
+    # The whole tx, signed by the player's wallet (Kasware signPskt returns the
+    # signed tx as a Safe-JSON string). The backend extracts their signatures
+    # from it via the sidecar.
+    signedTxJson: str
 
 
 @app.post("/api/matches/{match_id}/settle/submit")
 async def settle_submit(match_id: str, body: SettleSubmitBody,
                         account: dict = Depends(require_account)):
+    if not body.signedTxJson:
+        raise HTTPException(400, "no signed transaction supplied")
     try:
-        sigs = {int(k): v for k, v in body.sigs.items()}
-    except ValueError:
-        raise HTTPException(400, "signature keys must be input indexes")
-    if not sigs:
-        raise HTTPException(400, "no signatures supplied")
-    try:
-        return await settlement.submit(match_id, account["address"], sigs)
+        return await settlement.submit(match_id, account["address"], body.signedTxJson)
     except settlement.SettlementError as e:
         raise HTTPException(400, str(e))
     except ServiceError as e:

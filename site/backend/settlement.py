@@ -164,15 +164,16 @@ def _rake_sompi(m: dict) -> int:
     return (m["stake_sompi"] * 2 * config.RAKE_BPS) // 10_000
 
 
-async def submit(match_id: str, address: str, sigs: dict[int, str]) -> dict:
-    """Store this player's signatures and, once the set is complete, broadcast.
+async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
+    """Take the wallet-signed tx, keep this player's signatures, and — once the
+    set is complete — broadcast.
 
-    `sigs` is {input index: signature}. Every index is checked against the
-    stored signer map: a player can only sign the inputs that are theirs to
-    sign. Without that check a draw's loser-of-the-coin-flip could sign the
-    other player's escrow slot with their own key and produce a tx that fails
-    validation — or, worse, a future signer map change could let them redirect
-    someone else's half."""
+    The player's wallet (Kasware signPskt) returns the WHOLE tx with their
+    signature embedded in each of their inputs. We only ever pull sigs from the
+    inputs the stored signer map says are THIS player's — so a draw's
+    loser-of-the-coin-flip can't slip a signature into the other player's escrow
+    slot. The extracted raw sigs then go through the same broadcastSettle
+    assembly the arbiter sigs already do."""
     m = db.get_match(match_id)
     if not m:
         raise SettlementError("match not found")
@@ -186,12 +187,18 @@ async def submit(match_id: str, address: str, sigs: dict[int, str]) -> dict:
 
     inputs = json.loads(m["settle_inputs_json"])
     stored = json.loads(m["settle_sigs_player_json"])
-    for idx, sig in sigs.items():
-        if not 0 <= idx < len(inputs):
-            raise SettlementError(f"input {idx} isn't part of this settlement")
-        if inputs[idx]["signer"] != address:
-            raise SettlementError(f"input {idx} isn't yours to sign")
-        stored[idx] = sig
+    # Only the inputs that are this player's to sign AND not yet filled.
+    my_indexes = [i["index"] for i in inputs
+                  if i["signer"] == address and stored[i["index"]] is None]
+    if not my_indexes:
+        return _public(m, address, a, b)  # nothing left for them to sign
+    got = await service_client.extract_sigs(signed_tx_json=signed_tx_json, indexes=my_indexes)
+    extracted = got.get("sigs", {})
+    for i in my_indexes:
+        sig = extracted.get(str(i))
+        if not sig:
+            raise SettlementError(f"your wallet didn't sign input {i} — try again")
+        stored[i] = sig
     if not db.save_settlement_sigs(match_id, stored):
         # The guard only fails if a txid landed while we were signing, i.e. the
         # other player completed the set first. Their broadcast covers us.

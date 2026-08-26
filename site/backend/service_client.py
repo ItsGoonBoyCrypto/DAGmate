@@ -95,6 +95,14 @@ async def settle_broadcast(*, tx_json: str, escrows: list[dict], sigs_player: li
     })
 
 
+async def extract_sigs(*, signed_tx_json: str, indexes: list[int]) -> dict:
+    """Pull the raw player signatures back out of the given inputs of a
+    wallet-signed tx. Returns {"sigs": {"<index>": "<hex>"}}."""
+    return await _post("/escrow/extract-sigs", {
+        "signedTxJson": signed_tx_json, "indexes": indexes,
+    })
+
+
 async def reclaim_unsigned(*, address: str, depositor_addr: str, reclaim_daa: int) -> dict:
     """Unsigned tx draining one escrow's CLTV branch back to its depositor.
     Sompi fields come back as decimal strings (see escrow.js) — parsed to int
