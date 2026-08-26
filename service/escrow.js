@@ -287,8 +287,12 @@ export async function broadcastSettle({ txJson, escrows, sigsPlayer, sigsArb }) 
       inputs[i].signatureScript = settleSigScript(k, escrow.redeemHex, sigsPlayer[i], sigsArb[i]);
     }
     tx.inputs = inputs; // low-level Transaction has no fillInput(); commit the array back
-    const txid = await tx.submit(rpc);
-    return { txid };
+    // A low-level Transaction has no .submit() (that's a PendingTransaction
+    // method); it goes to the node through the RPC client, same as reclaim.
+    // allowOrphan:false — every escrow UTXO is already confirmed, so an orphan
+    // means the tx is malformed, not that a parent is still in flight.
+    const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false });
+    return { txid: String(resp.transactionId ?? resp) };
   });
 }
 
