@@ -78,9 +78,13 @@ RECLAIM_DAA_WINDOW = int(os.getenv("DAGMATE_RECLAIM_DAA_WINDOW", str(14 * 24 * 3
 # anything at all. Single-use is the real defence (database.consume_nonce);
 # this just keeps the table small and the blast radius short.
 AUTH_NONCE_TTL_SECS = int(os.getenv("DAGMATE_AUTH_NONCE_TTL_SECS", "300"))
-# Session lifetime. Long enough that a `daily` match (3d+12h) doesn't log you
-# out mid-game, short enough that a stolen token isn't a permanent key.
-AUTH_SESSION_TTL_SECS = int(os.getenv("DAGMATE_AUTH_SESSION_TTL_SECS", str(14 * 24 * 3600)))
+# Session lifetime. Long enough to "stay connected" across days of casual play
+# (a single wallet signs in once and stays in for ~3 months), short enough that
+# a stolen token isn't a permanent key. The session token is SHA-256 hashed at
+# rest and revoked on logout, so a long window is a UX win, not a key. NB:
+# switching between different wallets is a different identity each time and will
+# always ask for a fresh sign-in — that's not this TTL.
+AUTH_SESSION_TTL_SECS = int(os.getenv("DAGMATE_AUTH_SESSION_TTL_SECS", str(90 * 24 * 3600)))
 # Shown in the message the wallet asks the player to sign, so the popup names
 # who is asking. Set this to the real host in deployment.
 AUTH_DOMAIN = os.getenv("DAGMATE_AUTH_DOMAIN", "dagmate.org")

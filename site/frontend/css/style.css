@@ -420,3 +420,7 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--panel-border); border-radius: 999px; }
+
+/* deposit-confirming spinner (a slowly turning knight) */
+@keyframes dm-spin { to { transform: rotate(360deg); } }
+.dm-spin { display: inline-block; animation: dm-spin 1.1s linear infinite; color: var(--accent, #49EACB); font-size: 1.15em; }

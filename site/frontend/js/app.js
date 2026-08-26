@@ -396,18 +396,17 @@
     e.preventDefault();
     if (!state.session) { toast("Connect a wallet first."); return; }
     const toAddress = document.getElementById("chOpponent").value.trim() || null;
-    const gasOnly = document.getElementById("chGasOnly").checked;
-    const stakeKas = gasOnly ? 0 : parseFloat(document.getElementById("chStake").value || "0");
+    const stakeKas = parseFloat(document.getElementById("chStake").value || "0");
     const mode = document.getElementById("chMode").value;
     // A staked challenge locks real KAS into escrow the moment it's accepted, so
-    // a large one gets a confirm naming the amount (F12) — the backend caps it
-    // too, this just stops a fat-fingered number before it's posted.
-    if (!gasOnly && stakeKas >= STAKE_CONFIRM_ABOVE_KAS &&
-        !window.confirm(`Create a challenge staking ${stakeKas} KAS? You'll need to fund your escrow with that amount if it's accepted.`)) {
+    // a large one gets a confirm naming the amount — the backend caps it too,
+    // this just stops a fat-fingered number before it's posted.
+    if (stakeKas >= STAKE_CONFIRM_ABOVE_KAS &&
+        !window.confirm(`Create a challenge staking ${stakeKas} KAS? You'll stake that amount to play if it's accepted.`)) {
       return;
     }
     try {
-      await api("POST", "/api/challenges", { toAddress, stakeKas, mode, gasOnly });
+      await api("POST", "/api/challenges", { toAddress, stakeKas, mode });
       toast("Challenge created.");
       e.target.reset();
       document.getElementById("chStake").value = 1;
@@ -431,7 +430,7 @@
       const toLabel = esc(ch.toKns || ch.toShort);
       const label = ch.toAddress ? `${fromLabel} → ${toLabel}` : `${fromLabel} (open challenge)`;
       div.innerHTML = `<div><div>${label}</div>
-        <div class="meta">${ch.gasOnly ? "gas-only" : `${esc(ch.stakeKas)} KAS`} · ${esc(ch.mode)}</div></div>
+        <div class="meta">${esc(ch.stakeKas)} KAS · ${esc(ch.mode)}</div></div>
         <div class="actions"></div>`;
       const actions = div.querySelector(".actions");
       if (!mine) {
@@ -984,7 +983,19 @@
     const mine = myColorFor(m);
     const myEscrow = mine === "white" ? m.escrowA : (mine === "black" ? m.escrowB : null);
     const myFunded = mine === "white" ? f.aFunded : f.bFunded;
-    if (mine && myEscrow && !myFunded && !state.isDemoWallet) {
+
+    // Already sent your deposit, just waiting for the chain to confirm it: show
+    // a live spinner so it never looks like nothing happened. The 4s poll clears
+    // this the moment the watcher marks your side funded.
+    if (mine && myEscrow && !myFunded && !state.isDemoWallet && state.fundingSent === m.id) {
+      const wait = document.createElement("div");
+      wait.className = "meta";
+      wait.style.marginTop = "12px";
+      wait.style.fontSize = "15px";
+      wait.innerHTML = `<span class="dm-spin">&#9822;</span> Confirming your deposit on-chain — `
+        + `the match starts automatically once it lands (~15–30s)…`;
+      el.appendChild(wait);
+    } else if (mine && myEscrow && !myFunded && !state.isDemoWallet) {
       const wrap = document.createElement("div");
       wrap.style.marginTop = "10px";
 
@@ -1030,8 +1041,11 @@
       // confirmation. We pass the exact stake; the deposit watcher starts the
       // match once it confirms on-chain (~15s) and the opponent has funded too.
       await provider.sendKaspa(address, Number(stakeSompi));
-      toast("Deposit sent — the match starts automatically once it confirms.");
-      btn.textContent = "Deposit sent ✓";
+      toast("Deposit sent — waiting for it to confirm on-chain.");
+      // Flip the panel to the live "confirming…" spinner; the 4s poll clears it
+      // once the deposit watcher marks this side funded.
+      state.fundingSent = state.currentMatch ? state.currentMatch.id : null;
+      if (state.currentMatch) renderEscrowInfo(state.currentMatch);
     } catch (e) {
       toast(`Deposit didn't go through: ${e && e.message ? e.message : e}`);
       btn.disabled = false;
@@ -1086,7 +1100,7 @@
     // every other money decision in the app is spelled out, so this one is too.
     // The confirm names the stake at risk (and sits behind the browser's own
     // dialog, which a clickjacking frame can't drive).
-    const stake = m.gasOnly ? "this gas-only game" : `your ${m.stakeKas} KAS stake`;
+    const stake = `your ${m.stakeKas} KAS stake`;
     if (!window.confirm(`Resign and forfeit ${stake} to your opponent? This can't be undone.`)) return;
     const btn = e.currentTarget;
     btn.disabled = true;
@@ -1356,10 +1370,6 @@
     document.getElementById("challengeFeeNote").textContent = f.takesCut
       ? `You pay your stake. DAGmate takes ${(f.platformFeeBps / 100).toFixed(2)}% of the pot on settlement.`
       : "You pay your stake and nothing else — DAGmate takes no cut of the pot.";
-    // Only claim on-chain anchoring when the server says it's actually running.
-    document.getElementById("gasOnlyLabel").textContent = meta.anchorsMoves
-      ? "Gas-only (no stake — every move is anchored on-chain)"
-      : "Gas-only (no stake)";
     // Cap the stake field to the server's accepted range (F12) — the backend
     // still enforces it, this just stops a bad amount at the form.
     const stakeEl = document.getElementById("chStake");

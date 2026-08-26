@@ -350,29 +350,24 @@ class NewChallengeBody(BaseModel):
     toAddress: str | None = None
     stakeKas: float = 0
     mode: str = "rapid"
-    gasOnly: bool = False
 
 
 @app.post("/api/challenges")
 def new_challenge(body: NewChallengeBody, account: dict = Depends(require_account)):
     if body.mode not in ("rapid", "daily"):
         raise HTTPException(400, "mode must be 'rapid' or 'daily'")
-    if body.gasOnly:
-        stake_sompi = config.GAS_ONLY_STAKE_SOMPI
-    else:
-        # stakeKas is a float off the wire: NaN/inf survive JSON and would sail
-        # past a `<= 0` check (NaN comparisons are all false), minting an escrow
-        # for a garbage amount. Reject anything that isn't a finite number first,
-        # then clamp to the configured band so a fat-fingered stake bounces at
-        # the form rather than on-chain.
-        if not math.isfinite(body.stakeKas):
-            raise HTTPException(400, "stake must be a real number")
-        stake_sompi = round(body.stakeKas * config.SOMPI_PER_KAS)
-        if stake_sompi < config.MIN_STAKE_SOMPI:
-            raise HTTPException(400, f"minimum stake is {config.MIN_STAKE_SOMPI / config.SOMPI_PER_KAS:g} KAS "
-                                      "(or tick gas-only)")
-        if stake_sompi > config.MAX_STAKE_SOMPI:
-            raise HTTPException(400, f"maximum stake is {config.MAX_STAKE_SOMPI / config.SOMPI_PER_KAS:g} KAS")
+    # Gas-only was removed: a dust stake can't be deposited (Kaspa's storage-mass
+    # rule rejects a ~1000-sompi output), so every match is a real stake with a
+    # minimum. stakeKas is a float off the wire — NaN/inf survive JSON and beat a
+    # `<= 0` check, so reject non-finite first, then clamp to the configured band
+    # so a bad amount bounces at the form rather than on-chain.
+    if not math.isfinite(body.stakeKas):
+        raise HTTPException(400, "stake must be a real number")
+    stake_sompi = round(body.stakeKas * config.SOMPI_PER_KAS)
+    if stake_sompi < config.MIN_STAKE_SOMPI:
+        raise HTTPException(400, f"minimum stake is {config.MIN_STAKE_SOMPI / config.SOMPI_PER_KAS:g} KAS")
+    if stake_sompi > config.MAX_STAKE_SOMPI:
+        raise HTTPException(400, f"maximum stake is {config.MAX_STAKE_SOMPI / config.SOMPI_PER_KAS:g} KAS")
     to_id = None
     if body.toAddress:
         to = db.get_account_by_address(body.toAddress)
@@ -387,7 +382,7 @@ def new_challenge(body: NewChallengeBody, account: dict = Depends(require_accoun
         if not to["accept_challenges"]:
             raise HTTPException(400, "that player isn't accepting challenges right now")
         to_id = to["id"]
-    c = db.create_challenge(account["id"], to_id, stake_sompi, body.mode, body.gasOnly)
+    c = db.create_challenge(account["id"], to_id, stake_sompi, body.mode, False)
     return _challenge_public(c)
 
 
