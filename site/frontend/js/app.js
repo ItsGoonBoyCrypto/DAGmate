@@ -985,12 +985,34 @@
     const myEscrow = mine === "white" ? m.escrowA : (mine === "black" ? m.escrowB : null);
     const myFunded = mine === "white" ? f.aFunded : f.bFunded;
     if (mine && myEscrow && !myFunded && !state.isDemoWallet) {
+      const wrap = document.createElement("div");
+      wrap.style.marginTop = "10px";
+
       const btn = document.createElement("button");
       btn.className = "btn btn-primary full";
-      btn.style.marginTop = "10px";
-      btn.textContent = `Fund my stake (${f.stakeKas} KAS)`;
+      // Game-native framing, not "fund escrow" — the escrow detail lives behind
+      // the (i) toggle so the primary action reads as "get into the game".
+      btn.textContent = `Stake ${f.stakeKas} KAS & play`;
       btn.addEventListener("click", () => fundEscrow(myEscrow, f.stakeSompi, f.stakeKas, btn));
-      el.appendChild(btn);
+      wrap.appendChild(btn);
+
+      const info = document.createElement("button");
+      info.className = "btn full";
+      info.type = "button";
+      info.style.marginTop = "6px";
+      info.textContent = "ⓘ Where does my stake go?";
+      const note = document.createElement("div");
+      note.className = "meta";
+      note.style.display = "none";
+      note.textContent = "Your stake goes into a per-match escrow on Kaspa L1 that only you can "
+        + "reclaim — DAGmate never holds it. Win and you take the whole pot (minus the network "
+        + "fee). If the match never starts, your stake is always yours to take back.";
+      info.addEventListener("click", () => {
+        note.style.display = note.style.display === "none" ? "block" : "none";
+      });
+      wrap.appendChild(info);
+      wrap.appendChild(note);
+      el.appendChild(wrap);
     }
   }
 
