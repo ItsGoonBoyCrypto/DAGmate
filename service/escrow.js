@@ -48,6 +48,21 @@ function xOnlyHex(key) {
   return String(xo.toString()).replace(/^0x/, '');
 }
 
+/** Normalise ANY pubkey hex a wallet hands us to the 32-byte x-only schnorr
+ *  form the Kaspa script engine requires. Kasware's getPublicKey() returns a
+ *  33-byte COMPRESSED key (66 hex, 02/03 prefix); baking that straight into a
+ *  CHECKMULTISIG/CHECKSIG redeem builds a fundable P2SH address (the address is
+ *  only a hash, so a deposit succeeds) whose spend the node rejects with
+ *  "pubkey invalid: malformed public key". A 32-byte key passes through
+ *  untouched, so this is safe on already-x-only wallets. */
+function toXOnly(k, pkHex) {
+  const clean = String(pkHex).replace(/^0x/, '').toLowerCase();
+  if (clean.length === 64) return clean;               // already x-only
+  const pub = new k.PublicKey(clean);                  // parses 33-byte compressed (and 64-hex)
+  const xo = pub.toXOnlyPublicKey ? pub.toXOnlyPublicKey() : pub;
+  return String(xo.toString()).replace(/^0x/, '').toLowerCase();
+}
+
 /** GET /escrow/arbiter-pubkey?matchId=<n> — x-only pubkey for the per-match
  *  arbiter co-signing key. There is no player-pubkey endpoint: a player's
  *  pubkey comes from their own wallet's connect response, not from us. */
@@ -72,13 +87,17 @@ export function buildEscrow({ matchId, pkA, pkB, depositorIsA, reclaimDaa }) {
   if (reclaimDaa == null) throw new Error('reclaimDaa required');
   const k = core.wasm();
   const { key: arbKey } = core.deriveArbiter(matchId);
+  // Every pubkey in the redeem MUST be 32-byte x-only or the spend is rejected
+  // as malformed — normalise the wallet-supplied player keys, not just ours.
+  const pkAx = H(toXOnly(k, pkA));
+  const pkBx = H(toXOnly(k, pkB));
   const pkArb = H(xOnlyHex(arbKey));
-  const depositorPk = H(depositorIsA ? pkA : pkB);
+  const depositorPk = depositorIsA ? pkAx : pkBx;
 
   const sb = new k.ScriptBuilder(core.COVENANT_OPTS);
   sb.addOp(k.Opcodes.OpIf);
   sb.addOp(k.Opcodes.Op2);
-  sb.addData(H(pkA)); sb.addData(H(pkB)); sb.addData(pkArb);
+  sb.addData(pkAx); sb.addData(pkBx); sb.addData(pkArb);
   sb.addOp(k.Opcodes.Op3);
   sb.addOp(k.Opcodes.OpCheckMultiSig);
   sb.addOp(k.Opcodes.OpElse);
