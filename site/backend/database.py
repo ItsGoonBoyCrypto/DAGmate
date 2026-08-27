@@ -131,6 +131,16 @@ def ensure_schema():
           joined_ts INTEGER NOT NULL,
           PRIMARY KEY (tournament_id, account_id))""")
 
+        # One row per round actually built. Its PK is the bracket's concurrency
+        # guard: when the last two matches of a round settle together, both try
+        # to build the next round, and the second INSERT collides so only one
+        # bracket (and one set of escrows) is ever created.
+        c.execute("""CREATE TABLE IF NOT EXISTS tournament_rounds (
+          tournament_id TEXT NOT NULL,
+          round INTEGER NOT NULL,
+          created_ts INTEGER NOT NULL,
+          PRIMARY KEY (tournament_id, round))""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS learn_progress (
           account_id TEXT NOT NULL,
           level_id TEXT NOT NULL,
@@ -192,6 +202,11 @@ def ensure_schema():
         # rebuild would.
         _add_column(c, "matches", "reclaim_a_txid", "TEXT")
         _add_column(c, "matches", "reclaim_b_txid", "TEXT")
+
+        # Tournament bracket progression: who won the whole thing (NULL until the
+        # final settles). The round-by-round advance is driven off the matches
+        # table; this only records the outcome.
+        _add_column(c, "tournaments", "champion_account_id", "TEXT")
 
 
 def _add_column(c: sqlite3.Connection, table: str, column: str, decl: str):
@@ -694,6 +709,58 @@ def list_tournaments() -> list[dict]:
 def get_tournament(tournament_id: str) -> dict | None:
     with _lock, _conn() as c:
         return _row(c.execute("SELECT * FROM tournaments WHERE id=?", (tournament_id,)))
+
+
+def list_tournament_round_matches(tournament_id: str, round_no: int) -> list[dict]:
+    """Every match in one round of a tournament, ordered by hd_index so the
+    bracket pairs winners deterministically (the arbiter-key index is monotonic
+    with creation, so this is also creation order)."""
+    with _lock, _conn() as c:
+        return _rows(c.execute(
+            "SELECT * FROM matches WHERE tournament_id=? AND round=? ORDER BY hd_index",
+            (tournament_id, round_no)))
+
+
+def round_winners_if_complete(tournament_id: str, round_no: int) -> list[str] | None:
+    """The round's winners in bracket order — but ONLY once every match in it
+    has a decided winner. None while any match is still unresolved: a knockout
+    round advances as a whole, so a half-finished round must never spawn a
+    partial next round. A drawn match (winner_account_id NULL on a settled game)
+    also holds the round open — see _advance_tournament for why that's flagged."""
+    matches = list_tournament_round_matches(tournament_id, round_no)
+    if not matches:
+        return None
+    winners = []
+    for m in matches:
+        if m["status"] != "settled" or not m["winner_account_id"]:
+            return None
+        winners.append(m["winner_account_id"])
+    return winners
+
+
+def claim_round_advance(tournament_id: str, next_round: int) -> bool:
+    """Atomically claim the right to BUILD `next_round`. The INSERT's PK is the
+    guard: two matches settling in the same instant both try to advance, and the
+    second collides here and stands down, so the next round's matches (and their
+    escrows) are built exactly once."""
+    with _lock, _conn() as c:
+        try:
+            c.execute("INSERT INTO tournament_rounds (tournament_id, round, created_ts) VALUES (?,?,?)",
+                       (tournament_id, next_round, int(time.time())))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def set_tournament_champion(tournament_id: str, account_id: str) -> bool:
+    """Record the champion and close the tournament, once. Guarded on the still
+    -'running' status so a re-entrant advance (or a race on the final match)
+    can't crown a second champion or re-announce the first."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE tournaments SET status='complete', champion_account_id=? WHERE id=? AND status='running'",
+            (account_id, tournament_id))
+        return cur.rowcount == 1
 
 
 # ── learn progress ───────────────────────────────────────────────────────

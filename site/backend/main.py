@@ -651,6 +651,12 @@ def _opponent_of(m: dict, account: dict) -> str:
 async def draw_offer(match_id: str, account: dict = Depends(require_account)):
     import json
     m = _my_live_match(match_id, account)
+    # A knockout bracket can't promote a draw, so an agreed draw would strand
+    # the round with no winner. Refuse it here; a board draw (stalemate) is the
+    # only draw a tournament game can reach, and that's a documented tiebreak
+    # gap rather than something to silently split a pot over.
+    if m["tournament_id"]:
+        raise HTTPException(400, "tournament games must be decisive — draws can't be agreed here")
     ply = len(json.loads(m["moves_json"]))
     if not db.offer_draw(match_id, account["id"], ply):
         if m["draw_offer_by"] and m["draw_offer_by"] != account["id"]:
@@ -708,6 +714,12 @@ async def _settle_game_over(match_id: str, result: str, winner_color: str | None
     summary = f"{result}" + (" — you won" if winner_id else " — draw")
     for pid in (m["player_a_account_id"], m["player_b_account_id"]):
         await bot_client.notify_settled(pid, match_id, summary)
+    # A tournament match feeds a bracket: once its whole round is decided this
+    # builds the next round (or crowns the champion). Only a decisive result
+    # advances — a drawn knockout game has no winner to promote (see
+    # _advance_tournament), and non-tournament matches simply skip this.
+    if m["tournament_id"] and winner_id:
+        await _advance_tournament(m["tournament_id"], m["round"])
 
 
 # ── settlement ───────────────────────────────────────────────────────────
@@ -778,16 +790,38 @@ async def reclaim_submit(match_id: str, body: ReclaimSubmitBody,
 # ── tournaments ──────────────────────────────────────────────────────────
 @app.get("/api/tournaments")
 def list_tournaments():
+    # Winnings roll up, so each round's stake doubles. Publish the per-round
+    # ladder and the total it takes to win outright, so the UI can warn a player
+    # up front that advancing needs escalating funds (not just the entry tier).
+    rounds = max(1, math.ceil(math.log2(config.TOURNAMENT_MIN_ENTRANTS)))
     out = []
     for tier in config.TOURNAMENT_TIERS_KAS:
         t = db.get_or_create_open_tournament_readonly(tier)
         count = db.count_entrants(t["id"]) if t else 0
+        stakes = [tier * (2 ** r) for r in range(rounds)]
         out.append({
             "tierKas": tier, "tournamentId": t["id"] if t else None,
             "entrants": count, "minEntrants": config.TOURNAMENT_MIN_ENTRANTS,
             "status": t["status"] if t else "open",
+            "rounds": rounds, "stakesByRoundKas": stakes, "maxToWinKas": sum(stakes),
         })
     return out
+
+
+@app.get("/api/tournaments/{tournament_id}/detail")
+def tournament_detail(tournament_id: str):
+    """Status + champion for one tournament — including completed ones, which
+    drop out of the lobby listing. Lets the UI show a finished bracket's winner
+    (and the test confirm one emerged)."""
+    t = db.get_tournament(tournament_id)
+    if not t:
+        raise HTTPException(404, "tournament not found")
+    champ = db.get_account(t["champion_account_id"]) if t["champion_account_id"] else None
+    return {
+        "id": t["id"], "tierKas": t["tier_kas"], "status": t["status"],
+        "champion": {"address": champ["address"], "shortAddress": _short(champ["address"]),
+                     "knsName": kns.cached_name(champ["address"])} if champ else None,
+    }
 
 
 @app.post("/api/tournaments/{tier_kas}/join")
@@ -844,6 +878,74 @@ async def _start_tournament(tournament_id: str) -> bool:
             "You weren't paired this round — the lobby had an odd number of players. "
             "Your stake was never taken; join the next lobby to play.")
     return True
+
+
+async def _advance_tournament(tournament_id: str, round_no: int):
+    """Advance the bracket after a tournament match is decided.
+
+    Called from _settle_game_over on every tournament settle; it no-ops until
+    the WHOLE round has finished, then either pairs the round's winners into the
+    next round or crowns the champion. Safe under concurrency: the round only
+    reads as complete once, and both the next round and the champion are claimed
+    through DB guards, so two matches settling together can't double-build or
+    double-crown.
+
+    ⚠️ Stakes DOUBLE each round. The winnings a player just took roll straight
+    into the next escrow (20 → 40 → 80 …), so the final match's pot is the
+    entire entry pool and the champion takes it all while everyone else is out
+    only their original buy-in. A player therefore needs escalating funds in
+    their wallet to advance; the join flow warns them, and a winner who can't
+    fund the next round in time forfeits it on the deposit deadline.
+
+    ⚠️ Only a DECISIVE game advances. A knockout can't promote a draw — the
+    caller already gates on a winner, and a board draw (stalemate/repetition)
+    leaves the round open. Agreed draws are refused outright in a tournament
+    (see draw_offer); a rules draw stalling a bracket is a known edge to resolve
+    with a tiebreak rather than silently here."""
+    winners = db.round_winners_if_complete(tournament_id, round_no)
+    if winners is None:
+        return  # round still in progress
+
+    if len(winners) == 1:
+        if db.set_tournament_champion(tournament_id, winners[0]):
+            await _announce_champion(tournament_id, winners[0])
+        return
+
+    next_round = round_no + 1
+    if not db.claim_round_advance(tournament_id, next_round):
+        return  # a sibling settle is already building it
+
+    prev = db.list_tournament_round_matches(tournament_id, round_no)
+    next_stake = prev[0]["stake_sompi"] * 2  # winnings roll up — pot compounds to the whole pool
+    for i in range(0, len(winners) - 1, 2):
+        pa, pb = db.get_account(winners[i]), db.get_account(winners[i + 1])
+        try:
+            match = await _create_match_from_pair(
+                challenge_id=None, tournament_id=tournament_id, round_no=next_round,
+                player_a_id=pa["id"], player_b_id=pb["id"],
+                pk_a=pa["pubkey"], pk_b=pb["pubkey"], stake_sompi=next_stake, mode="rapid")
+        except Exception as e:
+            # A build failure here strands two winners with no next match. Log
+            # loudly — it's a bracket-integrity problem, not a per-player one —
+            # and leave the round-advance claimed so a retry doesn't double-build
+            # the pairs that DID succeed.
+            log.error(f"tournament {tournament_id}: failed to build round-{next_round} match "
+                      f"for {pa['id']} vs {pb['id']}: {e}")
+            continue
+        stake_kas = next_stake / config.SOMPI_PER_KAS
+        await bot_client.notify_challenge(pa["id"], _short(pb["address"]), stake_kas, "rapid", f"/play/{match['id']}")
+        await bot_client.notify_challenge(pb["id"], _short(pa["address"]), stake_kas, "rapid", f"/play/{match['id']}")
+
+
+async def _announce_champion(tournament_id: str, account_id: str):
+    """Tell every entrant the tournament is over. Best-effort, like every alert."""
+    champ = db.get_account(account_id)
+    for e in db.list_entrants(tournament_id):
+        won = e["account_id"] == account_id
+        await bot_client.notify_settled(
+            e["account_id"], tournament_id,
+            "🏆 You won the tournament — the whole pot is yours." if won
+            else f"Tournament over — {_short(champ['address'])} took the pot.")
 
 
 # ── learn ────────────────────────────────────────────────────────────────
