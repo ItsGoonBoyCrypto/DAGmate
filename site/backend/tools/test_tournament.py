@@ -104,6 +104,39 @@ def main():
     check("round-1 stake is the tier", prev[0]["stake_sompi"], STAKE)
     check("next round is double", prev[0]["stake_sompi"] * 2, 2 * STAKE)
 
+    print("a walkover settles the funded side in, and the round counts it as decided")
+    tw = db.get_or_create_open_tournament(500)
+    wa, wb = acct("wa"), acct("wb")
+    wm = new_match(tw["id"], 1, wa, wb)  # awaiting_deposit — only one side ever funds
+    check("funded side wins the walkover", db.walkover_if_awaiting(wm["id"], wa["id"]), True)
+    wrow = db.get_match(wm["id"])
+    check("status is settled", wrow["status"], "settled")
+    check("result is walkover", wrow["result"], "walkover")
+    check("winner is the funded side", wrow["winner_account_id"], wa["id"])
+    check("a walkover counts as a decided round", db.round_winners_if_complete(tw["id"], 1), [wa["id"]])
+    check("a walkover can't be re-applied", db.walkover_if_awaiting(wm["id"], wb["id"]), False)
+
+    print("a drawn tournament game replays in place on the same locked stakes")
+    tr = db.get_or_create_open_tournament(20)  # the earlier tier-20 tournament is 'complete', so this is fresh
+    ra, rb = acct("ra"), acct("rb")
+    rm = new_match(tr["id"], 1, ra, rb)
+    db.mark_match_live(rm["id"], initial_ms=600_000, increment_ms=0, now_ms=1)
+    check("a live match resets for replay", db.reset_match_for_replay(
+        rm["id"], fen="FRESHFEN", initial_ms=600_000, increment_ms=0, now_ms=123), True)
+    rrow = db.get_match(rm["id"])
+    check("board reset", rrow["fen"], "FRESHFEN")
+    check("moves cleared", rrow["moves_json"], "[]")
+    check("turn back to white", rrow["turn"], "white")
+    check("still live — stakes stay locked, not settled", rrow["status"], "live")
+    check("replay counted", rrow["replay_count"], 1)
+    check("the round stays open through a replay", db.round_winners_if_complete(tr["id"], 1), None)
+    db.reset_match_for_replay(rm["id"], fen="F2", initial_ms=600_000, increment_ms=0, now_ms=200)
+    check("a second draw increments the replay count", db.get_match(rm["id"])["replay_count"], 2)
+    decide(rm["id"], ra["id"])  # a replay eventually ends decisively
+    check("a decisive replay closes the round", db.round_winners_if_complete(tr["id"], 1), [ra["id"]])
+    check("a settled match won't reset for replay", db.reset_match_for_replay(
+        rm["id"], fen="X", initial_ms=1, increment_ms=0, now_ms=1), False)
+
     print()
     if _failures:
         print(f"{len(_failures)} FAILED: {_failures}")

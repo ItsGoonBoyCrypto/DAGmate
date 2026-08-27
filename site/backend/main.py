@@ -709,17 +709,37 @@ async def _settle_game_over(match_id: str, result: str, winner_color: str | None
         winner_id = m["player_a_account_id"]
     elif winner_color == "black":
         winner_id = m["player_b_account_id"]
+    # A knockout can't promote a draw. Rather than settle it (split the pot and
+    # stall the bracket with no winner), a drawn TOURNAMENT game replays on the
+    # same locked stakes — fresh board, no re-deposit — until someone wins.
+    if m["tournament_id"] and winner_id is None:
+        await _replay_tournament_draw(match_id, m)
+        return
     if not db.settle_match_if_live(match_id, result=result, winner_account_id=winner_id):
         return
     summary = f"{result}" + (" — you won" if winner_id else " — draw")
     for pid in (m["player_a_account_id"], m["player_b_account_id"]):
         await bot_client.notify_settled(pid, match_id, summary)
     # A tournament match feeds a bracket: once its whole round is decided this
-    # builds the next round (or crowns the champion). Only a decisive result
-    # advances — a drawn knockout game has no winner to promote (see
-    # _advance_tournament), and non-tournament matches simply skip this.
+    # builds the next round (or crowns the champion). Non-tournament matches and
+    # draws (handled above) simply skip it.
     if m["tournament_id"] and winner_id:
-        await _advance_tournament(m["tournament_id"], m["round"])
+        await advance_tournament(m["tournament_id"], m["round"])
+
+
+async def _replay_tournament_draw(match_id: str, m: dict):
+    """A drawn tournament game re-arms on the SAME escrows — a fresh board and
+    clocks, no re-deposit — so the bracket resolves on a decisive result instead
+    of stalling. The guarded reset fires once even if a move and a clock-flag
+    both land on the same drawn position."""
+    initial_ms, increment_ms = clocks.settings_for(m["mode"])
+    if db.reset_match_for_replay(match_id, fen=chess_logic.STARTING_FEN,
+                                 initial_ms=initial_ms, increment_ms=increment_ms, now_ms=clocks.now_ms()):
+        for pid in (m["player_a_account_id"], m["player_b_account_id"]):
+            await bot_client.notify_settled(
+                pid, match_id,
+                "Drawn — a tournament game must be decisive, so the board has been reset. "
+                "Play on; your stakes stay locked and the winner takes the pot.")
 
 
 # ── settlement ───────────────────────────────────────────────────────────
@@ -880,10 +900,11 @@ async def _start_tournament(tournament_id: str) -> bool:
     return True
 
 
-async def _advance_tournament(tournament_id: str, round_no: int):
+async def advance_tournament(tournament_id: str, round_no: int):
     """Advance the bracket after a tournament match is decided.
 
-    Called from _settle_game_over on every tournament settle; it no-ops until
+    Called from _settle_game_over on every tournament settle, and from the
+    deposit watcher after a walkover; it no-ops until
     the WHOLE round has finished, then either pairs the round's winners into the
     next round or crowns the champion. Safe under concurrency: the round only
     reads as complete once, and both the next round and the champion are claimed

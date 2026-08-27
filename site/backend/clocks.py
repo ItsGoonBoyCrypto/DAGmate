@@ -106,6 +106,13 @@ async def forfeit_if_flagged(m: dict, at_ms: int | None = None) -> bool:
     if not color:
         return False
     result, winner_color = chess_logic.timeout_result(m["fen"], color)
+    # Tournament rule: a flag is ALWAYS a loss. A knockout can't carry a timeout
+    # draw (FIDE 6.9 would score a flag with no mating material as a draw, which
+    # would stall the bracket), and "you ran out of time — you're out" is a
+    # clean decisive rule for a wagered timed game.
+    if m["tournament_id"] and winner_color is None:
+        winner_color = "black" if color == "white" else "white"
+        result = "timeout"
     winner_id = None
     if winner_color == "white":
         winner_id = m["player_a_account_id"]
@@ -119,6 +126,13 @@ async def forfeit_if_flagged(m: dict, at_ms: int | None = None) -> bool:
                if winner_id is None else f"{color.capitalize()} ran out of time.")
     for pid in (m["player_a_account_id"], m["player_b_account_id"]):
         await bot_client.notify_settled(pid, m["id"], summary)
+    # A tournament match decided on the clock still has to advance the bracket —
+    # the forfeit path bypasses _settle_game_over, so it carries its own hook.
+    # Deferred import: main imports this module at startup, so a top-level import
+    # here would be a cycle.
+    if m["tournament_id"] and winner_id:
+        import main
+        await main.advance_tournament(m["tournament_id"], m["round"])
     return True
 
 

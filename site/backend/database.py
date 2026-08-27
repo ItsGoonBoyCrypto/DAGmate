@@ -207,6 +207,10 @@ def ensure_schema():
         # final settles). The round-by-round advance is driven off the matches
         # table; this only records the outcome.
         _add_column(c, "tournaments", "champion_account_id", "TEXT")
+        # How many times a tournament match has been replayed after a board draw
+        # (a knockout can't promote a draw, so it re-plays on the same locked
+        # stakes until decisive). 0/NULL for every normal match.
+        _add_column(c, "matches", "replay_count", "INTEGER NOT NULL DEFAULT 0")
 
 
 def _add_column(c: sqlite3.Connection, table: str, column: str, decl: str):
@@ -760,6 +764,37 @@ def set_tournament_champion(tournament_id: str, account_id: str) -> bool:
         cur = c.execute(
             "UPDATE tournaments SET status='complete', champion_account_id=? WHERE id=? AND status='running'",
             (account_id, tournament_id))
+        return cur.rowcount == 1
+
+
+def reset_match_for_replay(match_id: str, *, fen: str, initial_ms: int, increment_ms: int, now_ms: int) -> bool:
+    """Re-arm a drawn tournament match for a replay ON THE SAME LOCKED STAKES —
+    fresh board, fresh clocks, no re-deposit. Guarded on status='live' so it
+    fires exactly once even if a move and a clock-flag both try to end the same
+    drawn position, and so it can never resurrect an already-settled match.
+    Returns whether this call did the reset."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET fen=?, moves_json='[]', turn='white', "
+            "clock_white_ms=?, clock_black_ms=?, clock_increment_ms=?, clock_turn_started_ms=?, "
+            "clock_warned_white=0, clock_warned_black=0, draw_offer_by=NULL, draw_offer_ply=NULL, "
+            "replay_count=COALESCE(replay_count,0)+1 "
+            "WHERE id=? AND status='live'",
+            (fen, initial_ms, initial_ms, increment_ms, now_ms, match_id))
+        return cur.rowcount == 1
+
+
+def walkover_if_awaiting(match_id: str, winner_account_id: str) -> bool:
+    """Settle a tournament match as a walkover: one side funded by the deposit
+    deadline and the other didn't, so the funded side wins uncontested and
+    advances. Guarded on status='awaiting_deposit' — a match that reached 'live'
+    had both stakes and must be decided on the board, never by this. Returns
+    whether this call recorded the walkover."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET status='settled', result='walkover', winner_account_id=?, settled_ts=? "
+            "WHERE id=? AND status='awaiting_deposit'",
+            (winner_account_id, int(time.time()), match_id))
         return cur.rowcount == 1
 
 
