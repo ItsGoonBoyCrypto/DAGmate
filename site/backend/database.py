@@ -725,20 +725,38 @@ def list_tournament_round_matches(tournament_id: str, round_no: int) -> list[dic
             (tournament_id, round_no)))
 
 
+def _round_match_terminal(m: dict) -> bool:
+    """A round match is `terminal` — done contributing to the bracket — once it
+    can no longer produce a winner: a settled game with a decided winner (a real
+    result, a walkover, or a bye), OR a 'void' slot (both sides no-showed the
+    deposit, or a dead carrier propagating an empty branch). A settled-but-drawn
+    game is NOT terminal: a tournament draw replays in place, so it's still live
+    in spirit and holds the round open until it resolves decisively."""
+    if m["status"] == "void":
+        return True
+    return m["status"] == "settled" and bool(m["winner_account_id"])
+
+
 def round_winners_if_complete(tournament_id: str, round_no: int) -> list[str] | None:
-    """The round's winners in bracket order — but ONLY once every match in it
-    has a decided winner. None while any match is still unresolved: a knockout
-    round advances as a whole, so a half-finished round must never spawn a
-    partial next round. A drawn match (winner_account_id NULL on a settled game)
-    also holds the round open — see _advance_tournament for why that's flagged."""
+    """The round's advancing winners in bracket order — but ONLY once every match
+    in it is terminal. None while any match is still unresolved: a knockout round
+    advances as a whole, so a half-finished round must never spawn a partial next
+    round. A drawn match (settled, winner NULL, replaying) holds the round open.
+
+    Void slots contribute no winner but do NOT hold the round open, so a fully
+    no-showed match — or a dead carrier from a collapsed branch — lets the round
+    complete with fewer survivors (possibly zero). The caller reads the count to
+    decide: >1 pairs the next round, exactly 1 crowns a champion (a bye to the
+    title), 0 voids the tournament."""
     matches = list_tournament_round_matches(tournament_id, round_no)
     if not matches:
         return None
     winners = []
     for m in matches:
-        if m["status"] != "settled" or not m["winner_account_id"]:
+        if not _round_match_terminal(m):
             return None
-        winners.append(m["winner_account_id"])
+        if m["winner_account_id"]:
+            winners.append(m["winner_account_id"])
     return winners
 
 
@@ -795,6 +813,69 @@ def walkover_if_awaiting(match_id: str, winner_account_id: str) -> bool:
             "UPDATE matches SET status='settled', result='walkover', winner_account_id=?, settled_ts=? "
             "WHERE id=? AND status='awaiting_deposit'",
             (winner_account_id, int(time.time()), match_id))
+        return cur.rowcount == 1
+
+
+def void_if_awaiting(match_id: str) -> bool:
+    """Void a tournament match that NEITHER side funded by the deposit deadline.
+    Unlike a walkover (one side funded → that side advances), a both-no-show
+    match has no winner to promote, so left as-is it would hold its round open
+    forever and stall the branch. Marking it 'void' makes it terminal-with-no-
+    winner: the round can complete without it, and the bracket builder gives the
+    opposing slot's winner a bye rather than a phantom opponent. Guarded on
+    status='awaiting_deposit' — a match that reached 'live' had both stakes and
+    must be decided on the board. Returns whether this call voided it."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET status='void', result='no_show', settled_ts=? "
+            "WHERE id=? AND status='awaiting_deposit'",
+            (int(time.time()), match_id))
+        return cur.rowcount == 1
+
+
+def create_tournament_carry(tournament_id: str, round_no: int, *, winner_account_id: str | None,
+                            player_a_account_id: str, player_b_account_id: str,
+                            stake_sompi: int, mode: str) -> dict:
+    """Create a pre-resolved bracket 'carry' row — a slot with no game to play.
+    Two kinds, distinguished by winner_account_id:
+
+      - BYE (winner set): the opposing feeder slot collapsed, so this survivor
+        advances a round for free. It holds no escrow and needs no deposit; it
+        simply carries the player into the next pairing at their bracket
+        position.
+      - DEAD (winner None): both feeder slots produced no winner, so this branch
+        is empty. It carries 'nobody' forward, keeping every slot occupied so
+        bracket positions never shift under a void — the next level pairs a real
+        winner against a dead slot and hands that winner a bye in turn.
+
+    Storing it as an ordinary (settled/void) match row means the existing
+    round-completion and pairing walk handle it with no special cases, and its
+    hd_index (rowid) lands in creation order, preserving bracket geometry."""
+    settled = winner_account_id is not None
+    with _lock, _conn() as c:
+        mid = str(uuid.uuid4())
+        now = int(time.time())
+        cur = c.execute("""INSERT INTO matches (id, tournament_id, round, player_a_account_id,
+          player_b_account_id, stake_sompi, mode, fen, status, result, winner_account_id,
+          created_ts, settled_ts)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (mid, tournament_id, round_no, player_a_account_id, player_b_account_id,
+                   stake_sompi, mode, "",
+                   "settled" if settled else "void",
+                   "bye" if settled else "no_show",
+                   winner_account_id, now, now))
+        c.execute("UPDATE matches SET hd_index=? WHERE id=?", (cur.lastrowid, mid))
+        return _row(c.execute("SELECT * FROM matches WHERE id=?", (mid,)))
+
+
+def void_tournament(tournament_id: str) -> bool:
+    """Close a tournament with no champion because its whole final branch
+    collapsed (every remaining match was a no-show). Guarded on 'running' like
+    set_tournament_champion, so it settles the outcome exactly once."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE tournaments SET status='void' WHERE id=? AND status='running'",
+            (tournament_id,))
         return cur.rowcount == 1
 
 

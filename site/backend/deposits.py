@@ -90,19 +90,34 @@ async def _check_match(m: dict, balances: dict[str, dict]) -> bool:
 
     a_funded = row["funded_a_ts"] is not None
     b_funded = row["funded_b_ts"] is not None
-    # Tournament walkover: in a bracket, one side funding and the other not is a
-    # WALKOVER, not a cancellation — the funded player advances (and reclaims
-    # their own stake through the normal settle path), so a no-show can't stall
-    # the whole bracket. A plain match with one side funded still just cancels.
-    if m["tournament_id"] and (a_funded != b_funded):
-        winner_id = m["player_a_account_id"] if a_funded else m["player_b_account_id"]
-        if db.walkover_if_awaiting(m["id"], winner_id):
-            log.info(f"tournament match {m['id']} walkover after {age}s — opponent never funded")
-            await _notify_both(m, "Walkover — your opponent didn't fund in time. The funded "
-                                  "player advances and can claim their stake back from the match.")
-            import main  # deferred: main imports this module at startup (cycle otherwise)
-            await main.advance_tournament(m["tournament_id"], m["round"])
-        return False
+    # Tournament no-show handling: a bracket must not stall on an unfunded slot.
+    #   - ONE side funded (walkover): the funded player advances and reclaims
+    #     their own stake through the normal settle path.
+    #   - NEITHER side funded (void): there's no one to promote, so the slot is
+    #     voided and the opposing branch's winner is handed a bye when the round
+    #     advances — the branch can't hang forever waiting on a match nobody paid
+    #     for. Any plain (non-tournament) match with one/neither side funded just
+    #     cancels via expire_match below.
+    if m["tournament_id"]:
+        if a_funded != b_funded:
+            winner_id = m["player_a_account_id"] if a_funded else m["player_b_account_id"]
+            if db.walkover_if_awaiting(m["id"], winner_id):
+                log.info(f"tournament match {m['id']} walkover after {age}s — opponent never funded")
+                await _notify_both(m, "Walkover — your opponent didn't fund in time. The funded "
+                                      "player advances and can claim their stake back from the match.")
+                import main  # deferred: main imports this module at startup (cycle otherwise)
+                await main.advance_tournament(m["tournament_id"], m["round"])
+            return False
+        if not a_funded and not b_funded:
+            if db.void_if_awaiting(m["id"]):
+                log.info(f"tournament match {m['id']} voided after {age}s — neither side funded")
+                await _notify_both(m, "This match was cancelled — neither player funded in time, "
+                                      "so both are out and the other side of the bracket advances. "
+                                      "Any stake you sent stays yours and is reclaimable after the "
+                                      "14-day timelock.")
+                import main  # deferred: main imports this module at startup (cycle otherwise)
+                await main.advance_tournament(m["tournament_id"], m["round"])
+            return False
 
     if db.expire_match(m["id"]):
         paid = "A" if a_funded else ("B" if b_funded else "neither side")

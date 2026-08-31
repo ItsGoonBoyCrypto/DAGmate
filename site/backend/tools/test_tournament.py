@@ -137,6 +137,51 @@ def main():
     check("a settled match won't reset for replay", db.reset_match_for_replay(
         rm["id"], fen="X", initial_ms=1, increment_ms=0, now_ms=1), False)
 
+    print("a both-no-show match voids, and no longer holds its round open")
+    tv = db.get_or_create_open_tournament(750)
+    va, vb, vc, vd = acct("va"), acct("vb"), acct("vc"), acct("vd")
+    vm0 = new_match(tv["id"], 1, va, vb)  # neither side ever funds
+    vm1 = new_match(tv["id"], 1, vc, vd)  # decided on the board
+    decide(vm1["id"], vc["id"])
+    check("a still-awaiting match holds the round open", db.round_winners_if_complete(tv["id"], 1), None)
+    check("a neither-funded match voids", db.void_if_awaiting(vm0["id"]), True)
+    vrow = db.get_match(vm0["id"])
+    check("status is void", vrow["status"], "void")
+    check("result is no_show", vrow["result"], "no_show")
+    check("no winner is recorded", vrow["winner_account_id"], None)
+    check("a match past awaiting can't be voided", db.void_if_awaiting(vm1["id"]), False)
+    check("a void can't be re-applied", db.void_if_awaiting(vm0["id"]), False)
+    check("the round completes with only the funded side's winner",
+          db.round_winners_if_complete(tv["id"], 1), [vc["id"]])
+
+    print("a bye carry advances a lone survivor; a dead carry holds an empty slot")
+    tc = db.get_or_create_open_tournament(1000)
+    bw = acct("bw")
+    bye = db.create_tournament_carry(tc["id"], 2, winner_account_id=bw["id"],
+                                     player_a_account_id=bw["id"], player_b_account_id=bw["id"],
+                                     stake_sompi=STAKE, mode="rapid")
+    check("a bye is settled", bye["status"], "settled")
+    check("a bye is marked bye", bye["result"], "bye")
+    check("a bye carries its winner forward", bye["winner_account_id"], bw["id"])
+    dead = db.create_tournament_carry(tc["id"], 2, winner_account_id=None,
+                                      player_a_account_id=bw["id"], player_b_account_id=bw["id"],
+                                      stake_sompi=STAKE, mode="rapid")
+    check("a dead carry is void", dead["status"], "void")
+    check("a dead carry advances nobody", dead["winner_account_id"], None)
+    check("a round of a bye + a dead carry yields just the bye's winner",
+          db.round_winners_if_complete(tc["id"], 2), [bw["id"]])
+
+    print("an all-void round leaves no survivors, and the tournament voids once")
+    tz = db.get_or_create_open_tournament(1500)
+    za, zb = acct("za"), acct("zb")
+    zm = new_match(tz["id"], 1, za, zb)
+    check("the only match voids", db.void_if_awaiting(zm["id"]), True)
+    check("a fully-voided round has zero survivors", db.round_winners_if_complete(tz["id"], 1), [])
+    db.claim_tournament_start(tz["id"])  # open -> running (void_tournament guards on 'running')
+    check("first void closes it", db.void_tournament(tz["id"]), True)
+    check("status is void", db.get_tournament(tz["id"])["status"], "void")
+    check("a tournament voids only once", db.void_tournament(tz["id"]), False)
+
     print()
     if _failures:
         print(f"{len(_failures)} FAILED: {_failures}")

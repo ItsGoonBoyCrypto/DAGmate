@@ -923,13 +923,23 @@ async def advance_tournament(tournament_id: str, round_no: int):
     leaves the round open. Agreed draws are refused outright in a tournament
     (see draw_offer); a rules draw stalling a bracket is a known edge to resolve
     with a tiebreak rather than silently here."""
-    winners = db.round_winners_if_complete(tournament_id, round_no)
-    if winners is None:
+    survivors = db.round_winners_if_complete(tournament_id, round_no)
+    if survivors is None:
         return  # round still in progress
 
-    if len(winners) == 1:
-        if db.set_tournament_champion(tournament_id, winners[0]):
-            await _announce_champion(tournament_id, winners[0])
+    if len(survivors) == 0:
+        # Every slot in the round collapsed to a no-show — the whole surviving
+        # branch is gone and there is no one to crown. Close it with no champion.
+        if db.void_tournament(tournament_id):
+            log.warning(f"tournament {tournament_id} voided: round {round_no} produced no survivors")
+            await _announce_tournament_void(tournament_id)
+        return
+
+    if len(survivors) == 1:
+        # One player left standing — including the case where their opponents
+        # all no-showed and they took the title on a bye.
+        if db.set_tournament_champion(tournament_id, survivors[0]):
+            await _announce_champion(tournament_id, survivors[0])
         return
 
     next_round = round_no + 1
@@ -938,24 +948,60 @@ async def advance_tournament(tournament_id: str, round_no: int):
 
     prev = db.list_tournament_round_matches(tournament_id, round_no)
     next_stake = prev[0]["stake_sompi"] * 2  # winnings roll up — pot compounds to the whole pool
-    for i in range(0, len(winners) - 1, 2):
-        pa, pb = db.get_account(winners[i]), db.get_account(winners[i + 1])
-        try:
-            match = await _create_match_from_pair(
-                challenge_id=None, tournament_id=tournament_id, round_no=next_round,
-                player_a_id=pa["id"], player_b_id=pb["id"],
-                pk_a=pa["pubkey"], pk_b=pb["pubkey"], stake_sompi=next_stake, mode="rapid")
-        except Exception as e:
-            # A build failure here strands two winners with no next match. Log
-            # loudly — it's a bracket-integrity problem, not a per-player one —
-            # and leave the round-advance claimed so a retry doesn't double-build
-            # the pairs that DID succeed.
-            log.error(f"tournament {tournament_id}: failed to build round-{next_round} match "
-                      f"for {pa['id']} vs {pb['id']}: {e}")
-            continue
-        stake_kas = next_stake / config.SOMPI_PER_KAS
-        await bot_client.notify_challenge(pa["id"], _short(pb["address"]), stake_kas, "rapid", f"/play/{match['id']}")
-        await bot_client.notify_challenge(pb["id"], _short(pa["address"]), stake_kas, "rapid", f"/play/{match['id']}")
+    mode = prev[0]["mode"]
+    # Walk the round in FIXED pairs so bracket geometry can never shift under a
+    # void: each consecutive pair of slots feeds exactly one next-round slot, and
+    # every slot yields exactly one row — a real match, a bye, or a dead carrier.
+    # That keeps hd_index (and therefore the next level's pairing) stable no
+    # matter which matches no-showed.
+    for i in range(0, len(prev), 2):
+        left = prev[i]
+        right = prev[i + 1] if i + 1 < len(prev) else None
+        lw = left["winner_account_id"]
+        rw = right["winner_account_id"] if right else None
+        if lw and rw:
+            pa, pb = db.get_account(lw), db.get_account(rw)
+            try:
+                match = await _create_match_from_pair(
+                    challenge_id=None, tournament_id=tournament_id, round_no=next_round,
+                    player_a_id=pa["id"], player_b_id=pb["id"],
+                    pk_a=pa["pubkey"], pk_b=pb["pubkey"], stake_sompi=next_stake, mode=mode)
+            except Exception as e:
+                # A build failure here strands two winners with no next match. Log
+                # loudly — it's a bracket-integrity problem, not a per-player one —
+                # and leave the round-advance claimed so a retry doesn't double-
+                # build the pairs that DID succeed.
+                log.error(f"tournament {tournament_id}: failed to build round-{next_round} match "
+                          f"for {pa['id']} vs {pb['id']}: {e}")
+                continue
+            stake_kas = next_stake / config.SOMPI_PER_KAS
+            await bot_client.notify_challenge(pa["id"], _short(pb["address"]), stake_kas, mode, f"/play/{match['id']}")
+            await bot_client.notify_challenge(pb["id"], _short(pa["address"]), stake_kas, mode, f"/play/{match['id']}")
+        elif lw or rw:
+            # One feeder collapsed → the survivor byes into the next round at this
+            # slot, no game and no re-deposit. They still fund fresh when their
+            # bye is paired against a real opponent a round later.
+            w = lw or rw
+            db.create_tournament_carry(
+                tournament_id, next_round, winner_account_id=w,
+                player_a_account_id=w, player_b_account_id=w, stake_sompi=next_stake, mode=mode)
+            await bot_client.notify_settled(
+                w, tournament_id,
+                "Your next-round opponents didn't fund in time — you advance on a bye.")
+        else:
+            # Both feeders collapsed → a dead carrier holds the slot so the
+            # positions after it don't shift; nobody advances from this branch.
+            db.create_tournament_carry(
+                tournament_id, next_round, winner_account_id=None,
+                player_a_account_id=_carry_rep(left), player_b_account_id=_carry_rep(right or left),
+                stake_sompi=next_stake, mode=mode)
+
+
+def _carry_rep(m: dict) -> str:
+    """A representative account id for a collapsed slot — its winner if it had
+    one, else a player who was in it. Only used to fill a dead carrier's
+    (unused) player columns; the row's meaning is carried by its void status."""
+    return m["winner_account_id"] or m["player_a_account_id"]
 
 
 async def _announce_champion(tournament_id: str, account_id: str):
@@ -967,6 +1013,19 @@ async def _announce_champion(tournament_id: str, account_id: str):
             e["account_id"], tournament_id,
             "🏆 You won the tournament — the whole pot is yours." if won
             else f"Tournament over — {_short(champ['address'])} took the pot.")
+
+
+async def _announce_tournament_void(tournament_id: str):
+    """Tell every entrant a tournament ended with no champion — its final branch
+    collapsed to no-shows. Best-effort. Any stake anyone did deposit is theirs,
+    reclaimable from their own escrow after the timelock (nothing was ever paid
+    out to a winner, because there wasn't one)."""
+    for e in db.list_entrants(tournament_id):
+        await bot_client.notify_settled(
+            e["account_id"], tournament_id,
+            "Tournament ended with no champion — the remaining players didn't fund in "
+            "time. Any stake you deposited stays yours and is reclaimable from your "
+            "own escrow after the timelock.")
 
 
 # ── learn ────────────────────────────────────────────────────────────────
