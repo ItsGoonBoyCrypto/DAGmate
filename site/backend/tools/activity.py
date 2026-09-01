@@ -33,6 +33,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="/var/lib/dagmate/site/dagmate_site.db")
     ap.add_argument("--recent", type=int, default=12)
+    ap.add_argument("--json", action="store_true", help="emit key metrics as one JSON line (for change detection)")
     args = ap.parse_args()
 
     if not os.path.exists(args.db):
@@ -64,6 +65,19 @@ def main():
 
     deposited = count("SELECT COALESCE(SUM(COALESCE(funded_a_sompi,0)+COALESCE(funded_b_sompi,0)),0) FROM matches")
     settled_pots = count("SELECT COALESCE(SUM(stake_sompi*2),0) FROM matches WHERE status='settled' AND winner_account_id IS NOT NULL")
+
+    if args.json:
+        import json
+        print(json.dumps({
+            "players": players, "challenges": ch_total,
+            "open_challenges": ch.get("open", 0), "matches": m_total,
+            "awaiting": ms.get("awaiting_deposit", 0), "live": ms.get("live", 0),
+            "settled": ms.get("settled", 0), "void": ms.get("void", 0),
+            "deposited_kas": round((deposited or 0) / SOMPI, 2),
+            "settled_pots_kas": round((settled_pots or 0) / SOMPI, 2),
+        }))
+        con.close()
+        return
 
     print(f"\n════ DAGmate — activity ════   {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(now))}\n")
     print(f"  Players      : {players:<4} (+{p1h} in 1h · +{p24h} in 24h)")
