@@ -76,5 +76,6 @@ server is always a commit). `deploy/README.md` is the runbook, including the
 pre-launch checklist. DAGmate runs no Kaspa node of its own — the sidecar
 resolves a public one and health-checks it on every connection.
 
-Owner-gated / private until GoonBoy has tested it end-to-end and it's ready for
-public testing.
+**Status: live on Kaspa L1 mainnet — public beta.** End-to-end tested and
+open for play at dagmate.org. It's an early beta: play small while the
+community shakes out the edges.
