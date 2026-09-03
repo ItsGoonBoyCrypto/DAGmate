@@ -116,6 +116,27 @@ SETTLE_FEE_SOMPI_PER_INPUT = 3_000_000
 # under it by design: they exist for the on-chain move record, not the money.
 SETTLE_MIN_POT_SOMPI = 2 * SETTLE_FEE_SOMPI_PER_INPUT
 
+# ── mutual settlement (settlement.py, roadmap #1 / DAGMATE_SPEC §2.3) ────
+# When on, a DECISIVE win settles player-to-player: the winner AND the loser
+# co-sign the payout, so DAGmate's arbiter key is NOT used for an honestly
+# completed game (the escrow is 2-of-3, and this uses the {playerA, playerB}
+# 2-subset instead of {winner, arbiter}). The arbiter stays a stall-breaker:
+# if the loser hasn't co-signed within SETTLE_STALL_SECS of the tx being built,
+# the winner's claim falls back to the winner+arbiter path (the pre-#1
+# behaviour), so a non-cooperating or absent loser can never hold the pot
+# hostage. Draws are unaffected (they already release to each depositor).
+#
+# OFF by default: mutual spends must first be proven on-chain by spike S4
+# (service/spikes.mjs) on the target network. Flip DAGMATE_SETTLE_MUTUAL=1 once
+# S4 passes there — nothing else about the escrow or the tx changes, only which
+# two of the three keys sign, so the flag is a safe, instant on/off.
+SETTLE_MUTUAL_ENABLED = os.getenv("DAGMATE_SETTLE_MUTUAL", "0") == "1"
+# How long the loser gets to co-sign an honest result before the arbiter
+# stall-breaker releases the pot to the winner anyway. Short enough not to make
+# a winner wait long when the loser has already closed their tab; long enough
+# for a present loser to read "you lost" and click confirm.
+SETTLE_STALL_SECS = int(os.getenv("DAGMATE_SETTLE_STALL_SECS", "45"))
+
 # ── reclaim (reclaim.py) ────────────────────────────────────────────────
 # ⚠️ MUST match RECLAIM_FEE_SOMPI_PER_INPUT in service/escrow.js. Same reason
 # as the settle fee above: the backend quotes the payout before the sidecar

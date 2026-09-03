@@ -125,6 +125,32 @@ function settleSigScript(k, redeemHex, sigPlayer, sigArb) {
   return k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem);
 }
 
+/** Fill one escrow input's sigScript for the IF (settle) branch using BOTH
+ *  players' signatures and NO arbiter — the mutual, player-agreed settlement
+ *  (roadmap #1 / docs/DAGMATE_SPEC.md §2.3). For every honestly-finished game
+ *  where the loser co-signs the payout, DAGmate's arbiter key is never used.
+ *
+ *  The 2-of-3 redeem is `OP_2 <pkA> <pkB> <pkArb> OP_3 CHECKMULTISIG`, and
+ *  Kaspa's OpCheckMultiSig requires the m=2 signatures to be pushed in the SAME
+ *  relative order as their pubkeys — so player A's signature is pushed before
+ *  player B's, ALWAYS, regardless of who won. The backend is the only side that
+ *  knows which wallet is A and which is B, so it maps winner/loser onto the A/B
+ *  roles and hands us role-ordered sigs; this stays a dumb, order-preserving
+ *  assembler. Getting the order wrong yields an unspendable input, so it is
+ *  fixed here by construction and never left to a caller's argument order.
+ *  Proven on mainnet dust by spike S4 (service/spikes.mjs). */
+function settleSigScriptMutual(k, redeemHex, sigA, sigB) {
+  if (!sigA || !sigB) {
+    throw new Error('mutual settle needs both player A and player B signatures for every input');
+  }
+  const redeem = new k.ScriptBuilder(core.COVENANT_OPTS)
+    .addData(rawSig(sigA)) // pkA slot — first, to match pubkey order
+    .addData(rawSig(sigB)) // pkB slot
+    .addOp(k.Opcodes.OpTrue) // select the IF (settle) branch
+    .drain();
+  return k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem);
+}
+
 /** POST /escrow/balances — how much is actually sitting at each address.
  *  This is what the backend's deposit watcher runs on, so it is a
  *  money-critical read and deliberately conservative:
@@ -290,20 +316,31 @@ export async function extractSigs({ signedTxJson, indexes }) {
  *  buildSettleUnsigned (site round-tripped it through the winning/depositor
  *  wallet(s) for a signature per input) and the matching player signatures,
  *  assemble the final sigScripts, and submit. */
-export async function broadcastSettle({ txJson, escrows, sigsPlayer, sigsArb }) {
+export async function broadcastSettle({ txJson, escrows, sigsPlayer, sigsArb, sigsA, sigsB }) {
   if (!txJson) throw new Error('txJson required');
-  if (!Array.isArray(sigsPlayer) || !Array.isArray(sigsArb)) throw new Error('sigsPlayer and sigsArb required, one per input');
+  // Two settlement modes over the SAME 2-of-3 escrow:
+  //   - mutual  (roadmap #1): both players co-sign, no arbiter — sigsA + sigsB.
+  //   - arbiter (v1 / draws / stall fallback): one player + arbiter — sigsPlayer + sigsArb.
+  // The backend picks the mode and sends only that mode's arrays; the arbiter
+  // path is byte-for-byte the code it always was.
+  const mutual = Array.isArray(sigsA) && Array.isArray(sigsB);
+  if (!mutual && (!Array.isArray(sigsPlayer) || !Array.isArray(sigsArb))) {
+    throw new Error('either sigsA+sigsB (mutual) or sigsPlayer+sigsArb (arbiter) required, one per input');
+  }
+  const n = mutual ? sigsA.length : sigsPlayer.length;
   const k = core.wasm();
   return core.withRpc(async (rpc) => {
     const tx = k.Transaction.deserializeFromSafeJSON(txJson);
     const inputs = tx.inputs;  // may be clones — mutate then reassign to commit
-    for (let i = 0; i < sigsPlayer.length; i++) {
+    for (let i = 0; i < n; i++) {
       // `escrows` here is indexed BY INPUT INDEX, not one entry per escrow —
       // an escrow holding two UTXOs appears twice. The backend expands it
       // (settlement._escrows_per_input); this side trusts the position.
       const escrow = escrows[i];
       if (!escrow) throw new Error(`no escrow mapping for input ${i}`);
-      inputs[i].signatureScript = settleSigScript(k, escrow.redeemHex, sigsPlayer[i], sigsArb[i]);
+      inputs[i].signatureScript = mutual
+        ? settleSigScriptMutual(k, escrow.redeemHex, sigsA[i], sigsB[i])
+        : settleSigScript(k, escrow.redeemHex, sigsPlayer[i], sigsArb[i]);
     }
     tx.inputs = inputs; // low-level Transaction has no fillInput(); commit the array back
     // A low-level Transaction has no .submit() (that's a PendingTransaction

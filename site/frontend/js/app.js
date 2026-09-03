@@ -729,16 +729,30 @@
         <div class="claim-note">Released on chain. Transaction <code>${esc(s.txid)}</code>.</div>`;
       return;
     }
-    const heading = s.isDraw ? "Draw — your half" : (s.youWon ? "You won the pot" : "Payout");
+    // cosignAsk: the loser confirming an honest result — they release the pot to
+    // the opponent (roadmap #1), so it's not their own payout being shown.
+    const heading = s.isDraw ? "Draw — your half"
+      : s.cosignAsk ? "Release the pot"
+      : (s.youWon ? "You won the pot" : "Payout");
     const needsMe = s.mySignatureInputs && s.mySignatureInputs.length;
+    const amountSompi = s.cosignAsk ? s.potSompi : s.payoutSompi;
+    const waitingNote = s.awaitingCosign
+      ? `Waiting for your opponent to confirm the result${s.autoReleaseInSecs != null
+           ? ` — the pot releases automatically in about ${s.autoReleaseInSecs}s`
+           : ""}.`
+      : s.waitingOnOpponent
+        ? "Waiting for your opponent to sign their side of the draw."
+        : "Nothing for you to sign here.";
+    const signBtn = s.cosignAsk
+      ? `<div class="claim-note">You lost this one — co-sign to send the pot straight to your
+           opponent, so the payout never has to wait on DAGmate.</div>
+         <button class="btn btn-primary full" id="claimBtn">Sign &amp; release to opponent</button>`
+      : `<button class="btn btn-primary full" id="claimBtn">Sign &amp; release</button>`;
     el.innerHTML = `
       <div class="claim-title">${heading}</div>
-      <div class="claim-amount">${kasFromSompi(s.payoutSompi)} KAS</div>
+      <div class="claim-amount">${kasFromSompi(amountSompi)} KAS</div>
       ${feeBreakdown(s)}
-      ${needsMe ? `<button class="btn btn-primary full" id="claimBtn">Sign &amp; release</button>`
-                : `<div class="claim-note">${s.waitingOnOpponent
-                     ? "Waiting for your opponent to sign their side of the draw."
-                     : "Nothing for you to sign here."}</div>`}`;
+      ${needsMe ? signBtn : `<div class="claim-note">${waitingNote}</div>`}`;
     if (needsMe) document.getElementById("claimBtn").addEventListener("click", () => claim(m));
   }
 

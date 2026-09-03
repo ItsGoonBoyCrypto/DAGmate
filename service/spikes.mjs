@@ -226,9 +226,60 @@ async function s3_cltv() {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+async function s4_mutual() {
+  console.log('S4 — 2-of-3 escrow settled by BOTH players (mutual, NO arbiter), mainnet dust');
+  console.log('     Roadmap #1: proves the honestly-agreed settle path where DAGmate never co-signs.');
+  await core.withRpc(async (rpc) => {
+    const a = newKey(), b = newKey(), arb = newKey();
+
+    // Identical escrow to S2 — the same 2-of-3 redeem. The ONLY difference is
+    // which two of the three keys sign the spend: here it is playerA + playerB,
+    // never the arbiter. If S2 passes and S4 fails, the multisig is rejecting a
+    // valid 2-subset and mutual settlement must not ship.
+    const redeemHex = buildEscrowRedeem(xOnly(a.key), xOnly(b.key), xOnly(arb.key));
+    const spk = k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).createPayToScriptHashScript();
+    const escrowAddr = k.addressFromScriptPublicKey(spk, NET).toString();
+    console.log('   escrow address:', escrowAddr);
+
+    const FUND = 300_000_000n; // 3 KAS — same generous margin as S2
+    await fundFromOperatingAddress(rpc, escrowAddr, FUND);
+    const entries = await waitUtxo(rpc, escrowAddr);
+
+    // Settle to playerA's address (the "winner"), signed by A AND B. No arbiter.
+    const { address: opAddr } = core.operatingAddress();
+    const { transactions } = await k.createTransactions({
+      entries, outputs: [{ address: a.address, amount: 100_000_000n }],
+      changeAddress: opAddr, priorityFee: 50_000_000n, networkId: NETWORK_ID,
+      sigOpCount: 3, // CHECKMULTISIG is billed by pubkey count (n=3), not required-sig count (m=2)
+    });
+    const tx = transactions[0];
+    const idx = 0; // single input
+    const sigA = tx.createInputSignature(idx, a.key);
+    const sigB = tx.createInputSignature(idx, b.key);
+    const raw = (s) => { const buf = Buffer.from(String(s), 'hex'); return buf.length === 66 ? buf.subarray(1) : buf; };
+
+    const redeem = new k.ScriptBuilder(core.COVENANT_OPTS)
+      // sigs in the same relative order as their pubkeys (pkA, pkB, pkArb):
+      // playerA's signature first, playerB's second, and NO arbiter push.
+      .addData(raw(sigA))
+      .addData(raw(sigB))
+      .addOp(k.Opcodes.OpTrue) // select IF branch
+      .drain();
+    tx.fillInput(idx, k.ScriptBuilder.fromScript(redeemHex, core.COVENANT_OPTS).encodePayToScriptHashSignatureScript(redeem));
+
+    const txid = await tx.submit(rpc);
+    console.log(`   mutual settle tx submitted: ${txid}`);
+    console.log('S4 PASSED — 2-of-3 escrow settled by both players with NO arbiter, on mainnet.');
+    await new Promise((r) => setTimeout(r, 4000));
+    await sweepBack(rpc, a.address, a.key);
+  });
+}
+
 const which = process.argv[2];
 if (which === 'S1') await s1_payload();
 else if (which === 'S2') await s2_multisig();
 else if (which === 'S3') await s3_cltv();
-else { console.error('usage: node spikes.mjs [S1|S2|S3]'); process.exit(1); }
+else if (which === 'S4') await s4_mutual();
+else { console.error('usage: node spikes.mjs [S1|S2|S3|S4]'); process.exit(1); }
 process.exit(0);

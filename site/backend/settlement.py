@@ -23,6 +23,18 @@ Four things drive the whole design:
    escrow's inputs are signed by THAT depositor — which is why settlement is a
    multi-visit process and not a single request.
 
+   ROADMAP #1 (config.SETTLE_MUTUAL_ENABLED) adds a second, preferred way to
+   settle a WIN: the loser ALSO co-signs, and the pot releases on the
+   {playerA, playerB} 2-subset with NO arbiter — so an honestly-completed game
+   never trusts DAGmate's key. The winner's signature is required either way
+   (it is one of the two sigs in both the mutual and the arbiter assembly). The
+   arbiter is only used as a stall-breaker: if the loser has not co-signed
+   within config.SETTLE_STALL_SECS of the build, the winner's claim falls back
+   to winner+arbiter. Two signature arrays back this: settle_sigs_player_json
+   (the "primary" signer — winner for a win, each depositor for a draw) and
+   settle_sigs_cosign_json (the loser's mutual co-signatures). Draws are
+   untouched by #1.
+
 3. **The payout address comes from the database, never the request.** The
    arbiter co-signs whatever we hand it. If the caller could name the payout
    address, "settle my match" would be "send the pot anywhere I like".
@@ -38,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 import config
 import database as db
@@ -153,13 +166,16 @@ async def prepare(match_id: str, address: str) -> dict:
             log.info(f"settle build for {match_id} lost the race — using the stored one")
         m = db.get_match(match_id)
 
-    # A fully-signed tx that never went out strands the pot: once the last
-    # signature is stored, every player sees "nothing to sign" and no click
-    # path reaches the broadcast. Whoever opens the panel next finishes the
-    # release — it needs no signature from them, only the stored set — so a
-    # failed broadcast self-heals on the next poll instead of deadlocking.
-    if _fully_signed(m):
-        return await _broadcast(match_id, m, address, a, b)
+    # A settle that is ready to release but never went out strands the pot: once
+    # the last needed signature is stored (or the stall window lapses), a player
+    # may see "nothing to sign" and no click path reaches the broadcast. Whoever
+    # opens the panel next finishes the release — it needs no signature from
+    # them, only the stored set — so a failed or deferred broadcast self-heals
+    # on the next poll instead of deadlocking. The stall fallback also lands
+    # here: once the window passes, the next prepare() flips to 'arb'.
+    mode = _broadcast_mode(m, a, b)
+    if mode:
+        return await _broadcast(match_id, m, address, a, b, mode)
     return _public(m, address, a, b)
 
 
@@ -172,31 +188,131 @@ def _rake_sompi(m: dict) -> int:
     return (m["stake_sompi"] * 2 * config.RAKE_BPS) // 10_000
 
 
-def _fully_signed(m: dict) -> bool:
-    """A settle tx that is built, has every player signature, and has not yet
-    been broadcast — i.e. ready to release with no further wallet interaction."""
+def _cosign_list(m: dict, n: int) -> list:
+    """The loser's mutual co-signature array, defaulting to all-unsigned. NULL
+    on every pre-#1 row and on any settle that hasn't used the mutual path, and
+    a length mismatch (e.g. a rebuild) is treated the same as absent — never
+    trusted into a broadcast."""
+    raw = m["settle_sigs_cosign_json"]
+    if not raw:
+        return [None] * n
+    try:
+        lst = json.loads(raw)
+    except (TypeError, ValueError):
+        return [None] * n
+    return lst if isinstance(lst, list) and len(lst) == n else [None] * n
+
+
+def _my_signing(m: dict, address: str, a: dict, b: dict) -> tuple[str, list[int]]:
+    """(which, indexes) — which signature array THIS caller fills and the input
+    indexes still needing their signature.
+
+    'primary' is the existing 2-of-3 co-signer set: the winner (who signs every
+    input) for a win, each depositor (who signs their own escrow) for a draw —
+    the stored per-input `signer` map already encodes it. 'cosign' is the
+    loser's optional agreement in a mutual win, which drops the arbiter from an
+    honestly-completed game (roadmap #1); the loser signs every input.
+
+    With mutual disabled this returns exactly the pre-#1 behaviour: the loser
+    has nothing to sign."""
+    inputs = json.loads(m["settle_inputs_json"])
+    primary = json.loads(m["settle_sigs_player_json"])
+    prim = [i["index"] for i in inputs if i["signer"] == address and primary[i["index"]] is None]
+    if prim:
+        return ("primary", prim)
+    # Nothing left on the primary set for this caller. On a decisive win, the
+    # loser can still co-sign to release without the arbiter.
+    if m["winner_account_id"] is not None and config.SETTLE_MUTUAL_ENABLED:
+        winner_addr = (a if m["winner_account_id"] == a["id"] else b)["address"]
+        if address != winner_addr:
+            cosign = _cosign_list(m, len(inputs))
+            co = [i["index"] for i in inputs if cosign[i["index"]] is None]
+            return ("cosign", co)
+    return ("primary", [])
+
+
+def _broadcast_mode(m: dict, a: dict, b: dict) -> str | None:
+    """Whether a built settle is ready to go out, and how: 'mutual' (both
+    players, no arbiter), 'arb' (one player + arbiter), or None (still waiting).
+
+    Generalises the old `_fully_signed`: with mutual disabled it returns 'arb'
+    exactly when every primary signature is in, which is precisely when the
+    pre-#1 code broadcast. With mutual enabled and a win, it prefers the
+    arbiter-free release once the loser has co-signed, and otherwise holds for
+    the stall window before letting the arbiter break the tie."""
     if not m["settle_tx_json"] or m["settle_txid"]:
-        return False
-    stored = json.loads(m["settle_sigs_player_json"])
-    return bool(stored) and all(s is not None for s in stored)
+        return None
+    primary = json.loads(m["settle_sigs_player_json"])
+    primary_done = bool(primary) and all(s is not None for s in primary)
+    if m["winner_account_id"] is None:
+        return "arb" if primary_done else None  # draw: unchanged path
+    if not primary_done:
+        return None  # the winner's signature is required in either assembly
+    if config.SETTLE_MUTUAL_ENABLED:
+        cosign = _cosign_list(m, len(primary))
+        if all(s is not None for s in cosign):
+            return "mutual"  # both players agreed — DAGmate's key is never touched
+        prepared = m["settle_prepared_ts"] or 0
+        if time.time() < prepared + config.SETTLE_STALL_SECS:
+            return None  # give the loser the stall window to co-sign first
+    return "arb"  # stall-breaker (or mutual disabled): winner + arbiter
 
 
-async def _broadcast(match_id: str, m: dict, address: str, a: dict, b: dict) -> dict:
-    """Push a fully-signed settle tx and record its txid.
+def _mutual_role_sigs(m: dict, a: dict, b: dict, inputs: list[dict],
+                      primary: list) -> tuple[list, list]:
+    """Map the stored (winner=primary, loser=cosign) signatures onto the fixed
+    (playerA, playerB) roles the escrow's redeem expects, so the sidecar can
+    push them in pubkey order. This side is the only one that knows which wallet
+    is A and which is B, which is exactly why the mapping lives here and the
+    assembler on the sidecar stays a dumb order-preserver."""
+    n = len(inputs)
+    cosign = _cosign_list(m, n)
+    winner_is_a = m["winner_account_id"] == a["id"]
+    sigs_a: list = [None] * n
+    sigs_b: list = [None] * n
+    for inp in inputs:
+        i = inp["index"]
+        win_sig, lose_sig = primary[i], cosign[i]
+        if win_sig is None or lose_sig is None:
+            # _broadcast_mode only returns 'mutual' with both sets complete;
+            # a gap here would mean a concurrent rebuild, so refuse rather than
+            # ship a half-signed input the node will reject anyway.
+            raise SettlementError("mutual settle is missing a signature — reload and try again")
+        if winner_is_a:
+            sigs_a[i], sigs_b[i] = win_sig, lose_sig
+        else:
+            sigs_a[i], sigs_b[i] = lose_sig, win_sig
+    return sigs_a, sigs_b
+
+
+async def _broadcast(match_id: str, m: dict, address: str, a: dict, b: dict, mode: str) -> dict:
+    """Push a ready settle tx and record its txid.
 
     Called from two places — submit (the player who just added the last
     signature) and prepare (a player opening a match whose set is already
     complete but never went out). Both are safe: the broadcast guard keeps the
     first txid, and a double-spend rejection means the other side released
     first, which is a success, not an error — but only if a txid really landed,
-    so it checks rather than assumes."""
+    so it checks rather than assumes.
+
+    `mode` decides which 2-subset of the 2-of-3 signs: 'mutual' = both players
+    (no arbiter, roadmap #1); 'arb' = one player + arbiter (the pre-#1 path,
+    used for draws and as the stall-breaker). The 'arb' branch is byte-for-byte
+    what it always was."""
     inputs = json.loads(m["settle_inputs_json"])
     stored = json.loads(m["settle_sigs_player_json"])
     try:
-        r = await service_client.settle_broadcast(
-            tx_json=m["settle_tx_json"],
-            escrows=_escrows_per_input(m, inputs),
-            sigs_player=stored, sigs_arb=json.loads(m["settle_sigs_arb_json"]))
+        if mode == "mutual":
+            sigs_a, sigs_b = _mutual_role_sigs(m, a, b, inputs, stored)
+            r = await service_client.settle_broadcast_mutual(
+                tx_json=m["settle_tx_json"],
+                escrows=_escrows_per_input(m, inputs),
+                sigs_a=sigs_a, sigs_b=sigs_b)
+        else:
+            r = await service_client.settle_broadcast(
+                tx_json=m["settle_tx_json"],
+                escrows=_escrows_per_input(m, inputs),
+                sigs_player=stored, sigs_arb=json.loads(m["settle_sigs_arb_json"]))
     except service_client.ServiceError as e:
         current = db.get_match(match_id)
         if current["settle_txid"]:
@@ -229,11 +345,14 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
         return _public(m, address, a, b)  # already broadcast; a duplicate click
 
     inputs = json.loads(m["settle_inputs_json"])
-    stored = json.loads(m["settle_sigs_player_json"])
-    # Only the inputs that are this player's to sign AND not yet filled.
-    my_indexes = [i["index"] for i in inputs
-                  if i["signer"] == address and stored[i["index"]] is None]
+    # Which array this player fills and which of its inputs they still owe:
+    # 'primary' (winner or draw depositor) or 'cosign' (the loser's mutual
+    # agreement). The loser can never write into the primary slots and the
+    # winner is never asked to co-sign — the split is by role, not by request.
+    which, my_indexes = _my_signing(m, address, a, b)
     if my_indexes:
+        stored = (_cosign_list(m, len(inputs)) if which == "cosign"
+                  else json.loads(m["settle_sigs_player_json"]))
         got = await service_client.extract_sigs(signed_tx_json=signed_tx_json, indexes=my_indexes)
         extracted = got.get("sigs", {})
         for i in my_indexes:
@@ -241,7 +360,9 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
             if not sig:
                 raise SettlementError(f"your wallet didn't sign input {i} — try again")
             stored[i] = sig
-        if not db.save_settlement_sigs(match_id, stored):
+        saved = (db.save_settlement_cosign_sigs(match_id, stored) if which == "cosign"
+                 else db.save_settlement_sigs(match_id, stored))
+        if not saved:
             # The guard only fails if a txid landed while we were signing, i.e.
             # the other player completed the set first. Their broadcast covers us.
             return _public(db.get_match(match_id), address, a, b)
@@ -249,13 +370,14 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
     # Re-read so the broadcast works off the just-saved signature set (and picks
     # up a txid if the other player's submit landed in between).
     m = db.get_match(match_id)
-    # Whether or not this call added a signature, if the set is now complete but
+    # Whether or not this call added a signature, if the settle is now ready but
     # a previous broadcast attempt failed (e.g. a transient sidecar error), a
     # re-submit gets us here and retries the broadcast rather than sitting on a
-    # fully-signed tx that never went out.
-    if not _fully_signed(m):
+    # ready tx that never went out.
+    mode = _broadcast_mode(m, a, b)
+    if not mode:
         return _public(m, address, a, b)
-    return await _broadcast(match_id, m, address, a, b)
+    return await _broadcast(match_id, m, address, a, b, mode)
 
 
 def _public(m: dict, address: str, a: dict, b: dict) -> dict:
@@ -267,14 +389,20 @@ def _public(m: dict, address: str, a: dict, b: dict) -> dict:
     if not m["settle_tx_json"]:
         return {"state": "unprepared"}
     inputs = json.loads(m["settle_inputs_json"])
-    stored = json.loads(m["settle_sigs_player_json"])
-    mine = [i["index"] for i in inputs
-            if i["signer"] == address and stored[i["index"]] is None]
+    primary = json.loads(m["settle_sigs_player_json"])
+    # `mine` comes from _my_signing so the loser's mutual co-sign inputs are
+    # included (roadmap #1). `which` tells the client whether this ask is the
+    # caller's OWN payout ('primary') or a co-sign that releases to the opponent
+    # ('cosign'), which is a different button and a different sentence.
+    which, mine = _my_signing(m, address, a, b)
+    is_cosign_ask = which == "cosign" and bool(mine)
     pot = m["settle_pot_sompi"] or 0
     rake = m["settle_rake_sompi"] or 0
     fee = config.SETTLE_FEE_SOMPI_PER_INPUT * len(inputs)
     distributable = max(0, pot - rake - fee)
     is_draw = m["winner_account_id"] is None
+    you_won = (m["winner_account_id"] is not None
+               and (a if m["winner_account_id"] == a["id"] else b)["address"] == address)
     # On a draw the sidecar splits the odd sompi to A (halfA = distributable −
     # distributable//2, halfB = distributable//2), so the exact amount this
     # caller receives depends on which side they are. Show THAT number, not a
@@ -283,14 +411,37 @@ def _public(m: dict, address: str, a: dict, b: dict) -> dict:
         half_b = distributable // 2
         half_a = distributable - half_b
         payout = half_a if a["address"] == address else half_b
-    else:
+    elif you_won:
         payout = distributable
+    else:
+        payout = 0  # the loser gets nothing; their panel is a co-sign, not a claim
+
+    # Mutual win in flight: the winner has signed but the loser hasn't co-signed
+    # yet. Tell the winner the pot is auto-releasing so a short wait doesn't read
+    # as a stuck button, and expose the seconds left so the panel can count down.
+    awaiting_cosign = False
+    auto_release_in = None
+    if (not is_draw and config.SETTLE_MUTUAL_ENABLED and not m["settle_txid"]):
+        primary_done = bool(primary) and all(s is not None for s in primary)
+        cosign = _cosign_list(m, len(inputs))
+        if primary_done and any(s is None for s in cosign) and not mine:
+            awaiting_cosign = True
+            prepared = m["settle_prepared_ts"] or 0
+            auto_release_in = max(0, int(prepared + config.SETTLE_STALL_SECS - time.time()))
+
     return {
         "state": "broadcast" if m["settle_txid"] else ("ready" if not mine else "needs_signature"),
         "txid": m["settle_txid"],
         "txJson": m["settle_tx_json"] if mine else None,
         "mySignatureInputs": mine,
-        "waitingOnOpponent": bool(not mine and any(s is None for s in stored)),
+        # Waiting on the OTHER player: a draw's other depositor, or (mutual) the
+        # loser's co-sign before the arbiter stall-breaker releases.
+        "waitingOnOpponent": bool(not mine and any(s is None for s in primary)) or awaiting_cosign,
+        # This ask releases the pot to the opponent, not to me — the loser
+        # confirming an honest result. Drives the button label and copy.
+        "cosignAsk": is_cosign_ask,
+        "awaitingCosign": awaiting_cosign,
+        "autoReleaseInSecs": auto_release_in,
         "potKas": pot / config.SOMPI_PER_KAS,
         "networkFeeKas": fee / config.SOMPI_PER_KAS,
         "platformFeeKas": rake / config.SOMPI_PER_KAS,
@@ -309,6 +460,5 @@ def _public(m: dict, address: str, a: dict, b: dict) -> dict:
         "payoutSompi": str(payout),
         "expectedOutputSompi": str(max(0, pot - fee)),
         "isDraw": is_draw,
-        "youWon": m["winner_account_id"] is not None
-                  and (a if m["winner_account_id"] == a["id"] else b)["address"] == address,
+        "youWon": you_won,
     }

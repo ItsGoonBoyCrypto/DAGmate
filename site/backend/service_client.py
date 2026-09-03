@@ -95,6 +95,17 @@ async def settle_broadcast(*, tx_json: str, escrows: list[dict], sigs_player: li
     })
 
 
+async def settle_broadcast_mutual(*, tx_json: str, escrows: list[dict], sigs_a: list[str], sigs_b: list[str]) -> dict:
+    """Broadcast a mutual (arbiter-free) settle — roadmap #1. Same route as the
+    arbiter path, but the sidecar sees sigsA+sigsB (both players, no arbiter)
+    and assembles the {pkA, pkB} 2-subset of the 2-of-3 instead of
+    {player, arbiter}. sigs_a[i] / sigs_b[i] are role-ordered by the caller
+    (settlement.py knows which wallet is A and which is B)."""
+    return await _post("/escrow/settle-broadcast", {
+        "txJson": tx_json, "escrows": escrows, "sigsA": sigs_a, "sigsB": sigs_b,
+    })
+
+
 async def extract_sigs(*, signed_tx_json: str, indexes: list[int]) -> dict:
     """Pull the raw player signatures back out of the given inputs of a
     wallet-signed tx. Returns {"sigs": {"<index>": "<hex>"}}."""

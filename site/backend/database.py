@@ -181,6 +181,10 @@ def ensure_schema():
         _add_column(c, "matches", "settle_inputs_json", "TEXT")   # per-input: escrow + required signer
         _add_column(c, "matches", "settle_sigs_arb_json", "TEXT")  # ours, computed at build time
         _add_column(c, "matches", "settle_sigs_player_json", "TEXT")  # filled in as players sign
+        # The loser's optional co-signatures for a mutual (arbiter-free) win —
+        # roadmap #1. NULL on every pre-#1 row and on any settle that never uses
+        # the mutual path; settlement._cosign_list treats NULL as "none yet".
+        _add_column(c, "matches", "settle_sigs_cosign_json", "TEXT")
         _add_column(c, "matches", "settle_pot_sompi", "INTEGER")
         _add_column(c, "matches", "settle_rake_sompi", "INTEGER")
         _add_column(c, "matches", "settle_prepared_ts", "INTEGER")
@@ -588,11 +592,12 @@ def save_settlement_build(match_id: str, *, tx_json: str, inputs: list[dict],
     with _lock, _conn() as c:
         cur = c.execute(
             "UPDATE matches SET settle_tx_json=?, settle_inputs_json=?, settle_sigs_arb_json=?, "
-            "settle_sigs_player_json=?, settle_pot_sompi=?, settle_rake_sompi=?, settle_prepared_ts=? "
+            "settle_sigs_player_json=?, settle_sigs_cosign_json=?, "
+            "settle_pot_sompi=?, settle_rake_sompi=?, settle_prepared_ts=? "
             "WHERE id=? AND settle_tx_json IS NULL",
             (tx_json, json.dumps(inputs), json.dumps(sigs_arb),
-             json.dumps([None] * len(inputs)), pot_sompi, rake_sompi,
-             int(time.time()), match_id))
+             json.dumps([None] * len(inputs)), json.dumps([None] * len(inputs)),
+             pot_sompi, rake_sompi, int(time.time()), match_id))
         return cur.rowcount == 1
 
 
@@ -605,6 +610,18 @@ def save_settlement_sigs(match_id: str, sigs_player: list) -> bool:
         cur = c.execute(
             "UPDATE matches SET settle_sigs_player_json=? WHERE id=? AND settle_txid IS NULL",
             (json.dumps(sigs_player), match_id))
+        return cur.rowcount == 1
+
+
+def save_settlement_cosign_sigs(match_id: str, sigs_cosign: list) -> bool:
+    """Write back the loser's co-signature array for a mutual (arbiter-free) win
+    — roadmap #1. Same guard as save_settlement_sigs: a signature is only valid
+    for the exact tx it signed, so once a txid has landed these are worthless
+    and must not overwrite the record of what actually settled."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET settle_sigs_cosign_json=? WHERE id=? AND settle_txid IS NULL",
+            (json.dumps(sigs_cosign), match_id))
         return cur.rowcount == 1
 
 
