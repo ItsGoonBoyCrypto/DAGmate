@@ -711,7 +711,7 @@
     if (state.settleFor !== m.id) {
       state.settleFor = m.id;
       state.settle = null;
-      el.innerHTML = `<div class="claim-title">Checking the pot…</div>`;
+      el.innerHTML = `<div class="claim-title">Checking the result…</div>`;
       api("POST", `/api/matches/${m.id}/settle/prepare`)
         .then((s) => { if (state.settleFor === m.id) { state.settle = s; renderClaim(m); } })
         .catch((e) => { if (state.settleFor === m.id) showPrepareError(el, "Payout", e, () => retrySettle(m)); });
@@ -722,6 +722,16 @@
     // left the error panel up (see showPrepareError). Don't auto-retry every
     // poll; the "Try again" button drives it.
     if (!s) return;
+
+    if (s.state === "free") {
+      // A free game — no escrow, no pot, nothing to sign. Just show the result.
+      const title = s.isDraw ? "Draw" : s.youWon ? "You won 🏆" : "Good game";
+      const note = s.isDraw ? "A free game — honours even, nothing wagered."
+        : s.youWon ? "A free game — the win is yours (no pot)."
+                   : "A free game — no stake lost. Rematch?";
+      el.innerHTML = `<div class="claim-title">${title}</div><div class="claim-note">${note}</div>`;
+      return;
+    }
 
     if (s.state === "broadcast") {
       // v2 (covenant) matches settle themselves — the loser polls too and sees payout 0, so the

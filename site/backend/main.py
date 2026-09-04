@@ -192,7 +192,8 @@ def _challenge_public(ch: dict) -> dict:
     to = db.get_account(ch["to_account_id"]) if ch["to_account_id"] else None
     return {
         "id": ch["id"], "status": ch["status"], "mode": ch["mode"],
-        "stakeKas": ch["stake_sompi"] / config.SOMPI_PER_KAS, "gasOnly": bool(ch["gas_only"]),
+        "stakeKas": ch["stake_sompi"] / config.SOMPI_PER_KAS,
+        "isFree": bool(ch["gas_only"]) or ch["stake_sompi"] == 0,  # 0-stake = free game
         "fromAccountId": ch["from_account_id"], "toAccountId": ch["to_account_id"],
         "fromAddress": frm["address"] if frm else None, "fromShort": _short(frm["address"]) if frm else None,
         "fromKns": kns.cached_name(frm["address"]) if frm else None,
@@ -208,6 +209,7 @@ def _match_public(m: dict) -> dict:
     return {
         "id": m["id"], "status": m["status"], "mode": m["mode"],
         "stakeKas": m["stake_sompi"] / config.SOMPI_PER_KAS,
+        "isFree": m["stake_sompi"] == 0,  # free game — no escrow, no pot
         "fen": m["fen"], "turn": m["turn"], "result": m["result"],
         "playerA": {"address": a["address"], "shortAddress": _short(a["address"]),
                     "knsName": kns.cached_name(a["address"])} if a else None,
@@ -362,17 +364,22 @@ class NewChallengeBody(BaseModel):
 def new_challenge(body: NewChallengeBody, account: dict = Depends(require_account)):
     if body.mode not in ("rapid", "daily"):
         raise HTTPException(400, "mode must be 'rapid' or 'daily'")
-    # Gas-only was removed: a dust stake can't be deposited (Kaspa's storage-mass
-    # rule rejects a ~1000-sompi output), so every match is a real stake with a
-    # minimum. stakeKas is a float off the wire — NaN/inf survive JSON and beat a
-    # `<= 0` check, so reject non-finite first, then clamp to the configured band
-    # so a bad amount bounces at the form rather than on-chain.
+    # stakeKas is a float off the wire — NaN/inf survive JSON and beat a `<= 0`
+    # check, so reject non-finite first. A stake of 0 is a FREE game (no escrow,
+    # no deposit, no pot — see config.FREE_PLAY_ENABLED); any other amount is a
+    # real wager and must sit inside the configured band, because a dust stake
+    # can't be deposited (Kaspa's storage-mass rule rejects a ~1000-sompi output).
     if not math.isfinite(body.stakeKas):
         raise HTTPException(400, "stake must be a real number")
     stake_sompi = round(body.stakeKas * config.SOMPI_PER_KAS)
-    if stake_sompi < config.MIN_STAKE_SOMPI:
-        raise HTTPException(400, f"minimum stake is {config.MIN_STAKE_SOMPI / config.SOMPI_PER_KAS:g} KAS")
-    if stake_sompi > config.MAX_STAKE_SOMPI:
+    is_free = stake_sompi == 0
+    if is_free:
+        if not config.FREE_PLAY_ENABLED:
+            raise HTTPException(400, "free play isn't available right now — set a stake to play for KAS")
+    elif stake_sompi < config.MIN_STAKE_SOMPI:
+        raise HTTPException(400, f"minimum stake is {config.MIN_STAKE_SOMPI / config.SOMPI_PER_KAS:g} KAS "
+                                  f"(or 0 for a free game)")
+    elif stake_sompi > config.MAX_STAKE_SOMPI:
         raise HTTPException(400, f"maximum stake is {config.MAX_STAKE_SOMPI / config.SOMPI_PER_KAS:g} KAS")
     to_id = None
     if body.toAddress:
@@ -388,7 +395,8 @@ def new_challenge(body: NewChallengeBody, account: dict = Depends(require_accoun
         if not to["accept_challenges"]:
             raise HTTPException(400, "that player isn't accepting challenges right now")
         to_id = to["id"]
-    c = db.create_challenge(account["id"], to_id, stake_sompi, body.mode, False)
+    # `gas_only` doubles as the free-game flag now (a 0-stake, no-escrow match).
+    c = db.create_challenge(account["id"], to_id, stake_sompi, body.mode, is_free)
     return _challenge_public(c)
 
 
@@ -462,6 +470,20 @@ def decline_challenge(challenge_id: str, account: dict = Depends(require_account
 
 async def _create_match_from_pair(*, challenge_id, tournament_id, round_no, player_a_id, player_b_id,
                                    pk_a, pk_b, stake_sompi, mode) -> dict:
+    # Free game (0 stake): no escrow, no deposit, no settlement — it goes live the
+    # instant it's accepted and never touches the Kaspa sidecar. The whole money
+    # path below is skipped, which is also why free play keeps working when the
+    # chain service is down.
+    if stake_sompi == 0:
+        match = db.create_match(
+            challenge_id=challenge_id, tournament_id=tournament_id, round_no=round_no,
+            player_a_account_id=player_a_id, player_b_account_id=player_b_id,
+            stake_sompi=0, mode=mode, fen=chess_logic.STARTING_FEN,
+            escrow_a=None, escrow_b=None, reclaim_daa=None)
+        initial, inc = clocks.settings_for(mode)
+        db.mark_match_live(match["id"], initial_ms=initial, increment_ms=inc, now_ms=clocks.now_ms())
+        return db.get_match(match["id"])
+
     # Raises ServiceError if the node is unreachable — no match row is created,
     # so we never build an escrow with an unsafe (already-open) timelock.
     reclaim_daa = await _reclaim_daa()

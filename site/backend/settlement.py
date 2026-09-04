@@ -133,6 +133,9 @@ async def prepare(match_id: str, address: str) -> dict:
     a, b = _players(m)
     if address not in (a["address"], b["address"]):
         raise SettlementError("you're not a player in this match")
+    # Free game (0 stake): no escrow, no pot, nothing to settle — just report the result.
+    if m["stake_sompi"] == 0:
+        return _public_free(m, address, a, b)
     # Roadmap #2: a v2 (covenant) match settles itself — DAGmate signs the result and the
     # escrow pays the winner (or, on a draw, each depositor). No player signature, no co-sign
     # round-trip, so the whole v1 build/sign machinery below is skipped.
@@ -344,6 +347,8 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
     a, b = _players(m)
     if address not in (a["address"], b["address"]):
         raise SettlementError("you're not a player in this match")
+    if m["stake_sompi"] == 0:  # free game — no signature, no settlement
+        return _public_free(m, address, a, b)
     # A v2 match has nothing for a player to sign — it self-settles. A stray submit (a client
     # that still POSTs one) just triggers or confirms the auto-settle, idempotently.
     if (m["escrow_version"] or "v1") == "v2":
@@ -568,4 +573,25 @@ def _public_v2(m: dict, address: str, a: dict, b: dict) -> dict:
         # The published oracle verdict — the escape hatch that lets the pot be released without
         # DAGmate. Surfaced so the UI (or a determined player) can relay it if we ever don't.
         "verdict": verdict,
+    }
+
+
+# ── free games (no wager) ───────────────────────────────────────────────────
+def _public_free(m: dict, address: str, a: dict, b: dict) -> dict:
+    """A free match has no escrow and no pot, so there is nothing to settle — the claim panel
+    just reports the result. Same key shape as a settled payout (so the client's existing
+    plumbing works) but every money figure is zero and the state is 'free'."""
+    is_draw = m["winner_account_id"] is None
+    you_won = (not is_draw
+               and (a if m["winner_account_id"] == a["id"] else b)["address"] == address)
+    return {
+        "state": "free",
+        "isFree": True,
+        "isDraw": is_draw,
+        "youWon": you_won,
+        "mySignatureInputs": [],
+        "waitingOnOpponent": False,
+        "txid": None,
+        "potKas": 0.0, "networkFeeKas": 0.0, "platformFeeKas": 0.0, "payoutKas": 0.0,
+        "potSompi": "0", "networkFeeSompi": "0", "platformFeeSompi": "0", "payoutSompi": "0",
     }

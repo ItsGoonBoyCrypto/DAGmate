@@ -181,6 +181,15 @@ GAS_ONLY_STAKE_SOMPI = 1000
 MIN_STAKE_SOMPI = int(os.getenv("DAGMATE_MIN_STAKE_SOMPI", str(1 * SOMPI_PER_KAS)))
 MAX_STAKE_SOMPI = int(os.getenv("DAGMATE_MAX_STAKE_SOMPI", str(1_000_000 * SOMPI_PER_KAS)))
 
+# ── free play (no-wager PvP) ────────────────────────────────────────────
+# A stake of 0 creates a FREE match: no escrow, no deposit, no settlement — the
+# two players just play chess for the win. It goes live the instant it's
+# accepted (skips the whole money path, and doesn't even need the Kaspa
+# sidecar), which also sidesteps the storage-mass rule that killed the old
+# "gas-only dust stake" idea. Top-of-funnel: let people play before they wager.
+# On by default; env-toggleable so a deployment can close it.
+FREE_PLAY_ENABLED = os.getenv("DAGMATE_FREE_PLAY", "1") == "1"
+
 # ── move anchoring (main.make_move → service/escrow.js anchor) ──────────
 # Every ply, when on, is written to Kaspa L1 as a dust tx carrying a DGMT
 # move payload, paid from DAGmate's OWN operating address (never a player's

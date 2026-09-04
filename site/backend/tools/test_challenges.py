@@ -85,8 +85,8 @@ def main_() -> int:
           status_of(main.new_challenge, Body(stakeKas=float("inf"), mode="rapid"), creator), 400)
     check("a sane stake is accepted",
           status_of(main.new_challenge, Body(stakeKas=10, mode="rapid"), creator), 200)
-    check("a zero stake is refused (no more gas-only)",
-          status_of(main.new_challenge, Body(stakeKas=0, mode="rapid"), creator), 400)
+    check("a zero stake is a FREE game (not refused)",
+          status_of(main.new_challenge, Body(stakeKas=0, mode="rapid"), creator), 200)
 
     print("accept is a one-winner open->accepting transition")
     ch = db.create_challenge(creator["id"], None, 10 * config.SOMPI_PER_KAS, "rapid", False)
