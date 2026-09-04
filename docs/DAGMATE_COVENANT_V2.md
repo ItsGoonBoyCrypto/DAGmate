@@ -22,11 +22,51 @@ forever. Three wins:
 3. **Arbiter → oracle.** DAGmate can only *declare a winner-of-two*, cryptographically
    bound to this match; it can't skim, redirect, or be a liveness dependency at settle time.
 
-**Irreducible limit (state it plainly):** a covenant cannot know who won a chess game —
-that's off-chain. The oracle still *declares* the result; a compromised oracle could sign
-the wrong winner. Covenants only remove the arbiter's *skim/redirect/liveness* power, not
-the *"trust DAGmate to report the right winner"* part. Shrinking THAT further is roadmap #3
-(fraud-proof move-channel), a separate, larger build.
+**The residual trust (state it plainly), and how it's actually removable:** a covenant cannot
+*compute* chess — it can't tell checkmate from a random position — so in v2 the oracle
+*declares* the result and a compromised oracle could sign the wrong winner. But the oracle is
+NOT fundamentally irreducible; it decomposes by case, and only the last case is genuinely hard:
+
+- **Honest games (both players agree the result):** no oracle needed *already* — that's roadmap
+  #1 (mutual settlement: winner + loser co-sign, no arbiter/oracle). BUILT + deployed.
+- **Abandonment (a player just stops responding):** removable with NO oracle and NO chess
+  validation, via a **DAA-based move-timeout forfeit**. Players sign each move into a channel
+  (the move-anchor infra already exists); if the opponent posts no signed move within N DAA, the
+  covenant awards the pot by forfeit — enforced on-chain with `OpTxInputDaaScore` +
+  `OpCheckLockTimeVerify` (the SAME machinery the reclaim branch already uses). You do NOT
+  "modify state with DAA" — DAA is a read-only input the spend condition is gated on. This is the
+  feasible near-term trustless win and is where a "clock using DAA" belongs.
+- **Contested result (a player claims checkmate, the other disputes):** the covenant must
+  determine the winner on-chain, which needs chess-rule validation — impractical in raw Kaspa
+  Script (no loops, mass limits; you'd be running a move-legality + checkmate checker per tx).
+  The realistic route is **ZK-proven chess**: prove off-chain "this signed move sequence is legal
+  and ends in checkmate for X", verify the proof on-chain via `OpZkPrecompile` (live post-Toccata,
+  opcode 166). Feasible in principle, but a major R&D project (a chess ZK circuit + prover), so it
+  is the endgame, not a quick change.
+
+So "throw the game into a covenant and drop the oracle" is right in spirit: honest play needs no
+oracle today, abandonment can be made oracle-free next, and only a *contested* result still needs
+either the oracle or a ZK proof. See "Roadmap #3" below.
+
+## Roadmap #3 — removing the oracle (DAA-timeout forfeit → ZK-proven result)
+
+**#3a (feasible next, medium effort) — signed-move channel + DAA-timeout forfeit.** Each move is
+signed by the mover (and countersigned/acked), forming an off-chain hash-chain; DAGmate anchors
+them (existing `anchor()` / `ANCHOR_MOVES`). Settlement gains two oracle-free branches beside v2's:
+(i) **mutual** (both sign the final result — #1), and (ii) **forfeit** — the last-to-move party
+claims after the opponent misses the DAA deadline, the covenant checking `OpTxInputDaaScore`
+against a baked/committed deadline (CLTV/CSV), plus a challenge window in which the opponent can
+post the missing signed move to cancel the forfeit. This removes the oracle for the two common
+non-agreement cases (abandonment / clock-flag) using only proven timelock opcodes. The oracle
+remains ONLY as the fallback for a genuinely contested checkmate — a rare edge.
+
+**#3b (endgame R&D) — ZK-proven result.** Replace even that fallback: a succinct proof that the
+signed move list is a legal game ending in a specific result, verified on-chain by `OpZkPrecompile`.
+Removes the oracle entirely. Large, standalone effort (circuit + prover + integration).
+
+DAA-clock note: the *current* server-authoritative clock (clocks.py, wall-time) stays correct for
+v1/v2 because the oracle arbitrates the result anyway. A DAA clock is only needed for #3a, where a
+timeout must be *provable on-chain* rather than trusted to DAGmate's server time.
 
 ## Verified opcode semantics (rusty-kaspa master, txscript/src/opcodes/mod.rs — NOT the KIPs)
 
