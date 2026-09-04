@@ -267,10 +267,17 @@ async function s5c_output_introspection() {
 //     ELSE (A won)  ... symmetric with msgA / spkA / pkA
 //   ELSE (reclaim)                    witness: <depositorSig> <OP_FALSE>
 //     <reclaimDaa> CHECKLOCKTIMEVERIFY <pkDepositor> CHECKSIG
-function v2SettleRedeem({ pkOracle, msgA, msgB, spkA, spkB, reclaimDaa, pkDepositor, maxFee }) {
+// 3-way settle: A won / B won / DRAW (each escrow pays its OWN depositor back). Witness:
+//   decisive:  <oracleSig64> <winnerSel> <OP_FALSE(isDraw)> <OP_TRUE(settle)>
+//   draw:      <oracleSig64> <OP_FALSE(unused)> <OP_TRUE(isDraw)> <OP_TRUE(settle)>
+//   reclaim:   <depositorSig> <OP_FALSE(settle)>
+// The draw leg OpDrops the unused winnerSel so the stack is clean for CheckSigFromStack.
+function v2SettleRedeem({ pkOracle, msgA, msgB, msgDraw, spkA, spkB, spkDepositor, reclaimDaa, pkDepositor, maxFee }) {
   const sb = new k.ScriptBuilder(core.COVENANT_OPTS);
-  const winnerLeg = (msg, spk) => {
+  const leg = (msg, spk) => {
+    // oracle blessed this outcome:
     sb.addData(msg).addData(pkOracle).addOp(k.Opcodes.OpCheckSigFromStack).addOp(k.Opcodes.OpVerify);
+    // this input's same-index output pays the required party, in full:
     sb.addOp(k.Opcodes.OpTxInputIndex).addOp(k.Opcodes.OpTxOutputSpk).addData(spk).addOp(k.Opcodes.OpEqualVerify);
     // (output[i].amount + maxFee) >= input[i].amount  — no OpSub needed, keeps it to proven ops.
     sb.addOp(k.Opcodes.OpTxInputIndex).addOp(k.Opcodes.OpTxOutputAmount);
@@ -278,32 +285,52 @@ function v2SettleRedeem({ pkOracle, msgA, msgB, spkA, spkB, reclaimDaa, pkDeposi
     sb.addOp(k.Opcodes.OpTxInputIndex).addOp(k.Opcodes.OpTxInputAmount);
     sb.addOp(k.Opcodes.OpGreaterThanOrEqual);
   };
-  sb.addOp(k.Opcodes.OpIf);
-  sb.addOp(k.Opcodes.OpIf);
-  winnerLeg(msgB, spkB);           // B won
-  sb.addOp(k.Opcodes.OpElse);
-  winnerLeg(msgA, spkA);           // A won
+  sb.addOp(k.Opcodes.OpIf);          // settle
+  sb.addOp(k.Opcodes.OpIf);          //   isDraw
+  sb.addOp(k.Opcodes.OpDrop);        //     drop the unused winnerSel
+  leg(msgDraw, spkDepositor);        //     DRAW: pay THIS escrow's depositor back
+  sb.addOp(k.Opcodes.OpElse);        //   decisive
+  sb.addOp(k.Opcodes.OpIf);          //     winnerSel truthy = B won
+  leg(msgB, spkB);
+  sb.addOp(k.Opcodes.OpElse);        //     A won
+  leg(msgA, spkA);
   sb.addOp(k.Opcodes.OpEndIf);
-  sb.addOp(k.Opcodes.OpElse);
+  sb.addOp(k.Opcodes.OpEndIf);
+  sb.addOp(k.Opcodes.OpElse);        // reclaim (14-day CLTV, depositor-signed)
   sb.addI64(BigInt(reclaimDaa)).addOp(k.Opcodes.OpCheckLockTimeVerify);
   sb.addData(pkDepositor).addOp(k.Opcodes.OpCheckSig);
   sb.addOp(k.Opcodes.OpEndIf);
   return sb.drain();
 }
 
-/** Build the fixed match constants for a v2 escrow the way escrow_v2.js will. */
+/** Build the fixed match constants for a v2 escrow the way escrow_v2.js will. `depKey` is this
+ *  escrow's depositor — it backs BOTH the reclaim branch and the draw-payout destination. */
 function v2Match({ oracleKey, aKey, bKey, depKey, reclaimDaa, maxFee }) {
   const matchTag = randomBytes(32); // = SHA256(matchId ‖ side) in production
   const msgA = sha256(Buffer.concat([matchTag, Buffer.from([0x00])])); // A won
   const msgB = sha256(Buffer.concat([matchTag, Buffer.from([0x01])])); // B won
+  const msgDraw = sha256(Buffer.concat([matchTag, Buffer.from([0x02])])); // draw
   return {
-    matchTag, msgA, msgB,
+    matchTag, msgA, msgB, msgDraw,
     pkOracle: xOnly(oracleKey),
     spkA: outputSpkBytes(aKey.toPublicKey().toAddress(NET).toString()),
     spkB: outputSpkBytes(bKey.toPublicKey().toAddress(NET).toString()),
+    spkDepositor: outputSpkBytes(depKey.toPublicKey().toAddress(NET).toString()),
     pkDepositor: xOnly(depKey),
     reclaimDaa: BigInt(reclaimDaa), maxFee: BigInt(maxFee),
   };
+}
+
+/** Settle witness for the 3-way redeem. outcome: 'A' | 'B' | 'draw'. */
+function v2Witness(sig64, outcome) {
+  const isDraw = outcome === 'draw';
+  const winnerSel = outcome === 'B' ? k.Opcodes.OpTrue : k.Opcodes.OpFalse; // unused for draw
+  return new k.ScriptBuilder(core.COVENANT_OPTS)
+    .addData(sig64)
+    .addOp(winnerSel)
+    .addOp(isDraw ? k.Opcodes.OpTrue : k.Opcodes.OpFalse) // isDraw
+    .addOp(k.Opcodes.OpTrue)                              // settle
+    .drain();
 }
 
 // S6 — the full v2 escrow, HAPPY PATH: oracle blesses B, the claim pays B in full, no arbiter.
@@ -329,13 +356,8 @@ async function s6_full_happy() {
     const fee = 5_000_000n;
     // 1 input ↔ 1 output, output[0] pays the winner B — exactly what the covenant demands.
     const tx = k.createTransaction(entries, [{ address: b.address, amount: total - fee }], fee, undefined, 1);
-    const witness = new k.ScriptBuilder(core.COVENANT_OPTS)
-      .addData(oracleSig)         // bottom
-      .addOp(k.Opcodes.OpTrue)    // winnerSel = B won
-      .addOp(k.Opcodes.OpTrue)    // settle branch
-      .drain();
     const ins = tx.inputs;
-    ins[0].signatureScript = p2shSigScript(redeemHex, witness);
+    ins[0].signatureScript = p2shSigScript(redeemHex, v2Witness(oracleSig, 'B'));
     tx.inputs = ins;
 
     const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false });
@@ -382,8 +404,7 @@ async function s6_adversarial() {
 
     // The one legitimate authorisation that exists: oracle over msgB (B won).
     const sigB = oracleSchnorr(k.signScriptHash(Buffer.from(m.msgB).toString('hex'), oracle.key));
-    const settleWitness = (sig, winnerSelOp) => new k.ScriptBuilder(core.COVENANT_OPTS)
-      .addData(sig).addOp(winnerSelOp).addOp(k.Opcodes.OpTrue).drain();
+    const settleWitness = (sig, winnerSelOp) => v2Witness(sig, winnerSelOp === k.Opcodes.OpTrue ? 'B' : 'A');
 
     await fundFromOperatingAddress(rpc, escrowAddr, DUST);
     const entries = await waitUtxo(rpc, escrowAddr);
@@ -420,6 +441,12 @@ async function s6_adversarial() {
       await trySpend(rpc, redeemHex, entries, payB(total - 5_000_000n), 5_000_000n,
         settleWitness(sigB2, k.Opcodes.OpTrue)));
 
+    // A7 — draw-branch attempt with a WIN signature: the draw leg checks the oracle over msgDraw,
+    //      which nobody signed → reject. Stops a decided game being laundered into a "draw" split.
+    expectReject('A7 draw branch triggered with a win signature',
+      await trySpend(rpc, redeemHex, entries, payB(total - 5_000_000n), 5_000_000n,
+        v2Witness(sigB, 'draw')));
+
     // A6 — the HONEST claim finally releases to B and sweeps the escrow. MUST be accepted.
     const honest = await trySpend(rpc, redeemHex, entries, payB(total - 5_000_000n), 5_000_000n,
       settleWitness(sigB, k.Opcodes.OpTrue));
@@ -432,11 +459,55 @@ async function s6_adversarial() {
   });
 }
 
+// S7 — the DRAW outcome: oracle signs "draw", each escrow pays its OWN depositor back. Here the
+// escrow's depositor is A, so a draw must pay A. Plus draw-specific attacks that must be rejected.
+async function s7_draw() {
+  console.log('S7 — v2 escrow DRAW settle (oracle signs draw → escrow pays its depositor back), dust');
+  let critical = false;
+  const expectReject = (label, r) => {
+    if (r.accepted) { critical = true; console.log(`   ✗ CRITICAL — ${label} was ACCEPTED (${r.id})`); }
+    else console.log(`   ✓ rejected — ${label}  [${r.err}]`);
+  };
+  await core.withRpc(async (rpc) => {
+    const oracle = newKey(), a = newKey(), b = newKey(); // depositor = A → a draw pays A
+    const info = await rpc.getBlockDagInfo();
+    const reclaimDaa = BigInt(info.virtualDaaScore) + 1_000_000n;
+    const maxFee = 10_000_000n;
+    const m = v2Match({ oracleKey: oracle.key, aKey: a.key, bKey: b.key, depKey: a.key, reclaimDaa, maxFee });
+    const redeemHex = v2SettleRedeem(m);
+    const { address: escrowAddr } = p2shFor(redeemHex);
+    console.log('   escrow address:', escrowAddr, ' (depositor = A)');
+
+    const drawSig = oracleSchnorr(k.signScriptHash(Buffer.from(m.msgDraw).toString('hex'), oracle.key));
+    await fundFromOperatingAddress(rpc, escrowAddr, DUST);
+    const entries = await waitUtxo(rpc, escrowAddr);
+    const total = entries.reduce((s, e) => s + BigInt(e.amount), 0n);
+    const payTo = (addr) => [{ address: addr, amount: total - 5_000_000n }];
+
+    // D1 — draw signature used on the WIN-B branch: the B leg checks oracle over msgB → reject.
+    expectReject('D1 draw signature used to claim a win',
+      await trySpend(rpc, redeemHex, entries, payTo(b.address), 5_000_000n, v2Witness(drawSig, 'B')));
+    // D2 — valid draw sig, but the payout goes to B instead of the depositor A → spk check fails.
+    expectReject('D2 draw paid to the wrong party (not the depositor)',
+      await trySpend(rpc, redeemHex, entries, payTo(b.address), 5_000_000n, v2Witness(drawSig, 'draw')));
+
+    // The HONEST draw: pays the depositor A back. MUST be accepted.
+    const honest = await trySpend(rpc, redeemHex, entries, payTo(a.address), 5_000_000n, v2Witness(drawSig, 'draw'));
+    if (honest.accepted) console.log(`   ✓ honest draw settle ACCEPTED (${honest.id})`);
+    else { critical = true; console.log(`   ✗ CRITICAL — the honest draw was REJECTED [${honest.err}]`); }
+
+    if (honest.accepted) { await new Promise((r) => setTimeout(r, 4000)); await sweepBack(rpc, a.address, a.key); }
+    console.log(critical ? 'S7 FAILED — a CRITICAL draw case misbehaved; v2 must NOT ship.'
+                         : 'S7 PASSED — draw pays each depositor back; a draw sig cannot win and a win sig cannot draw.');
+  });
+}
+
 const which = process.argv[2];
 if (which === 'S5a') await s5a_cat_sha();
 else if (which === 'S5b') await s5b_checksigfromstack();
 else if (which === 'S5c') await s5c_output_introspection();
 else if (which === 'S6') await s6_full_happy();
 else if (which === 'S6adv') await s6_adversarial();
-else { console.error('usage: node spikes_covenant.mjs [S5a|S5b|S5c|S6|S6adv]'); process.exit(1); }
+else if (which === 'S7') await s7_draw();
+else { console.error('usage: node spikes_covenant.mjs [S5a|S5b|S5c|S6|S6adv|S7]'); process.exit(1); }
 process.exit(0);

@@ -471,11 +471,20 @@ async def _create_match_from_pair(*, challenge_id, tournament_id, round_no, play
         stake_sompi=stake_sompi, mode=mode, fen=chess_logic.STARTING_FEN,
         escrow_a=None, escrow_b=None, reclaim_daa=reclaim_daa)
     try:
-        escrow_a = await service_client.build_escrow(
-            match_id=match["hd_index"], pk_a=pk_a, pk_b=pk_b, depositor_is_a=True, reclaim_daa=reclaim_daa)
-        escrow_b = await service_client.build_escrow(
-            match_id=match["hd_index"], pk_a=pk_a, pk_b=pk_b, depositor_is_a=False, reclaim_daa=reclaim_daa)
-        db.set_match_escrows(match["id"], escrow_a, escrow_b)
+        if config.ESCROW_V2_ENABLED:
+            # Roadmap #2: KIP-10 covenant escrows. `side` (not depositor_is_a) picks
+            # each escrow's domain tag + reclaim depositor; settlement is arbiter-free.
+            escrow_a = await service_client.build_escrow_v2(
+                match_id=match["hd_index"], pk_a=pk_a, pk_b=pk_b, side="A", reclaim_daa=reclaim_daa)
+            escrow_b = await service_client.build_escrow_v2(
+                match_id=match["hd_index"], pk_a=pk_a, pk_b=pk_b, side="B", reclaim_daa=reclaim_daa)
+            db.set_match_escrows(match["id"], escrow_a, escrow_b, version="v2")
+        else:
+            escrow_a = await service_client.build_escrow(
+                match_id=match["hd_index"], pk_a=pk_a, pk_b=pk_b, depositor_is_a=True, reclaim_daa=reclaim_daa)
+            escrow_b = await service_client.build_escrow(
+                match_id=match["hd_index"], pk_a=pk_a, pk_b=pk_b, depositor_is_a=False, reclaim_daa=reclaim_daa)
+            db.set_match_escrows(match["id"], escrow_a, escrow_b, version="v1")
         return db.get_match(match["id"])
     except ServiceError:
         # Roll the just-created match back rather than leave a zombie with NULL

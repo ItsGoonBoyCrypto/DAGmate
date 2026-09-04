@@ -133,6 +133,11 @@ async def prepare(match_id: str, address: str) -> dict:
     a, b = _players(m)
     if address not in (a["address"], b["address"]):
         raise SettlementError("you're not a player in this match")
+    # Roadmap #2: a v2 (covenant) match settles itself — DAGmate signs the result and the
+    # escrow pays the winner (or, on a draw, each depositor). No player signature, no co-sign
+    # round-trip, so the whole v1 build/sign machinery below is skipped.
+    if (m["escrow_version"] or "v1") == "v2":
+        return await _settle_v2(match_id, m, address, a, b)
     if m["settle_txid"]:
         return _public(m, address, a, b)
 
@@ -339,6 +344,10 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
     a, b = _players(m)
     if address not in (a["address"], b["address"]):
         raise SettlementError("you're not a player in this match")
+    # A v2 match has nothing for a player to sign — it self-settles. A stray submit (a client
+    # that still POSTs one) just triggers or confirms the auto-settle, idempotently.
+    if (m["escrow_version"] or "v1") == "v2":
+        return await _settle_v2(match_id, m, address, a, b)
     if not m["settle_tx_json"]:
         raise SettlementError("nothing prepared to sign — reload and try again")
     if m["settle_txid"]:
@@ -461,4 +470,102 @@ def _public(m: dict, address: str, a: dict, b: dict) -> dict:
         "expectedOutputSompi": str(max(0, pot - fee)),
         "isDraw": is_draw,
         "youWon": you_won,
+    }
+
+
+# ── covenant escrow v2 settlement (roadmap #2) ──────────────────────────────
+# Nothing like the v1 co-sign dance: DAGmate signs the result once and the escrow SCRIPT pays
+# the winner (or, on a draw, each depositor). No tx is stored per-player, no signature is
+# collected — settle is a single server-side action, idempotent and safe to call from either
+# player's poll. Proven end-to-end on mainnet dust (service/spikes_covenant.mjs + test_escrow_v2.mjs).
+
+def _outcome_of(m: dict, a: dict, b: dict) -> str:
+    """'A' | 'B' | 'draw' from the recorded result. A = player_a wins, B = player_b, draw =
+    no winner (agreed draw, or a FIDE insufficient-material flag)."""
+    wid = m["winner_account_id"]
+    if wid is None:
+        return "draw"
+    return "A" if wid == a["id"] else "B"
+
+
+async def _settle_v2(match_id: str, m: dict, address: str, a: dict, b: dict) -> dict:
+    """Sign the verdict and release a v2 match. Returns the public payout state either way.
+
+    Idempotent: if a txid already landed (this player or the other polled first), it reports the
+    paid state without touching the chain. A concurrent double-settle is a double-spend the node
+    rejects — caught here and reported as the success it is, exactly like v1's broadcast guard."""
+    if m["settle_txid"]:
+        return _public_v2(m, address, a, b)
+
+    pot = (m["funded_a_sompi"] or 0) + (m["funded_b_sompi"] or 0)
+    if pot and pot < 2 * config.SETTLE_V2_FEE_SOMPI_PER_INPUT:
+        raise SettlementError(
+            "this pot is smaller than the Kaspa network fee needed to release it, so there is "
+            "nothing to claim — the match still stands as an on-chain record")
+    if not m["escrow_a_address"] or not m["escrow_b_address"]:
+        raise SettlementError("this match has no escrow addresses — it was created while the "
+                              "Kaspa service was unreachable")
+
+    outcome = _outcome_of(m, a, b)
+    # The verdict is the ONLY thing DAGmate signs. Kept and published (settle_v2_verdict_json) so
+    # the winner or anyone can relay the settle even if DAGmate never does — the v2 escape hatch.
+    verdict = await service_client.oracle_sign_result(match_id=m["hd_index"], outcome=outcome)
+    escrows = [
+        {"address": m["escrow_a_address"], "redeemHex": m["escrow_a_redeem_hex"], "side": "A"},
+        {"address": m["escrow_b_address"], "redeemHex": m["escrow_b_redeem_hex"], "side": "B"},
+    ]
+    try:
+        res = await service_client.settle_v2(
+            match_id=m["hd_index"], escrows=escrows, outcome=outcome,
+            pk_a=a["pubkey"], pk_b=b["pubkey"], sig_a=verdict["sigA"], sig_b=verdict["sigB"])
+    except service_client.ServiceError as e:
+        current = db.get_match(match_id)
+        if current["settle_txid"]:
+            return _public_v2(current, address, a, b)  # someone else settled first — success
+        raise SettlementError(str(e))
+    # Guarded write: only the first settle records. A loser of the race read the txid above.
+    if not db.mark_v2_settled(match_id, res["txid"], json.dumps(verdict)):
+        log.info(f"v2 settle for {match_id} raced — keeping the first txid")
+    return _public_v2(db.get_match(match_id), address, a, b)
+
+
+def _public_v2(m: dict, address: str, a: dict, b: dict) -> dict:
+    """What the browser needs for a v2 match's payout panel. There is nothing to sign, so the
+    shape mirrors a v1 already-broadcast settle: an amount and a txid, plus flags so the UI can
+    say 'paid automatically'."""
+    is_draw = m["winner_account_id"] is None
+    you_won = (not is_draw
+               and (a if m["winner_account_id"] == a["id"] else b)["address"] == address)
+    fee_per = config.SETTLE_V2_FEE_SOMPI_PER_INPUT
+    pot = (m["funded_a_sompi"] or 0) + (m["funded_b_sompi"] or 0)
+    fee = fee_per * 2  # one input per escrow
+    if is_draw:
+        # Each depositor gets their OWN stake back, minus that one input's fee.
+        mine = (m["funded_a_sompi"] if address == a["address"] else m["funded_b_sompi"]) or 0
+        payout = max(0, mine - fee_per)
+    elif you_won:
+        payout = max(0, pot - fee)
+    else:
+        payout = 0
+    verdict = json.loads(m["settle_v2_verdict_json"]) if m["settle_v2_verdict_json"] else None
+    return {
+        "state": "broadcast" if m["settle_txid"] else "settling",
+        "txid": m["settle_txid"],
+        "escrowVersion": "v2",
+        "autoSettled": True,          # no player signature — the covenant paid out
+        "mySignatureInputs": [],       # nothing to sign, ever
+        "waitingOnOpponent": False,
+        "isDraw": is_draw,
+        "youWon": you_won,
+        "potKas": pot / config.SOMPI_PER_KAS,
+        "networkFeeKas": fee / config.SOMPI_PER_KAS,
+        "platformFeeKas": 0.0,
+        "payoutKas": payout / config.SOMPI_PER_KAS,
+        "potSompi": str(pot),
+        "networkFeeSompi": str(fee),
+        "platformFeeSompi": "0",
+        "payoutSompi": str(payout),
+        # The published oracle verdict — the escape hatch that lets the pot be released without
+        # DAGmate. Surfaced so the UI (or a determined player) can relay it if we ever don't.
+        "verdict": verdict,
     }

@@ -724,9 +724,26 @@
     if (!s) return;
 
     if (s.state === "broadcast") {
-      el.innerHTML = `<div class="claim-title">Paid out</div>
-        <div class="claim-amount">${kasFromSompi(s.payoutSompi)} KAS</div>
-        <div class="claim-note">Released on chain. Transaction <code>${esc(s.txid)}</code>.</div>`;
+      // v2 (covenant) matches settle themselves — the loser polls too and sees payout 0, so the
+      // wording is outcome-aware rather than a blanket "Paid out".
+      const title = s.autoSettled
+        ? (s.isDraw ? "Draw — settled" : s.youWon ? "You won — paid out" : "Game settled")
+        : "Paid out";
+      const showAmount = !(s.autoSettled && !s.youWon && !s.isDraw); // hide "0 KAS" from the loser
+      const note = s.autoSettled
+        ? `${(s.youWon || s.isDraw) ? "Released automatically — no signing needed. " : ""}`
+          + `Transaction <code>${esc(s.txid)}</code>.`
+        : `Released on chain. Transaction <code>${esc(s.txid)}</code>.`;
+      el.innerHTML = `<div class="claim-title">${title}</div>
+        ${showAmount ? `<div class="claim-amount">${kasFromSompi(s.payoutSompi)} KAS</div>` : ""}
+        <div class="claim-note">${note}</div>`;
+      return;
+    }
+    // v2 in-flight (should be brief — the settle is synchronous): don't fall through to the v1
+    // "sign & release" UI, which a covenant match never uses.
+    if (s.autoSettled || s.state === "settling") {
+      el.innerHTML = `<div class="claim-title">Releasing the pot…</div>
+        <div class="claim-note">This match settles automatically — no signing needed.</div>`;
       return;
     }
     // cosignAsk: the loser confirming an honest result — they release the pot to

@@ -190,6 +190,14 @@ def ensure_schema():
         _add_column(c, "matches", "settle_prepared_ts", "INTEGER")
         _add_column(c, "matches", "settle_txid", "TEXT")
         _add_column(c, "matches", "settle_broadcast_ts", "INTEGER")
+        # Which escrow scheme this match uses — roadmap #2. NULL / 'v1' = the
+        # 2-of-3 P2SH (all pre-#2 rows); 'v2' = the KIP-10 covenant. Set once at
+        # match creation and NEVER changed, so a match settles on the scheme it
+        # was built with regardless of how the flag is toggled later.
+        _add_column(c, "matches", "escrow_version", "TEXT")
+        # The oracle's published verdict for a v2 win (JSON: winner + sigA/sigB),
+        # so the winner or anyone can relay the settle even if DAGmate won't.
+        _add_column(c, "matches", "settle_v2_verdict_json", "TEXT")
 
         # Draw offers. `draw_offer_by` is the standing offer (NULL = none);
         # `draw_offer_ply` is the move number it was made at and is NOT cleared
@@ -651,12 +659,28 @@ def mark_reclaim_broadcast(match_id: str, side: str, txid: str) -> bool:
         return cur.rowcount == 1
 
 
-def set_match_escrows(match_id: str, escrow_a: dict, escrow_b: dict):
+def set_match_escrows(match_id: str, escrow_a: dict, escrow_b: dict, version: str = "v1"):
+    """Store both escrow addresses/redeems and pin the escrow scheme. `version`
+    is written once at creation and never changed — a match settles on the
+    scheme it was built with (roadmap #2)."""
     with _lock, _conn() as c:
         c.execute("UPDATE matches SET escrow_a_address=?, escrow_a_redeem_hex=?, "
-                   "escrow_b_address=?, escrow_b_redeem_hex=? WHERE id=?",
+                   "escrow_b_address=?, escrow_b_redeem_hex=?, escrow_version=? WHERE id=?",
                    (escrow_a.get("address"), escrow_a.get("redeemHex"),
-                    escrow_b.get("address"), escrow_b.get("redeemHex"), match_id))
+                    escrow_b.get("address"), escrow_b.get("redeemHex"), version, match_id))
+
+
+def mark_v2_settled(match_id: str, txid: str, verdict_json: str) -> bool:
+    """Record a v2 covenant settlement: the on-chain txid and the oracle verdict
+    that authorised it. Guarded on settle_txid IS NULL so only the first
+    settle for a match records — a re-trigger (poll, retry) that races an
+    already-landed settle is a harmless no-op, not a double-pay."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET settle_txid=?, settle_v2_verdict_json=?, settle_broadcast_ts=? "
+            "WHERE id=? AND settle_txid IS NULL",
+            (txid, verdict_json, int(time.time()), match_id))
+        return cur.rowcount == 1
 
 
 # ── tournaments ──────────────────────────────────────────────────────────

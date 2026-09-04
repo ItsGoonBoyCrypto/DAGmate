@@ -13,6 +13,7 @@
 import { randomBytes } from 'node:crypto';
 import express from 'express';
 import * as escrow from './escrow.js';
+import * as escrowV2 from './escrow_v2.js';
 import * as core from './core.js';
 import * as auth from './auth.js';
 
@@ -66,6 +67,12 @@ app.post('/escrow/reclaim-unsigned', wrap((req) => escrow.buildReclaimUnsigned(r
 app.post('/escrow/reclaim-broadcast', wrap((req) => escrow.broadcastReclaim(req.body)));
 
 app.post('/escrow/anchor', wrap((req) => escrow.anchor(req.body)));
+
+// ── covenant escrow v2 (roadmap #2). Reclaim reuses /escrow/reclaim-* with the
+// v2 redeemHex — the ELSE branch is byte-identical to v1, so no v2 reclaim route.
+app.post('/escrow-v2/build', wrap((req) => escrowV2.buildEscrowV2(req.body)));
+app.post('/escrow-v2/oracle-sign', wrap((req) => escrowV2.oracleSignResult(req.body)));
+app.post('/escrow-v2/settle', wrap((req) => escrowV2.settleV2(req.body)));
 
 app.get('/escrow/daa', wrap(() => escrow.daaScore()));
 

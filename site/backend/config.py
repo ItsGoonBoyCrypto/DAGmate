@@ -137,6 +137,25 @@ SETTLE_MUTUAL_ENABLED = os.getenv("DAGMATE_SETTLE_MUTUAL", "0") == "1"
 # for a present loser to read "you lost" and click confirm.
 SETTLE_STALL_SECS = int(os.getenv("DAGMATE_SETTLE_STALL_SECS", "45"))
 
+# ── covenant escrow v2 (settlement_v2.py, roadmap #2 / DAGMATE_COVENANT_V2.md) ──
+# When on, NEW matches build KIP-10 introspection covenants instead of the v1
+# 2-of-3 P2SH. DAGmate becomes a write-once oracle: at game-end it signs "A won"
+# / "B won" and the escrow SCRIPT releases the pot to that winner, in full, with
+# no arbiter co-sign and no player signature — the winner is paid automatically.
+#
+# OFF by default, and per-match: a match records its escrow_version at creation
+# and NEVER switches, so flipping this only affects matches created afterwards;
+# in-flight v1 matches finish on v1. Enable only after the v2 full-flow is proven
+# on the target network (the opcode primitives + settle + adversarial matrix are
+# already proven on mainnet dust — see service/spikes_covenant.mjs).
+ESCROW_V2_ENABLED = os.getenv("DAGMATE_ESCROW_V2", "0") == "1"
+# ⚠️ MUST match SETTLE_V2_FEE_SOMPI_PER_INPUT / SETTLE_V2_MAXFEE_SOMPI in
+# service/escrow_v2.js — duplicated for the same reason as the v1 settle fee
+# (the backend quotes/gates before the sidecar builds). The covenant rejects an
+# output below input − MAXFEE, so FEE must stay < MAXFEE.
+SETTLE_V2_FEE_SOMPI_PER_INPUT = 5_000_000
+SETTLE_V2_MAXFEE_SOMPI = 15_000_000
+
 # ── reclaim (reclaim.py) ────────────────────────────────────────────────
 # ⚠️ MUST match RECLAIM_FEE_SOMPI_PER_INPUT in service/escrow.js. Same reason
 # as the settle fee above: the backend quotes the payout before the sidecar

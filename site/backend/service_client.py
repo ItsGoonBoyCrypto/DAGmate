@@ -106,6 +106,36 @@ async def settle_broadcast_mutual(*, tx_json: str, escrows: list[dict], sigs_a: 
     })
 
 
+async def build_escrow_v2(*, match_id: str, pk_a: str, pk_b: str, side: str, reclaim_daa: int) -> dict:
+    """Build one player's v2 covenant escrow (roadmap #2). `side` is 'A' or 'B'
+    (which escrow); the reclaim branch is byte-identical to v1, so a stranded v2
+    escrow reclaims through the existing /escrow/reclaim-* routes."""
+    return await _post("/escrow-v2/build", {
+        "matchId": match_id, "pkA": pk_a, "pkB": pk_b, "side": side, "reclaimDaa": reclaim_daa,
+    })
+
+
+async def oracle_sign_result(*, match_id: str, outcome: str) -> dict:
+    """The oracle's signed verdict for a decided v2 match — {outcome, sigA, sigB}.
+    The ONE thing DAGmate produces to settle; publish it so the winner (or
+    anyone) can relay the settle even if DAGmate never does. `outcome` is
+    'A', 'B' or 'draw'."""
+    return await _post("/escrow-v2/oracle-sign", {"matchId": match_id, "outcome": outcome})
+
+
+async def settle_v2(*, match_id: str, escrows: list[dict], outcome: str, pk_a: str, pk_b: str,
+                    sig_a: str, sig_b: str) -> dict:
+    """Build AND submit a v2 settle — no player signature, the covenant pays the
+    winner (or, on a draw, each depositor back). Returns {txid, potSompi,
+    feeSompi, outcome}. Idempotent at the chain level (a re-submit of an
+    already-spent escrow is a double-spend the node rejects — caller checks for
+    a prior txid)."""
+    return await _post("/escrow-v2/settle", {
+        "matchId": match_id, "escrows": escrows, "outcome": outcome,
+        "pkA": pk_a, "pkB": pk_b, "sigA": sig_a, "sigB": sig_b,
+    })
+
+
 async def extract_sigs(*, signed_tx_json: str, indexes: list[int]) -> dict:
     """Pull the raw player signatures back out of the given inputs of a
     wallet-signed tx. Returns {"sigs": {"<index>": "<hex>"}}."""
