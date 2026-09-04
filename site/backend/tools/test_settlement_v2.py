@@ -163,6 +163,37 @@ async def main() -> int:
     check("error reaches the player", await err(settlement.prepare(mid, a["address"])), "node unreachable")
     check("no txid recorded", db.get_match(mid)["settle_txid"], None)
 
+    # ── parametrised sweep: every outcome × a range of stakes, from both players' viewpoints ──
+    print("SWEEP: outcome × stake × viewpoint — payout math and settle args on every combination")
+    stakes = [1, 5, 10, 137, 1000, 1_000_000]  # KAS, incl. an odd value and the max
+    for kas in stakes:
+        stake = kas * config.SOMPI_PER_KAS
+        pot = 2 * stake
+        for winner in ("a", "b", None):
+            stub_sidecar(settle_txid=f"tx-{kas}-{winner}")
+            mid, a, b = new_v2_match(winner=winner, stake=stake)
+            outcome = {"a": "A", "b": "B", None: "draw"}[winner]
+            # settle from A's viewpoint (any player triggers the same server-side settle)
+            pa = await settlement.prepare(mid, a["address"])
+            pb = await settlement.prepare(mid, b["address"])  # idempotent second view
+            tag = f"{kas}KAS/{outcome}"
+            check(f"[{tag}] oracle signed the right outcome", _calls["sign"][0]["outcome"], outcome)
+            check(f"[{tag}] settle used the right outcome", _calls["settle"][0]["outcome"], outcome)
+            check(f"[{tag}] settled exactly once (idempotent across both views)", len(_calls["settle"]), 1)
+            check(f"[{tag}] txid persisted", pa["txid"], f"tx-{kas}-{winner}")
+            if outcome == "draw":
+                check(f"[{tag}] A refunded stake-fee", pa["payoutSompi"], str(stake - FEE))
+                check(f"[{tag}] B refunded stake-fee", pb["payoutSompi"], str(stake - FEE))
+                check(f"[{tag}] both flagged draw", (pa["isDraw"], pb["isDraw"]), (True, True))
+            else:
+                winner_addr, loser_addr = (a, b) if outcome == "A" else (b, a)
+                pw = pa if winner_addr is a else pb
+                pl = pb if winner_addr is a else pa
+                check(f"[{tag}] winner paid pot-2fee", pw["payoutSompi"], str(pot - 2 * FEE))
+                check(f"[{tag}] winner youWon", pw["youWon"], True)
+                check(f"[{tag}] loser paid nothing", pl["payoutSompi"], "0")
+                check(f"[{tag}] loser youWon False", pl["youWon"], False)
+
     print()
     if _failures:
         print(f"{len(_failures)} FAILED: {', '.join(_failures)}")

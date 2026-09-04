@@ -108,9 +108,10 @@ async function scenario(matchId, outcome) {
 }
 
 async function main() {
-  await scenario(424201, 'B');    // decisive: winner takes the pot
+  await scenario(424201, 'B');    // decisive: player B wins
+  await scenario(424203, 'A');    // decisive: player A wins (the other leg)
   await scenario(424202, 'draw'); // draw: each depositor back (2-in ↔ 2-out binding)
-  console.log(failures === 0 ? '\nESCROW_V2 E2E PASSED — decisive + draw both settle correctly via the production module.'
+  console.log(failures === 0 ? '\nESCROW_V2 E2E PASSED — win-A, win-B and draw all settle correctly via the production module.'
                              : `\n${failures} CHECK(S) FAILED`);
   return failures === 0 ? 0 : 1;
 }
