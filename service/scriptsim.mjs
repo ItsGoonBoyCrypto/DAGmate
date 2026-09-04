@@ -94,6 +94,8 @@ export function run(script, witness = [], ctx = {}) {
         case 'OpSub': need(2); { const b = bytesToNum(s.pop()), a = bytesToNum(s.pop()); s.push(numToBytes(a - b)); } break;
         case 'OpGreaterThanOrEqual': need(2); { const b = bytesToNum(s.pop()), a = bytesToNum(s.pop()); s.push(a >= b ? numToBytes(1) : Buffer.alloc(0)); } break;
         case 'OpLessThanOrEqual': need(2); { const b = bytesToNum(s.pop()), a = bytesToNum(s.pop()); s.push(a <= b ? numToBytes(1) : Buffer.alloc(0)); } break;
+        case 'OpGreaterThan': need(2); { const b = bytesToNum(s.pop()), a = bytesToNum(s.pop()); s.push(a > b ? numToBytes(1) : Buffer.alloc(0)); } break;
+        case 'OpLessThan': need(2); { const b = bytesToNum(s.pop()), a = bytesToNum(s.pop()); s.push(a < b ? numToBytes(1) : Buffer.alloc(0)); } break;
         case 'OpBin2Num': need(1); s.push(numToBytes(bytesToNum(s.pop()))); break;
         case 'OpNum2Bin': need(2); { const size = Number(bytesToNum(s.pop())); const n = bytesToNum(s.pop()); const raw = numToBytes(n); if (raw.length > size) throw new Error('OpNum2Bin overflow'); const out = Buffer.alloc(size); raw.copy(out); s.push(out); } break;
         // ── mocked crypto / introspection (stack effect + ctx predicate) ──

@@ -200,8 +200,89 @@ async function s9() {
   });
 }
 
+// The S10 PENDING-FORFEIT covenant (optimistic challenge window), validated in dev_s10.mjs.
+// Baked: spkX, spkY, claimedPly, W, pkA, pkB, matchTag, maxFee.
+//   FINALIZE: witness [OP_TRUE]  — X after DAA ≥ (pending UTXO DAA)+W.
+//   CANCEL:   witness [sigA' sigB' ply' OP_FALSE] — Y with a newer co-signed checkpoint.
+function pendingLeg({ spkX, spkY, claimedPly, W, pkA, pkB, matchTag, maxFee }) {
+  return [
+    'OpIf',
+      'OpTxInputIndex', 'OpTxInputDaaScore', numToBytes(W), 'OpAdd', 'OpCheckLockTimeVerify',
+      'OpTxInputIndex', 'OpTxOutputSpk', Buffer.from(spkX), 'OpEqualVerify',
+      'OpTxInputIndex', 'OpTxOutputAmount', numToBytes(maxFee), 'OpAdd', 'OpTxInputIndex', 'OpTxInputAmount', 'OpGreaterThanOrEqual',
+    'OpElse',
+      Buffer.from(matchTag), numToBytes(1), 'OpPick', 'OpCat', 'OpSHA256',
+      numToBytes(2), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkB), 'OpCheckSigFromStack', 'OpVerify',
+      numToBytes(3), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkA), 'OpCheckSigFromStack', 'OpVerify',
+      'OpDrop', 'OpNip', 'OpNip',
+      numToBytes(claimedPly), 'OpGreaterThan', 'OpVerify',
+      'OpTxInputIndex', 'OpTxOutputSpk', Buffer.from(spkY), 'OpEqualVerify',
+      'OpTxInputIndex', 'OpTxOutputAmount', numToBytes(maxFee), 'OpAdd', 'OpTxInputIndex', 'OpTxInputAmount', 'OpGreaterThanOrEqual',
+    'OpEndIf',
+  ];
+}
+
+async function s10() {
+  console.log('S10 — pending-forfeit covenant (optimistic challenge window), mainnet dust');
+  let critical = false;
+  const expect = (label, r, want) => { const good = r.accepted === want; if (!good) critical = true; console.log(`   ${good ? 'ok ' : 'BAD'} ${label} → ${r.accepted ? 'ACCEPTED ' + (r.id || '') : 'rejected [' + r.err + ']'}`); };
+  await core.withRpc(async (rpc) => {
+    const X = newKey(), Y = newKey(); // A=X claimant, B=Y canceller
+    const matchTag = randomBytes(32), claimedPly = 40n, W = 30n;
+    const consts = { spkX: outputSpkBytes(X.address), spkY: outputSpkBytes(Y.address), claimedPly, W, pkA: xOnly(X.key), pkB: xOnly(Y.key), matchTag, maxFee: 15_000_000n };
+    const redeemHex = buildScript(pendingLeg(consts));
+    const pendAddr = p2shFor(redeemHex); console.log('   pending covenant:', pendAddr);
+    const num = (n) => Buffer.from(numToBytes(BigInt(n)));
+    const signCp = (ply) => { const h = sha256(Buffer.concat([Buffer.from(matchTag), num(ply)])); return { sigA: signHash(h, X.key), sigB: signHash(h, Y.key) }; };
+
+    // fund TWO pending UTXOs (one for cancel, one for finalize) in one tx
+    const { address: opAddr, key: opKey } = core.operatingAddress();
+    const { entries: opE } = await rpc.getUtxosByAddresses({ addresses: [opAddr] });
+    const { transactions } = await k.createTransactions({ entries: opE, outputs: [{ address: pendAddr, amount: DUST }, { address: pendAddr, amount: DUST }], changeAddress: opAddr, priorityFee: 20_000_000n, networkId: NETWORK_ID });
+    for (const tx of transactions) { tx.sign([opKey]); await tx.submit(rpc); }
+    const all = await waitUtxo(rpc, pendAddr); // 2 utxos
+    while ((await rpc.getUtxosByAddresses({ addresses: [pendAddr] })).entries.length < 2) await new Promise((r) => setTimeout(r, 3000));
+    const utxos = (await rpc.getUtxosByAddresses({ addresses: [pendAddr] })).entries;
+    const u1 = [utxos[0]], u2 = [utxos[1]];
+
+    const spendCancel = async (input, ply, sigs, payAddr) => {
+      const total = BigInt(input[0].amount), fee = 5_000_000n;
+      const tx = k.createTransaction(input, [{ address: payAddr, amount: total - fee }], fee, undefined, 4);
+      const ins = tx.inputs; ins[0].signatureScript = p2shSig(redeemHex, [sigs.sigA, sigs.sigB, num(ply), Buffer.alloc(0)]); tx.inputs = ins;
+      try { const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false }); return { accepted: true, id: String(resp.transactionId ?? resp) }; }
+      catch (e) { return { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 300) }; }
+    };
+    const spendFinalize = async (input, lockTime, payAddr) => {
+      const total = BigInt(input[0].amount), fee = 5_000_000n;
+      const tx = k.createTransaction(input, [{ address: payAddr, amount: total - fee }], fee, undefined, 2);
+      tx.lockTime = BigInt(lockTime); const ins = tx.inputs; ins[0].sequence = 0n; ins[0].signatureScript = p2shSig(redeemHex, [numToBytes(1)]); tx.inputs = ins;
+      try { const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false }); return { accepted: true, id: String(resp.transactionId ?? resp) }; }
+      catch (e) { return { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 300) }; }
+    };
+
+    // ── CANCEL branch on u1 ──
+    expect('cancel STALE (ply==claimed)', await spendCancel(u1, claimedPly, signCp(claimedPly), Y.address), false);
+    expect('cancel forged co-sig', await spendCancel(u1, 42n, { ...signCp(42n), sigB: randomBytes(64) }, Y.address), false);
+    expect('cancel pays X not Y', await spendCancel(u1, 42n, signCp(42n), X.address), false);
+    expect('cancel NEWER (ply>claimed) pays Y', await spendCancel(u1, 42n, signCp(42n), Y.address), true);
+
+    // ── FINALIZE branch on u2 ──
+    const inDaa = BigInt(u2[0].blockDaaScore);
+    expect('finalize BEFORE window', await spendFinalize(u2, inDaa + W, Y.address), false); // also wrong payee, but window not open yet
+    console.log(`   waiting for the ${W}-DAA window to pass...`);
+    for (;;) { const now = BigInt((await rpc.getBlockDagInfo()).virtualDaaScore); if (now >= inDaa + W) break; await new Promise((r) => setTimeout(r, 3000)); }
+    const fin = await spendFinalize(u2, inDaa + W, X.address);
+    expect('finalize AFTER window pays X', fin, true);
+
+    await new Promise((r) => setTimeout(r, 4000));
+    await sweepBack(rpc, Y.address, Y.key); await sweepBack(rpc, X.address, X.key);
+    console.log(critical ? 'S10 FAILED.' : 'S10 PASSED — pending-forfeit covenant: finalize-after-window + cancel-by-newer-state both work; stale/forged/wrong-payee/early rejected.');
+  });
+}
+
 const which = process.argv[2];
 if (which === 'S8') await s8();
 else if (which === 'S9') await s9();
-else { console.error('usage: node spikes_forfeit.mjs [S8|S9]'); process.exit(1); }
+else if (which === 'S10') await s10();
+else { console.error('usage: node spikes_forfeit.mjs [S8|S9|S10]'); process.exit(1); }
 process.exit(0);
