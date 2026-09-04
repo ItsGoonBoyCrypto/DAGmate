@@ -130,7 +130,78 @@ async function s8() {
   });
 }
 
+// The S9 leg (C + bounded unilateral move M), exactly the token list validated in dev_s9.mjs.
+// Witness (bottom→top): B, D_C, turn, D_M, sigCA, sigCB, sigM.
+function forfeitLegS9({ matchTag, pkA, pkB, spkA, spkB, maxFee, increment }) {
+  return [
+    Buffer.from(matchTag), numToBytes(6), 'OpPick', 'OpCat', numToBytes(5), 'OpPick', 'OpCat', numToBytes(7), 'OpPick', 'OpCat', 'OpSHA256',
+    numToBytes(2), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkB), 'OpCheckSigFromStack', 'OpVerify',
+    numToBytes(3), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkA), 'OpCheckSigFromStack', 'OpVerify',
+    numToBytes(4), 'OpPick', 'OpCat', 'OpSHA256',
+    numToBytes(1), 'OpPick', numToBytes(1), 'OpPick',
+    numToBytes(7), 'OpPick', Buffer.from([0x02]), 'OpEqual', 'OpIf', Buffer.from(pkB), 'OpElse', Buffer.from(pkA), 'OpEndIf',
+    'OpCheckSigFromStack', 'OpVerify',
+    'OpDrop', 'OpDrop', 'OpDrop', 'OpDrop',
+    numToBytes(2), 'OpPick', numToBytes(4), 'OpPick', 'OpAdd', numToBytes(increment), 'OpAdd',
+    numToBytes(1), 'OpPick', 'OpSwap', 'OpGreaterThanOrEqual', 'OpVerify',
+    'OpCheckLockTimeVerify', 'OpNip', 'OpNip',
+    Buffer.from([0x01]), 'OpEqual', 'OpIf', Buffer.from(spkA), 'OpElse', Buffer.from(spkB), 'OpEndIf',
+    'OpTxInputIndex', 'OpTxOutputSpk', 'OpEqualVerify',
+    'OpTxInputIndex', 'OpTxOutputAmount', numToBytes(maxFee), 'OpAdd', 'OpTxInputIndex', 'OpTxInputAmount', 'OpGreaterThanOrEqual',
+  ];
+}
+
+async function trySpendS9(rpc, redeemHex, entries, payAddr, witnessNums, sigs) {
+  const total = entries.reduce((s, e) => s + BigInt(e.amount), 0n); const fee = 5_000_000n;
+  const tx = k.createTransaction(entries, [{ address: payAddr, amount: total - fee }], fee, undefined, 5); // 3 sigs → more compute
+  tx.lockTime = BigInt(witnessNums.D_M);
+  const num = (n) => Buffer.from(numToBytes(BigInt(n)));
+  const ins = tx.inputs; ins[0].sequence = 0n;
+  ins[0].signatureScript = p2shSig(redeemHex, [num(witnessNums.B), num(witnessNums.D_C), Buffer.from([witnessNums.turn]), num(witnessNums.D_M), sigs.sigCA, sigs.sigCB, sigs.sigM]);
+  tx.inputs = ins;
+  try { const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false }); return { accepted: true, id: String(resp.transactionId ?? resp) }; }
+  catch (e) { return { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 400) }; }
+}
+
+async function s9() {
+  console.log('S9 — co-signed checkpoint + BOUNDED unilateral move forfeit leg, mainnet dust');
+  let critical = false;
+  const expect = (label, r, wantAccept) => { const good = r.accepted === wantAccept; if (!good) critical = true; console.log(`   ${good ? 'ok ' : 'BAD'} ${label} → ${r.accepted ? 'ACCEPTED ' + (r.id || '') : 'rejected [' + r.err + ']'}`); };
+  await core.withRpc(async (rpc) => {
+    const A = newKey(), B = newKey(); // A = mover X = claimant; B (Y) flagged
+    const matchTag = randomBytes(32); const INCREMENT = 20n, BUD = 1000n, turn = 0x01;
+    const consts = { matchTag, pkA: xOnly(A.key), pkB: xOnly(B.key), spkA: outputSpkBytes(A.address), spkB: outputSpkBytes(B.address), maxFee: 15_000_000n, increment: INCREMENT };
+    const redeemHex = buildScript(forfeitLegS9(consts));
+    const escrowAddr = p2shFor(redeemHex); console.log('   escrow:', escrowAddr);
+    const info = await rpc.getBlockDagInfo(); const nowDaa = BigInt(info.virtualDaaScore);
+    const num = (n) => Buffer.from(numToBytes(BigInt(n)));
+    const sign = (D_C, D_M) => {
+      const hC = sha256(Buffer.concat([Buffer.from(matchTag), num(D_C), Buffer.from([turn]), num(BUD)]));
+      const hM = sha256(Buffer.concat([hC, num(D_M)]));
+      return { sigCA: signHash(hC, A.key), sigCB: signHash(hC, B.key), sigM: signHash(hM, A.key) };
+    };
+    await fundFrom(rpc, escrowAddr, DUST); const entries = await waitUtxo(rpc, escrowAddr);
+
+    // honest: D_M = D_C + BUD + INC (min allowed), all past so CLTV/finality OK
+    const D_M = nowDaa - 200n, D_C = D_M - BUD - INCREMENT;
+    let s = sign(D_C, D_M);
+    // 1) SHORT deadline steal: D_M' < D_C+BUD+INC → lower bound rejects
+    const shortDM = D_C + 10n; const ss = sign(D_C, shortDM);
+    expect('short-deadline steal (D_M < bound)', await trySpendS9(rpc, redeemHex, entries, A.address, { B: BUD, D_C, turn, D_M: shortDM }, ss), false);
+    // 2) forged M sig → reject
+    expect('forged move signature', await trySpendS9(rpc, redeemHex, entries, A.address, { B: BUD, D_C, turn, D_M }, { ...s, sigM: randomBytes(64) }), false);
+    // 3) pay the flagger B instead of the claimant A → reject
+    expect('paid the flagger not the claimant', await trySpendS9(rpc, redeemHex, entries, B.address, { B: BUD, D_C, turn, D_M }, s), false);
+    // 4) HONEST bounded forfeit → accept
+    const honest = await trySpendS9(rpc, redeemHex, entries, A.address, { B: BUD, D_C, turn, D_M }, s);
+    expect('honest bounded forfeit (pays claimant A)', honest, true);
+    if (honest.accepted) { await new Promise((r) => setTimeout(r, 4000)); await sweepBack(rpc, A.address, A.key); }
+    console.log(critical ? 'S9 FAILED.' : 'S9 PASSED — bounded unilateral move forfeit works; the short-deadline steal is rejected on-chain.');
+  });
+}
+
 const which = process.argv[2];
 if (which === 'S8') await s8();
-else { console.error('usage: node spikes_forfeit.mjs [S8]'); process.exit(1); }
+else if (which === 'S9') await s9();
+else { console.error('usage: node spikes_forfeit.mjs [S8|S9]'); process.exit(1); }
 process.exit(0);

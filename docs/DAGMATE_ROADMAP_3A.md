@@ -50,16 +50,19 @@ The "latest state" a player holds is either a co-signed `C`, or a `C` + one unil
 
 ### Bounding the unilateral deadline (why the mover can't cheat the clock)
 `M.nextDeadlineDaa` is set by the mover, who could try to make it too short to steal a forfeit. The
-covenant BOUNDS it against the co-signed fields it can trust:
+covenant BOUNDS it against the co-signed fields it can trust — a LOWER bound (proven direction, S9):
 
-    M.nextDeadlineDaa  ≤  C.deadlineDaa + C.budgetOppDaa + INCREMENT_DAA
+    M.nextDeadlineDaa  ≥  C.deadlineDaa + C.budgetOppDaa + INCREMENT_DAA
 
-i.e. the opponent's deadline can be no earlier than "mover used their whole remaining time, then the
+i.e. the opponent's deadline must be at least "mover used their whole remaining time, then the
 opponent gets their full budget + the Fischer increment". `C.deadlineDaa`/`C.budgetOppDaa` are
 co-signed (agreed), `INCREMENT_DAA` is baked in the escrow, and the covenant checks the inequality
 with 8-byte `OpAdd`/`OpGreaterThanOrEqual`. Result: the bound is *generous to the opponent* (never
-too short), so the mover cannot shorten the opponent's clock — the worst they can do is give the
-opponent slightly MORE time than strictly owed. Oracle-free and sound.
+too short — the mover is forced to grant at least the maximum fair deadline), so the mover cannot
+shorten the opponent's clock; the worst they can do is give the opponent slightly MORE time than
+strictly owed. ⚠️ It MUST be `≥` — an `≤` (upper) bound would let the mover set a *short* deadline
+and steal, which is exactly the S9 "short-deadline steal" adversarial case (rejected on dust).
+Oracle-free and sound.
 
 ### The FORFEIT covenant leg (new, beside win-A / win-B / draw / reclaim)
 Witness to claim a forfeit for `claimant` (the player still active), presenting `C` (+ optional `M`):
