@@ -157,21 +157,44 @@ async function phaseDraw(wA, wB) {
   ok(afterA > beforeA && afterB > beforeB, `both depositors refunded (A ${beforeA}→${afterA}, B ${beforeB}→${afterB})`);
 }
 
+// Free play needs no funding, no escrow, no sidecar — just two logged-in players.
+async function phaseFree(wA, wB) {
+  console.log('\n── free play: 0-stake match, live instantly, no escrow, no settlement ──');
+  const m = await makeMatch(wA, wB, 0);
+  ok(m.isFree === true, 'match flagged free');
+  ok(m.status === 'live', 'free match is LIVE immediately (no deposit phase)');
+  ok(!m.escrowA && !m.escrowB, 'free match has no escrows');
+  const end = await playFoolsMate(m.id, wA, wB);
+  ok(end.status === 'settled' && end.winnerAccountId === wB.id, 'played to a result, B wins');
+  const s = await api('POST', `/api/matches/${m.id}/settle/prepare`, { token: wB.token });
+  ok(s.state === 'free' && s.payoutSompi === '0', 'settle returns a free result — no pot, no signing');
+  ok(s.youWon === true, 'winner told they won (no payout)');
+}
+
 async function main() {
+  const only = process.argv[2]; // 'free' → free-play only (no funding)
   const meta = await api('GET', '/api/meta');
-  console.log(`   backend: ${API}  network=${meta.network}`);
-  const wallets = [newWallet('A1'), newWallet('B1'), newWallet('A2'), newWallet('B2')];
-  await fundWallets(wallets, 3n * SOMPI); // 3 KAS each: 2 stake + fees
+  console.log(`   backend: ${API}  network=${meta.network}${only ? `  phase=${only}` : ''}`);
+  if (only === 'free') {
+    const [wA, wB] = [newWallet('F1'), newWallet('F2')];
+    await login(wA); await login(wB);
+    await phaseFree(wA, wB);
+    console.log(`\n${FAIL === 0 ? 'FREE-PLAY HTTP-FLOW PASSED' : `${FAIL} FAILED: ${FAILURES.join(', ')}`}  (${PASS} ok)`);
+    return FAIL === 0 ? 0 : 1;
+  }
+  const wallets = [newWallet('A1'), newWallet('B1'), newWallet('A2'), newWallet('B2'), newWallet('F1'), newWallet('F2')];
+  await fundWallets(wallets.slice(0, 4), 3n * SOMPI); // only the money phases need funding
   await sleep(4000);
   for (const w of wallets) await login(w);
-  console.log('   4 wallets funded + logged in');
+  console.log('   wallets funded + logged in');
   try {
     await phaseDecisive(wallets[0], wallets[1]);
     await phaseDraw(wallets[2], wallets[3]);
+    await phaseFree(wallets[4], wallets[5]);
   } finally {
     await sweepBack(wallets);
   }
-  console.log(`\n${FAIL === 0 ? 'ESCROW_V2 FULL HTTP-FLOW PASSED' : `${FAIL} FAILED: ${FAILURES.join(', ')}`}  (${PASS} ok)`);
+  console.log(`\n${FAIL === 0 ? 'FULL HTTP-FLOW PASSED (v2 + free)' : `${FAIL} FAILED: ${FAILURES.join(', ')}`}  (${PASS} ok)`);
   return FAIL === 0 ? 0 : 1;
 }
 
