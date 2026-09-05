@@ -541,11 +541,75 @@ async function s11b() {
   });
 }
 
+// ── S11n: prove a move_channel (session-key, noble BIP340) checkpoint settles the covenant on-chain ──
+// Same leg as S11b, but pkA/pkB are SESSION xonly keys and the co-signatures come from
+// move_channel.signCheckpoint — i.e. exactly what a browser client would produce. On-chain accept here
+// closes the loop: off-chain module output == what OpCheckSigFromStack accepts.
+async function s11n() {
+  console.log('S11n — a move_channel session-key checkpoint settles on-chain, mainnet dust');
+  const mc = await import('./move_channel.mjs');
+  let critical = false;
+  const expect = (label, r, want) => { const good = r.accepted === want; if (!good) critical = true; console.log(`   ${good ? 'ok ' : 'BAD'} ${label} → ${r.accepted ? 'ACCEPTED ' + (r.id || '') : 'rejected [' + r.err + ']'}`); };
+  await core.withRpc(async (rpc) => {
+    const Aon = newKey(), Bon = newKey();                 // on-chain payout/sweep keys
+    const As = mc.newSessionKey(), Bs = mc.newSessionKey(); // per-match SESSION keys (checkpoint signers)
+    const pkAsess = Buffer.from(As.xonlyHex, 'hex'), pkBsess = Buffer.from(Bs.xonlyHex, 'hex');
+    const matchTag = randomBytes(32), W = 30n, PLY = 40n, maxFee = 15_000_000n, claimant = mc.CLAIMANT.A;
+    // PA (A finalises) with session pks baked for the cancel branch; payouts to the on-chain addrs.
+    const partsA = pendingFixedParts({ W, pkA: pkAsess, pkB: pkBsess, matchTag, maxFee, spkX: outputSpkBytes(Aon.address), spkY: outputSpkBytes(Bon.address) });
+    const partsB = pendingFixedParts({ W, pkA: pkAsess, pkB: pkBsess, matchTag, maxFee, spkX: outputSpkBytes(Bon.address), spkY: outputSpkBytes(Aon.address) });
+    const redeemA = buildScript([...partsA.prefix, plyFixed(PLY), ...partsA.suffix]);
+    const addrA = p2shFor(redeemA);
+    const prefixA = Buffer.concat([drainBuf(partsA.prefix), Buffer.from([0x02])]), suffixA = drainBuf(partsA.suffix);
+    const prefixB = Buffer.concat([drainBuf(partsB.prefix), Buffer.from([0x02])]), suffixB = drainBuf(partsB.suffix);
+    const redeemHex = buildScript(forfeitLegS11b({ matchTag, pkA: pkAsess, pkB: pkBsess, prefixA, suffixA, prefixB, suffixB, maxFee }));
+    const escrowAddr = p2shFor(redeemHex);
+    console.log(`   escrow leg: ${escrowAddr}\n   PA: ${addrA}`);
+
+    const info = await rpc.getBlockDagInfo(); const past = BigInt(info.virtualDaaScore) - 200n;
+    // THE POINT: co-sign the checkpoint with the SESSION keys via the shared module.
+    const cp = { matchTag, deadlineDaa: past, ply: PLY, claimant };
+    const sigA = Buffer.from(mc.signCheckpoint(cp, As.privHex));
+    const sigB = Buffer.from(mc.signCheckpoint(cp, Bs.privHex));
+    // sanity: they verify off-chain too (what the opponent's client would check)
+    console.log(`   off-chain verify A:${mc.verifyCheckpoint(cp, sigA, As.xonlyHex)} B:${mc.verifyCheckpoint(cp, sigB, Bs.xonlyHex)}`);
+
+    await fundFrom(rpc, escrowAddr, DUST);
+    const entries = await waitUtxo(rpc, escrowAddr);
+    const honest = await trySpendS11b(rpc, redeemHex, entries, addrA, past, PLY, claimant, sigA, sigB);
+    expect('module-signed forfeit accepted + lands at PA', honest, true);
+    if (honest.accepted) {
+      await new Promise((r) => setTimeout(r, 4000));
+      const landed = await rpc.getUtxosByAddresses({ addresses: [addrA] });
+      if (!landed.entries.length) critical = true;
+      console.log(`   ${landed.entries.length ? 'ok ' : 'BAD'} pot landed at PA (${landed.entries.length} utxo)`);
+      if (landed.entries.length) {
+        const u = landed.entries, inDaa = BigInt(u[0].blockDaaScore);
+        const MARGIN = 15n; // wait PAST inDaa+W so the accepting node's virtual DAA clears tx.lockTime (avoid "not finalized")
+        console.log(`   waiting for the ${W}-DAA window (+${MARGIN} margin)...`);
+        for (;;) { const now = BigInt((await rpc.getBlockDagInfo()).virtualDaaScore); if (now >= inDaa + W + MARGIN) break; await new Promise((r) => setTimeout(r, 3000)); }
+        const total = BigInt(u[0].amount), fee = 5_000_000n;
+        const mkFin = () => { const tx = k.createTransaction(u, [{ address: Aon.address, amount: total - fee }], fee, undefined, 2); tx.lockTime = inDaa + W; const ins = tx.inputs; ins[0].sequence = 0n; ins[0].signatureScript = p2shSig(redeemA, [numToBytes(1)]); tx.inputs = ins; return tx; };
+        let fin = { accepted: false, err: '' };
+        for (let attempt = 0; attempt < 4 && !fin.accepted; attempt++) {
+          if (attempt) await new Promise((r) => setTimeout(r, 4000));
+          try { const resp = await rpc.submitTransaction({ transaction: mkFin(), allowOrphan: false }); fin = { accepted: true, id: String(resp.transactionId ?? resp) }; }
+          catch (e) { fin = { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 300) }; }
+        }
+        expect('finalise after window pays A', fin, true);
+        if (fin.accepted) { await new Promise((r) => setTimeout(r, 4000)); await sweepBack(rpc, Aon.address, Aon.key); }
+      }
+    }
+    console.log(critical ? 'S11n FAILED.' : 'S11n PASSED — a session-key checkpoint from move_channel.mjs settles the covenant end to end.');
+  });
+}
+
 const which = process.argv[2];
 if (which === 'S8') await s8();
 else if (which === 'S9') await s9();
 else if (which === 'S10') await s10();
 else if (which === 'S11') await s11();
 else if (which === 'S11b') await s11b();
-else { console.error('usage: node spikes_forfeit.mjs [S8|S9|S10|S11|S11b]'); process.exit(1); }
+else if (which === 'S11n') await s11n();
+else { console.error('usage: node spikes_forfeit.mjs [S8|S9|S10|S11|S11b|S11n]'); process.exit(1); }
 process.exit(0);

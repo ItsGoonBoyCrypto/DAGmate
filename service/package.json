@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@kronsdk/kron-sdk": "0.17.1",
+    "@noble/curves": "^1.6.0",
     "express": "5.2.1"
   },
   "engines": {
