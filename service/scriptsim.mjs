@@ -87,6 +87,12 @@ export function run(script, witness = [], ctx = {}) {
         case 'OpSize': need(1); s.push(numToBytes(s[s.length - 1].length)); break;
         case 'OpCat': need(2); { const b = s.pop(), a = s.pop(); s.push(Buffer.concat([a, b])); } break;
         case 'OpSHA256': need(1); s.push(sha256(s.pop())); break;
+        // blake2b/blake3 STAND-INS: real Kaspa uses blake2b-256/blake3, which node's crypto can't
+        // produce here. For CHOREOGRAPHY these only need to be deterministic, 32 bytes, and DISTINCT
+        // from OpSHA256 (so a sha256<->blake2b swap on the same input is caught as a wrong hash).
+        // Domain separation gives that. The REAL hash is proven by one on-chain run.
+        case 'OpBlake2b': need(1); s.push(sha256(Buffer.concat([Buffer.from('BLAKE2B-SIM'), s.pop()]))); break;
+        case 'OpBlake3': need(1); s.push(sha256(Buffer.concat([Buffer.from('BLAKE3-SIM'), s.pop()]))); break;
         case 'OpEqual': need(2); { const b = s.pop(), a = s.pop(); s.push(a.equals(b) ? numToBytes(1) : Buffer.alloc(0)); } break;
         case 'OpEqualVerify': need(2); { const b = s.pop(), a = s.pop(); if (!a.equals(b)) throw new Error(`OpEqualVerify failed (${a.toString('hex').slice(0,12)} != ${b.toString('hex').slice(0,12)})`); } break;
         case 'OpVerify': need(1); if (!truthy(s.pop())) throw new Error('OpVerify failed'); break;
@@ -128,4 +134,7 @@ export function run(script, witness = [], ctx = {}) {
 
 function exec_parentOK(cond) { for (let i = 0; i < cond.length - 1; i++) if (!cond[i]) return false; return true; }
 
-export { numToBytes, bytesToNum, truthy, sha256 };
+// Same stand-in the OpBlake2b case uses — export so dev harnesses build their EXPECTED P2SH spk
+// with the identical function (choreography must agree in-sim; the real blake2b is proven on-chain).
+const blake2bSim = (b) => sha256(Buffer.concat([Buffer.from('BLAKE2B-SIM'), B(b)]));
+export { numToBytes, bytesToNum, truthy, sha256, blake2bSim };

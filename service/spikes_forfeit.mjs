@@ -280,9 +280,149 @@ async function s10() {
   });
 }
 
+// ── S11 LINK: escrow forfeit spend OUTPUTS into the S10 pending covenant (trustless end to end) ──
+// buildScript returns hex; we also need the raw redeem-byte halves either side of the ply push.
+function drainBuf(tokens) { return Buffer.from(buildScript(tokens), 'hex'); }
+const plyFixed = (n) => { const b = Buffer.alloc(2); b.writeUInt16LE(Number(n)); return b; };
+
+// S10 pending covenant, FIXED-WIDTH claimedPly (2-byte field, OpBin2Num'd) so the escrow can
+// reconstruct it with a constant push framing. Returned as {prefix, suffix} token halves; the ply
+// field sits between them. Baked: spkX(finaliser), spkY(canceller), W, pkA, pkB, matchTag, maxFee.
+function pendingFixedParts({ spkX, spkY, W, pkA, pkB, matchTag, maxFee }) {
+  return {
+    prefix: [
+      'OpIf',
+        'OpTxInputIndex', 'OpTxInputDaaScore', numToBytes(W), 'OpAdd', 'OpCheckLockTimeVerify',
+        'OpTxInputIndex', 'OpTxOutputSpk', Buffer.from(spkX), 'OpEqualVerify',
+        'OpTxInputIndex', 'OpTxOutputAmount', numToBytes(maxFee), 'OpAdd', 'OpTxInputIndex', 'OpTxInputAmount', 'OpGreaterThanOrEqual',
+      'OpElse',
+        Buffer.from(matchTag), numToBytes(1), 'OpPick', 'OpCat', 'OpSHA256',
+        numToBytes(2), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkB), 'OpCheckSigFromStack', 'OpVerify',
+        numToBytes(3), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkA), 'OpCheckSigFromStack', 'OpVerify',
+        'OpDrop', 'OpNip', 'OpNip',
+    ],
+    suffix: [
+        'OpBin2Num', 'OpGreaterThan', 'OpVerify',
+        'OpTxInputIndex', 'OpTxOutputSpk', Buffer.from(spkY), 'OpEqualVerify',
+        'OpTxInputIndex', 'OpTxOutputAmount', numToBytes(maxFee), 'OpAdd', 'OpTxInputIndex', 'OpTxInputAmount', 'OpGreaterThanOrEqual',
+      'OpEndIf',
+    ],
+  };
+}
+
+// Escrow forfeit leg that pays into the pending covenant. Baked: matchTag, pkA, pkB, PENDING_PREFIX
+// (drain(prefix)‖0x02), PENDING_SUFFIX (drain(suffix)), maxFee. Witness (bottom→top): deadline, ply2,
+// sigA, sigB. hC = SHA256(matchTag ‖ deadline ‖ ply2) — ply is co-signed so it can't be inflated.
+function forfeitLegS11({ matchTag, pkA, pkB, pendingPrefix, pendingSuffix, maxFee }) {
+  const VER_AA20 = Buffer.from([0x00, 0x00, 0xaa, 0x20]);
+  const TAIL = Buffer.from([0x87]);
+  return [
+    Buffer.from(matchTag), numToBytes(4), 'OpPick', 'OpCat', numToBytes(3), 'OpPick', 'OpCat', 'OpSHA256',
+    numToBytes(1), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkB), 'OpCheckSigFromStack', 'OpVerify',
+    numToBytes(2), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkA), 'OpCheckSigFromStack', 'OpVerify',
+    'OpDrop', 'OpDrop', 'OpDrop',
+    'OpSwap', 'OpCheckLockTimeVerify',
+    Buffer.from(pendingPrefix), 'OpSwap', 'OpCat', Buffer.from(pendingSuffix), 'OpCat',
+    'OpBlake2b',
+    VER_AA20, 'OpSwap', 'OpCat', TAIL, 'OpCat',
+    'OpTxInputIndex', 'OpTxOutputSpk', 'OpEqualVerify',
+    'OpTxInputIndex', 'OpTxOutputAmount', numToBytes(maxFee), 'OpAdd', 'OpTxInputIndex', 'OpTxInputAmount', 'OpGreaterThanOrEqual',
+  ];
+}
+
+async function trySpendS11(rpc, redeemHex, entries, payToSpkAddr, deadlineDaa, ply, sigA, sigB) {
+  const total = entries.reduce((s, e) => s + BigInt(e.amount), 0n); const fee = 5_000_000n;
+  // heavy leg: 2 CheckSigFromStack + SHA256 + Blake2b over a ~225B redeem + cats → generous sigOpCount
+  const tx = k.createTransaction(entries, [{ address: payToSpkAddr, amount: total - fee }], fee, undefined, 5);
+  tx.lockTime = BigInt(deadlineDaa);
+  const dl = Buffer.from(numToBytes(BigInt(deadlineDaa)));
+  const ins = tx.inputs; ins[0].sequence = 0n;
+  ins[0].signatureScript = p2shSig(redeemHex, [dl, plyFixed(ply), sigA, sigB]);
+  tx.inputs = ins;
+  try { const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false }); return { accepted: true, id: String(resp.transactionId ?? resp) }; }
+  catch (e) { return { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 400) }; }
+}
+
+async function s11() {
+  console.log('S11 — escrow forfeit OUTPUTS into the S10 pending covenant (trustless link), mainnet dust');
+  let critical = false;
+  const expect = (label, r, want) => { const good = r.accepted === want; if (!good) critical = true; console.log(`   ${good ? 'ok ' : 'BAD'} ${label} → ${r.accepted ? 'ACCEPTED ' + (r.id || '') : 'rejected [' + r.err + ']'}`); };
+  await core.withRpc(async (rpc) => {
+    const A = newKey(), B = newKey(); // A = claimant/finaliser (X); B = flagged opponent (Y, canceller)
+    const matchTag = randomBytes(32), W = 30n, CLAIMED_PLY = 40n, maxFee = 15_000_000n;
+    const consts = { spkX: outputSpkBytes(A.address), spkY: outputSpkBytes(B.address), W, pkA: xOnly(A.key), pkB: xOnly(B.key), matchTag, maxFee };
+
+    // Ground-truth pending covenant (fixed-width ply = CLAIMED_PLY) and its P2SH address.
+    const { prefix, suffix } = pendingFixedParts(consts);
+    const realPendingRedeem = buildScript([...prefix, plyFixed(CLAIMED_PLY), ...suffix]);
+    const pendingAddr = p2shFor(realPendingRedeem);
+
+    // Escrow leg bakes the two halves; PENDING_PREFIX carries the trailing 0x02 push-len.
+    const pendingPrefix = Buffer.concat([drainBuf(prefix), Buffer.from([0x02])]);
+    const pendingSuffix = drainBuf(suffix);
+    // Belt-and-braces: assert the split reproduces the real redeem before spending a satoshi.
+    const reproduced = Buffer.concat([pendingPrefix, plyFixed(CLAIMED_PLY), pendingSuffix]).toString('hex');
+    if (reproduced !== realPendingRedeem) { console.log('   BAD prefix/suffix split mismatch — aborting'); return; }
+    console.log(`   pending covenant: ${pendingAddr}  (redeem ${realPendingRedeem.length / 2}B)`);
+
+    const redeemHex = buildScript(forfeitLegS11({ matchTag, pkA: consts.pkA, pkB: consts.pkB, pendingPrefix, pendingSuffix, maxFee }));
+    const escrowAddr = p2shFor(redeemHex);
+    console.log(`   escrow leg:       ${escrowAddr}  (redeem ${redeemHex.length / 2}B)`);
+
+    const info = await rpc.getBlockDagInfo(); const nowDaa = BigInt(info.virtualDaaScore);
+    const checkpoint = (deadlineDaa, ply = CLAIMED_PLY) => {
+      const dl = Buffer.from(numToBytes(BigInt(deadlineDaa)));
+      const hC = sha256(Buffer.concat([Buffer.from(matchTag), dl, plyFixed(ply)]));
+      return { sigA: signHash(hC, A.key), sigB: signHash(hC, B.key) };
+    };
+
+    await fundFrom(rpc, escrowAddr, DUST);
+    const entries = await waitUtxo(rpc, escrowAddr);
+
+    // 1) deadline in the FUTURE → CLTV rejects
+    const future = nowDaa + 5_000n; let s = checkpoint(future);
+    expect('deadline not reached', await trySpendS11(rpc, redeemHex, entries, pendingAddr, future, CLAIMED_PLY, s.sigA, s.sigB), false);
+    // 2) forged co-signature → reject
+    const past = nowDaa - 200n; s = checkpoint(past);
+    expect('forged co-signature', await trySpendS11(rpc, redeemHex, entries, pendingAddr, past, CLAIMED_PLY, s.sigA, randomBytes(64)), false);
+    // 3) output pays the claimant DIRECTLY (A), skipping the challenge window → spk mismatch → reject
+    expect('output skips the pending covenant (pays claimant direct)', await trySpendS11(rpc, redeemHex, entries, A.address, past, CLAIMED_PLY, s.sigA, s.sigB), false);
+    // 4) HONEST: past deadline, both co-signed ply=40, output pays the reconstructed pending covenant
+    const honest = await trySpendS11(rpc, redeemHex, entries, pendingAddr, past, CLAIMED_PLY, s.sigA, s.sigB);
+    expect('honest forfeit lands in the pending covenant', honest, true);
+
+    // 5) THE LINK PROOF: the pot must now sit at the pending covenant address (real Blake2b matched).
+    if (honest.accepted) {
+      await new Promise((r) => setTimeout(r, 4000));
+      const landed = await rpc.getUtxosByAddresses({ addresses: [pendingAddr] });
+      const ok = landed.entries.length > 0;
+      if (!ok) critical = true;
+      console.log(`   ${ok ? 'ok ' : 'BAD'} pot LANDED at the pending covenant (${landed.entries.length} utxo) — on-chain Blake2b == P2SH hash`);
+
+      // 6) END-TO-END: finalise the pending UTXO (S10 FINALIZE) after the window → pays claimant A.
+      if (ok) {
+        const u = landed.entries;
+        const inDaa = BigInt(u[0].blockDaaScore);
+        console.log(`   waiting for the ${W}-DAA challenge window...`);
+        for (;;) { const now = BigInt((await rpc.getBlockDagInfo()).virtualDaaScore); if (now >= inDaa + W) break; await new Promise((r) => setTimeout(r, 3000)); }
+        const total = BigInt(u[0].amount), fee = 5_000_000n;
+        const tx = k.createTransaction(u, [{ address: A.address, amount: total - fee }], fee, undefined, 2);
+        tx.lockTime = inDaa + W; const fins = tx.inputs; fins[0].sequence = 0n;
+        fins[0].signatureScript = p2shSig(realPendingRedeem, [numToBytes(1)]); tx.inputs = fins;
+        let fin; try { const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false }); fin = { accepted: true, id: String(resp.transactionId ?? resp) }; }
+        catch (e) { fin = { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 300) }; }
+        expect('END-TO-END finalise after window pays claimant A', fin, true);
+        if (fin.accepted) { await new Promise((r) => setTimeout(r, 4000)); await sweepBack(rpc, A.address, A.key); }
+      }
+    }
+    console.log(critical ? 'S11 FAILED — a case misbehaved on-chain.' : 'S11 PASSED — escrow→pending link works end to end; OpBlake2b reconstructs the real P2SH; every attack rejected.');
+  });
+}
+
 const which = process.argv[2];
 if (which === 'S8') await s8();
 else if (which === 'S9') await s9();
 else if (which === 'S10') await s10();
-else { console.error('usage: node spikes_forfeit.mjs [S8|S9|S10]'); process.exit(1); }
+else if (which === 'S11') await s11();
+else { console.error('usage: node spikes_forfeit.mjs [S8|S9|S10|S11]'); process.exit(1); }
 process.exit(0);
