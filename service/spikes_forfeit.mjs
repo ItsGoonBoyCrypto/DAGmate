@@ -419,10 +419,133 @@ async function s11() {
   });
 }
 
+// ── S11b: TWO-DIRECTION link — either player can be the forfeit claimant ──
+// A co-signed `claimant` byte (0x01=A finalises, 0x02=B finalises) selects which pending covenant
+// (PA or PB) the escrow reconstructs. hC = SHA256(matchTag ‖ deadline ‖ ply2 ‖ claimant).
+function forfeitLegS11b({ matchTag, pkA, pkB, prefixA, suffixA, prefixB, suffixB, maxFee }) {
+  const VER_AA20 = Buffer.from([0x00, 0x00, 0xaa, 0x20]);
+  const TAIL = Buffer.from([0x87]);
+  return [
+    Buffer.from(matchTag), numToBytes(5), 'OpPick', 'OpCat', numToBytes(4), 'OpPick', 'OpCat', numToBytes(3), 'OpPick', 'OpCat', 'OpSHA256',
+    numToBytes(1), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkB), 'OpCheckSigFromStack', 'OpVerify',
+    numToBytes(2), 'OpPick', numToBytes(1), 'OpPick', Buffer.from(pkA), 'OpCheckSigFromStack', 'OpVerify',
+    'OpDrop', 'OpDrop', 'OpDrop',
+    numToBytes(2), 'OpRoll', 'OpCheckLockTimeVerify',                    // CLTV(deadline) -> [ply2 cl]
+    'OpDup', Buffer.from([0x01]), 'OpEqual', 'OpIf', Buffer.from(suffixA), 'OpElse', Buffer.from(suffixB), 'OpEndIf',
+    'OpSwap', Buffer.from([0x01]), 'OpEqual', 'OpIf', Buffer.from(prefixA), 'OpElse', Buffer.from(prefixB), 'OpEndIf',
+    numToBytes(2), 'OpRoll', 'OpCat', 'OpSwap', 'OpCat',                 // [prefix‖ply2‖suffix]
+    'OpBlake2b',
+    VER_AA20, 'OpSwap', 'OpCat', TAIL, 'OpCat',
+    'OpTxInputIndex', 'OpTxOutputSpk', 'OpEqualVerify',
+    'OpTxInputIndex', 'OpTxOutputAmount', numToBytes(maxFee), 'OpAdd', 'OpTxInputIndex', 'OpTxInputAmount', 'OpGreaterThanOrEqual',
+  ];
+}
+
+async function trySpendS11b(rpc, redeemHex, input, payToAddr, deadlineDaa, ply, claimant, sigA, sigB) {
+  const total = BigInt(input[0].amount), fee = 5_000_000n;
+  const tx = k.createTransaction(input, [{ address: payToAddr, amount: total - fee }], fee, undefined, 5);
+  tx.lockTime = BigInt(deadlineDaa);
+  const dl = Buffer.from(numToBytes(BigInt(deadlineDaa)));
+  const ins = tx.inputs; ins[0].sequence = 0n;
+  ins[0].signatureScript = p2shSig(redeemHex, [dl, plyFixed(ply), Buffer.from([claimant]), sigA, sigB]);
+  tx.inputs = ins;
+  try { const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false }); return { accepted: true, id: String(resp.transactionId ?? resp) }; }
+  catch (e) { return { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 300) }; }
+}
+
+async function s11b() {
+  console.log('S11b — TWO-DIRECTION escrow→pending link (either player claims), mainnet dust');
+  let critical = false;
+  const expect = (label, r, want) => { const good = r.accepted === want; if (!good) critical = true; console.log(`   ${good ? 'ok ' : 'BAD'} ${label} → ${r.accepted ? 'ACCEPTED ' + (r.id || '') : 'rejected [' + r.err + ']'}`); };
+  await core.withRpc(async (rpc) => {
+    const A = newKey(), B = newKey();
+    const matchTag = randomBytes(32), W = 30n, PLY = 40n, maxFee = 15_000_000n;
+    const base = { W, pkA: xOnly(A.key), pkB: xOnly(B.key), matchTag, maxFee };
+    // PA: A finalises (spkX=A), B cancels (spkY=B). PB: mirror.
+    const partsA = pendingFixedParts({ ...base, spkX: outputSpkBytes(A.address), spkY: outputSpkBytes(B.address) });
+    const partsB = pendingFixedParts({ ...base, spkX: outputSpkBytes(B.address), spkY: outputSpkBytes(A.address) });
+    const redeemA = buildScript([...partsA.prefix, plyFixed(PLY), ...partsA.suffix]);
+    const redeemB = buildScript([...partsB.prefix, plyFixed(PLY), ...partsB.suffix]);
+    const addrA = p2shFor(redeemA), addrB = p2shFor(redeemB);
+    const prefixA = Buffer.concat([drainBuf(partsA.prefix), Buffer.from([0x02])]), suffixA = drainBuf(partsA.suffix);
+    const prefixB = Buffer.concat([drainBuf(partsB.prefix), Buffer.from([0x02])]), suffixB = drainBuf(partsB.suffix);
+    // belt-and-braces split checks
+    if (Buffer.concat([prefixA, plyFixed(PLY), suffixA]).toString('hex') !== redeemA ||
+        Buffer.concat([prefixB, plyFixed(PLY), suffixB]).toString('hex') !== redeemB) { console.log('   BAD split mismatch — aborting'); return; }
+
+    const redeemHex = buildScript(forfeitLegS11b({ matchTag, pkA: base.pkA, pkB: base.pkB, prefixA, suffixA, prefixB, suffixB, maxFee }));
+    const escrowAddr = p2shFor(redeemHex);
+    console.log(`   escrow leg: ${escrowAddr} (redeem ${redeemHex.length / 2}B)`);
+    console.log(`   PA: ${addrA}`);
+    console.log(`   PB: ${addrB}`);
+
+    const info = await rpc.getBlockDagInfo(); const nowDaa = BigInt(info.virtualDaaScore);
+    const past = nowDaa - 200n, future = nowDaa + 5_000n;
+    const checkpoint = (deadlineDaa, claimant, ply = PLY) => {
+      const dl = Buffer.from(numToBytes(BigInt(deadlineDaa)));
+      const hC = sha256(Buffer.concat([Buffer.from(matchTag), dl, plyFixed(ply), Buffer.from([claimant])]));
+      return { sigA: signHash(hC, A.key), sigB: signHash(hC, B.key) };
+    };
+
+    // fund TWO escrow UTXOs (one per direction) in one tx
+    const { address: opAddr, key: opKey } = core.operatingAddress();
+    const { entries: opE } = await rpc.getUtxosByAddresses({ addresses: [opAddr] });
+    const { transactions } = await k.createTransactions({ entries: opE, outputs: [{ address: escrowAddr, amount: DUST }, { address: escrowAddr, amount: DUST }], changeAddress: opAddr, priorityFee: 20_000_000n, networkId: NETWORK_ID });
+    for (const tx of transactions) { tx.sign([opKey]); await tx.submit(rpc); }
+    while ((await rpc.getUtxosByAddresses({ addresses: [escrowAddr] })).entries.length < 2) await new Promise((r) => setTimeout(r, 3000));
+    const eu = (await rpc.getUtxosByAddresses({ addresses: [escrowAddr] })).entries;
+    const u1 = [eu[0]], u2 = [eu[1]];
+
+    // ── attacks on u1 (rejected → u1 survives) ──
+    let sA = checkpoint(past, 0x01);
+    expect('cross-direction: claimant=1 but pays PB', await trySpendS11b(rpc, redeemHex, u1, addrB, past, PLY, 0x01, sA.sigA, sA.sigB), false);
+    // flipped claimant: witness says 2, co-signed 1 → the hash won't verify
+    expect('flipped claimant (witness 2, co-signed 1)', await trySpendS11b(rpc, redeemHex, u1, addrB, past, PLY, 0x02, sA.sigA, sA.sigB), false);
+    let sFut = checkpoint(future, 0x01);
+    expect('deadline not reached', await trySpendS11b(rpc, redeemHex, u1, addrA, future, PLY, 0x01, sFut.sigA, sFut.sigB), false);
+
+    // ── DIR A honest on u1 → lands at PA ──
+    const hA = await trySpendS11b(rpc, redeemHex, u1, addrA, past, PLY, 0x01, sA.sigA, sA.sigB);
+    expect('DIR A honest lands at PA', hA, true);
+    // ── DIR B honest on u2 → lands at PB ──
+    const sB = checkpoint(past, 0x02);
+    const hB = await trySpendS11b(rpc, redeemHex, u2, addrB, past, PLY, 0x02, sB.sigA, sB.sigB);
+    expect('DIR B honest lands at PB', hB, true);
+
+    await new Promise((r) => setTimeout(r, 4000));
+    const inPA = await rpc.getUtxosByAddresses({ addresses: [addrA] });
+    const inPB = await rpc.getUtxosByAddresses({ addresses: [addrB] });
+    const okLand = inPA.entries.length > 0 && inPB.entries.length > 0;
+    if (!okLand) critical = true;
+    console.log(`   ${okLand ? 'ok ' : 'BAD'} pot landed in BOTH pending covenants (PA:${inPA.entries.length} PB:${inPB.entries.length}) — OpBlake2b reconstructs both`);
+
+    // ── finalise both after the window (S10 FINALIZE) so no dust is stranded; DIR A pays A, DIR B pays B ──
+    if (okLand) {
+      const uPA = inPA.entries, uPB = inPB.entries;
+      const target = BigInt(uPA[0].blockDaaScore) > BigInt(uPB[0].blockDaaScore) ? BigInt(uPA[0].blockDaaScore) : BigInt(uPB[0].blockDaaScore);
+      console.log(`   waiting for the ${W}-DAA window on both...`);
+      for (;;) { const now = BigInt((await rpc.getBlockDagInfo()).virtualDaaScore); if (now >= target + W) break; await new Promise((r) => setTimeout(r, 3000)); }
+      const finalise = async (redeem, u, winDaa, payAddr) => {
+        const total = BigInt(u[0].amount), fee = 5_000_000n;
+        const tx = k.createTransaction(u, [{ address: payAddr, amount: total - fee }], fee, undefined, 2);
+        tx.lockTime = winDaa + W; const ins = tx.inputs; ins[0].sequence = 0n; ins[0].signatureScript = p2shSig(redeem, [numToBytes(1)]); tx.inputs = ins;
+        try { const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false }); return { accepted: true, id: String(resp.transactionId ?? resp) }; }
+        catch (e) { return { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 300) }; }
+      };
+      expect('finalise PA pays A', await finalise(redeemA, uPA, BigInt(uPA[0].blockDaaScore), A.address), true);
+      expect('finalise PB pays B', await finalise(redeemB, uPB, BigInt(uPB[0].blockDaaScore), B.address), true);
+      await new Promise((r) => setTimeout(r, 4000));
+      await sweepBack(rpc, A.address, A.key); await sweepBack(rpc, B.address, B.key);
+    }
+    console.log(critical ? 'S11b FAILED.' : 'S11b PASSED — both forfeit directions link into their pending covenants and finalise; cross-direction + flipped-claimant + early + forged rejected.');
+  });
+}
+
 const which = process.argv[2];
 if (which === 'S8') await s8();
 else if (which === 'S9') await s9();
 else if (which === 'S10') await s10();
 else if (which === 'S11') await s11();
-else { console.error('usage: node spikes_forfeit.mjs [S8|S9|S10|S11]'); process.exit(1); }
+else if (which === 'S11b') await s11b();
+else { console.error('usage: node spikes_forfeit.mjs [S8|S9|S10|S11|S11b]'); process.exit(1); }
 process.exit(0);
