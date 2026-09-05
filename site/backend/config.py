@@ -156,6 +156,39 @@ ESCROW_V2_ENABLED = os.getenv("DAGMATE_ESCROW_V2", "0") == "1"
 SETTLE_V2_FEE_SOMPI_PER_INPUT = 5_000_000
 SETTLE_V2_MAXFEE_SOMPI = 15_000_000
 
+# ── covenant escrow v3 — trustless DAA forfeit (roadmap #3a / DAGMATE_ROADMAP_3A.md) ──
+# v2 still trusts DAGmate's oracle to DECLARE the winner. v3 removes the oracle for
+# the abandonment/clock-flag case: a co-signed off-chain checkpoint (move_channel)
+# + the proven forfeit covenant legs (S8–S11b, mainnet) let a player collect a
+# timeout forfeit with NO oracle signature. OFF by default and per-match (same
+# never-switches rule as v2). Only flip on once the v3 full flow is proven on the
+# target network. The covenant PRIMITIVES are already proven on mainnet dust
+# (service/spikes_forfeit.mjs S8/S9/S10/S11/S11b/S11n).
+ESCROW_V3_ENABLED = os.getenv("DAGMATE_ESCROW_V3", "0") == "1"
+# The forfeit legs use the same fee/maxFee shape as v2 (output ≥ input − MAXFEE).
+SETTLE_V3_FEE_SOMPI_PER_INPUT = 5_000_000
+SETTLE_V3_MAXFEE_SOMPI = 15_000_000
+
+# ── DAA clock (daa_clock.py) — the on-chain deadline unit for v3 ─────────
+# On-chain deadlines are DAA scores, not wall-clock: the covenant reads the tx's
+# DAA-locktime, so a checkpoint's deadline must be expressed in DAA. MEASURED on
+# mainnet 2026-09-05: ~9.61 DAA/s (post-Crescendo 10 BPS) — NOT the ~1/s that
+# pre-Crescendo docs assumed. We set the conversion rate on the HIGH side of the
+# measurement so a DAA deadline is never SHORTER in real time than the wall clock
+# a player sees (deadlineDaa = now + secs·rate; a higher rate = more chain DAA to
+# elapse = more real seconds), which means clock drift can only ever give a player
+# MORE time, never flag them early. Per-network override for testnet BPS.
+DAA_PER_SEC = float(os.getenv("DAGMATE_DAA_PER_SEC", "10.0"))
+# Extra fixed cushion (in DAA) added to every deadline, on top of the high rate —
+# absorbs node-to-node virtual-DAA lag at the moment of a claim.
+DAA_DEADLINE_MARGIN = int(os.getenv("DAGMATE_DAA_DEADLINE_MARGIN", "150"))  # ~15s at 10/s
+# Fischer increment granted per move, in seconds, converted to DAA for the S9
+# unilateral-move lower bound. Mirrors the wall-clock increment of the mode.
+# Optimistic challenge window W (seconds → DAA): how long a flagged opponent has to
+# CANCEL a bogus forfeit with a newer co-signed state before the claimant finalises.
+# Generous (hours) so self-defence via watch-and-defend is always easy.
+CHALLENGE_WINDOW_SECS = int(os.getenv("DAGMATE_CHALLENGE_WINDOW_SECS", str(2 * 3600)))  # 2h
+
 # ── reclaim (reclaim.py) ────────────────────────────────────────────────
 # ⚠️ MUST match RECLAIM_FEE_SOMPI_PER_INPUT in service/escrow.js. Same reason
 # as the settle fee above: the backend quotes the payout before the sidecar

@@ -155,8 +155,11 @@ player's behalf as a *convenience* (not a trust dependency — the player can al
 - ✅ **Ply/turn encoding & hashing — RESOLVED (S11/S11b):** `H(C) = SHA256(matchTag ‖ deadlineDaa ‖
   ply2(fixed 2B LE) ‖ claimant(1B))`; the covenant recomputes it from witness copies and it matches
   the signed hash on-chain. See "What the on-chain proofs settled" above for the full byte layout.
-- **DAA↔seconds mapping for the clock:** ~1 DAA/s but not exact; size budgets/`W` with margin so
-  clock drift never flips a legitimately-in-time move into a forfeit.
+- ✅ **DAA↔seconds mapping — MEASURED (2026-09-05):** mainnet runs **~9.61 DAA/s** (post-Crescendo
+  10 BPS), NOT the ~1/s pre-Crescendo docs assumed — a 10× error that would have flagged every player
+  early. `daa_clock.py` uses a HIGH-side rate (default 10.0) + a fixed DAA margin so a deadline is never
+  shorter in real time than the wall clock (drift is always generous to the player). Testnet BPS differs
+  — `DAGMATE_DAA_PER_SEC` overrides per network.
 - **Griefing the challenge window:** ensure a spurious forfeit-claim costs the claimant (fees) and
   can't be spammed to lock a pot; `W` bounds the delay, but quantify worst-case stall.
 
