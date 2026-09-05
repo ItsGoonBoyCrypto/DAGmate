@@ -1,8 +1,13 @@
 # DAGmate — Roadmap #3a: DAA move-timeout forfeit (removing the oracle for abandonment)
 
-**Status:** DESIGN / spec. Not built. Builds on the proven v2 covenant (docs/DAGMATE_COVENANT_V2.md)
-and the existing CLTV reclaim branch + move-anchor infra. Prerequisite direction from Kaspa-dev
-feedback (2026-09-04): "oracle not needed if thrown into a covenant" + "clock using DAA".
+**Status:** ON-CHAIN PRIMITIVES PROVEN (2026-09-05). All covenant legs are proven on Kaspa **mainnet**
+dust — S8 (co-signed DAA-CLTV forfeit), S9 (bounded unilateral move), S10 (optimistic challenge
+window), S11 (escrow→pending **link**), S11b (two-direction link). The full trustless forfeit path
+runs end to end on chain: escrow → pending-forfeit → finalise / cancel. Remaining: the off-chain
+signed-move channel, the v3 backend settlement branch, and the DAA clock — then testnet → mainnet.
+Builds on the proven v2 covenant (docs/DAGMATE_COVENANT_V2.md) and the existing CLTV reclaim branch +
+move-anchor infra. Prerequisite direction from Kaspa-dev feedback (2026-09-04): "oracle not needed if
+thrown into a covenant" + "clock using DAA".
 
 ## Goal & threat model
 
@@ -101,26 +106,55 @@ player's behalf as a *convenience* (not a trust dependency — the player can al
 - The **increment/clock config** is baked at escrow creation, so it's fixed & agreed up front.
 
 ## Build plan (spikes first, same discipline as v2)
-1. **S8 — DAA-CLTV forfeit leg on dust:** a covenant that pays a claimant only after tx-locktime ≥ a
-   baked deadline DAA AND a co-signed `C` verifies (2× `OpCheckSigFromStack`) + turn parity. Prove
-   accept-after / reject-before, and reject a wrong-claimant.
-2. **S9 — bounded unilateral move:** add `M` (prevHash pin + mover sig + the deadline-bound
-   inequality); prove a too-short `M.nextDeadlineDaa` is rejected.
-3. **S10 — optimistic challenge:** pending-forfeit UTXO; prove cancel-by-newer-state and
-   finalize-after-W.
-4. **S11 — adversarial matrix:** stale-state claim rejected once superseded; forged `C`/`M` rejected;
-   claim-your-own-turn rejected; deadline-not-passed rejected; wrong-payee rejected.
-5. Then the off-chain channel (sign/verify/exchange `C` & `M` in the game loop), the backend
+1. ✅ **S8 — DAA-CLTV forfeit leg (mainnet):** pays a claimant only after tx-locktime ≥ a co-signed
+   deadline DAA AND a co-signed `C` verifies (2× `OpCheckSigFromStack`) + turn selection. Proven:
+   accept-after / reject-before, forged co-sig rejected, wrong-claimant rejected.
+2. ✅ **S9 — bounded unilateral move (mainnet):** `M` (prevHash pin + mover sig + the `≥` deadline
+   bound); the too-short `M.nextDeadlineDaa` "short-deadline steal" is rejected on-chain.
+3. ✅ **S10 — optimistic challenge (mainnet):** pending-forfeit UTXO; cancel-by-newer-state and
+   finalize-after-W both work; stale / forged / wrong-payee / early all rejected.
+4. ✅ **S11 — escrow→pending LINK (mainnet):** the forfeit spend OUTPUTS into the S10 pending covenant
+   instead of paying directly. The escrow reconstructs the pending P2SH scriptPubKey on-chain
+   (`pendingRedeem = PREFIX ‖ ply2 ‖ SUFFIX`, `OpBlake2b`, spk `0000 aa20 ‖ h ‖ 87`,
+   `OpTxOutputSpk == it`) — first on-chain use of `OpBlake2b` (opcode 170); the pot verifiably lands
+   at the reconstructed address. Escrow-leg redeem 387B — well under the compute-mass ceiling.
+   ✅ **S11b — two-direction link (mainnet):** a co-signed `claimant` byte selects PA vs PB; both
+   directions land + finalise; cross-direction, flipped-claimant, early, forged all rejected. (This
+   subsumed the originally-planned "S11 adversarial matrix" — the adversarial cases are proven across
+   S8–S11b, and the real open problem turned out to be the *linkage*, now resolved.)
+5. **▶ NEXT — the off-chain channel** (sign/verify/exchange `C` & `M` in the game loop), the backend
    settlement branch (a v3 escrow variant behind an `ESCROW_V3`/`DAA_FORFEIT` flag), a DAA clock in
    `clocks.py` used for the on-chain deadlines (kept alongside the wall-clock UX display), frontend,
    tests, then testnet full-flow, then mainnet — exactly the v2 rollout shape.
+
+### What the on-chain proofs settled (byte-exact facts for the builders)
+- **Checkpoint hash** = `SHA256(matchTag ‖ deadlineDaa ‖ ply2 ‖ claimant)`; deadline is the minimal
+  script-number encoding so it doubles as the CLTV operand with no `OpBin2Num`. Signed by both players
+  with `signScriptHash` → the bare 64-byte Schnorr (`subarray(1,65)` of the 66-byte return) for
+  `OpCheckSigFromStack`.
+- **`claimedPly` is a FIXED 2-byte little-endian field** (constant `0x02` push framing → baked into the
+  pending-covenant PREFIX). This is what makes the escrow's `PREFIX ‖ ply2 ‖ SUFFIX` reconstruction a
+  simple two-`OpCat` with no length arithmetic. The pending covenant reads it with `OpBin2Num` before
+  `OpGreaterThan`. The split reproduces the real `ScriptBuilder` redeem byte-for-byte across ply
+  0..32767 (`dev_s11_split.mjs`).
+- **P2SH spk framing** (confirmed against real `ScriptBuilder`): `0x0000` (version, 2-byte BE) ‖ `aa 20`
+  (OpBlake2b-push of a 32-byte hash) ‖ `<blake2b256(redeem)>` ‖ `0x87` (OP_EQUAL) = 37 bytes.
+- **Compute mass:** the single-direction escrow leg is 387B, the two-direction 641B; both accepted, so
+  the earlier ~500k-mass worry is cleared for this construction. No slimming needed.
+- **Offline-first workflow:** develop the stack choreography in `scriptsim.mjs` (a pure Kaspa-script
+  stack simulator; `OpBlake2b`/`OpBlake3` are domain-separated stand-ins) via `dev_s8..s11b.mjs`, then
+  prove the real crypto with ONE on-chain run via `spikes_forfeit.mjs [S8|S9|S10|S11|S11b]`.
+- **txid note:** Kaspa's txid EXCLUDES the signature script, so an honest spend and a forged-witness
+  attempt on the same UTXO share a txid — the forged one fails script verification, the honest one is
+  accepted. Not a bug; don't key any logic on txid uniqueness across witnesses.
 
 ## Open problems to resolve during S8–S9 (don't pretend these are settled)
 - **Stonewalling refinement:** the `C + M` construction lets a mover advance one step unilaterally,
   but confirm on-chain that a player who never gets a *co-signed* reply can still always reach a
   "opponent-to-move" claimable state from the last co-signed `C` they hold. Map every stall ordering.
-- **Ply/turn encoding & hashing:** fix the exact byte layout of `C`/`M` and the hash (Blake3/SHA256)
-  so `H(C)` in the witness and `H(C)` the covenant recomputes match; prove on dust (cf. S5a).
+- ✅ **Ply/turn encoding & hashing — RESOLVED (S11/S11b):** `H(C) = SHA256(matchTag ‖ deadlineDaa ‖
+  ply2(fixed 2B LE) ‖ claimant(1B))`; the covenant recomputes it from witness copies and it matches
+  the signed hash on-chain. See "What the on-chain proofs settled" above for the full byte layout.
 - **DAA↔seconds mapping for the clock:** ~1 DAA/s but not exact; size budgets/`W` with margin so
   clock drift never flips a legitimately-in-time move into a forfeit.
 - **Griefing the challenge window:** ensure a spurious forfeit-claim costs the claimant (fees) and
