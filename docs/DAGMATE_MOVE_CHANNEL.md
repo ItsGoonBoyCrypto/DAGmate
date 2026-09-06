@@ -83,6 +83,32 @@ with margin (never tight enough that clock drift flips an in-time move into a fo
 `deadlineDaa`/`nextDeadlineDaa` the clients put into `C`/`M`. The wall-clock UX display stays as-is; the
 DAA figure is the authoritative one the covenant reads.
 
+## v3 integration checklist (the frontend-coupled build — TESTNET first)
+The covenant, the DAA clock, `escrow_v3.js`, and the sidecar `/escrow-v3/*` routes + `service_client`
+wrappers are DONE and proven. What remains is one coupled unit (backend + frontend), because the escrow
+can't be built until the clients have minted their session keys:
+
+1. **Frontend — session key.** At challenge create/accept, mint `move_channel.newSessionKey()`; keep the
+   private key in the match's client state; send the x-only `sessPk` alongside the wallet pubkey.
+2. **Backend — escrow creation.** Thread `sess_pk_a`/`sess_pk_b` + `w_daa` (=`daa_clock.challenge_window_daa()`)
+   into `_create_match_from_pair`; when `ESCROW_V3_ENABLED`, call `service_client.build_escrow_v3(... side A/B ...)`
+   and `db.set_match_escrows(..., version="v3")` (mirror the v2 branch at `main.py:496`). Store the returned
+   `checkpointTag` on the match so both clients build `C` against the same domain.
+3. **Backend — settle dispatch.** In `settlement.py`, add a v3 arm beside `_settle_v2` (oracle settle is
+   identical: `oracle_sign_result_v3` + `settle_v3`); add a `settle_v3_verdict_json` column.
+4. **Backend — trustless forfeit.** In `clocks.py`, when a v3 match flags, drive the forfeit instead of the
+   oracle path: `forfeit_claim_v3` (deadline = the co-signed `C.deadlineDaa`) → persist the returned
+   `pendingAddress`/`pendingRedeem` → after `w_daa` DAA, `forfeit_finalise_v3`. A `forfeit_cancel_v3` is
+   posted if a newer co-signed `C'` arrives during the window (self, or the watch-tower).
+5. **Relay.** Carry `C`/`M` over the existing match websocket (§ Exchange protocol). Optional sidecar
+   watch-tower verifies opponents' checkpoints and auto-cancels a bogus claim.
+6. **Frontend — play + collect.** Co-sign `C` on each move (`move_channel.signCheckpoint`); a claim/cancel
+   panel for the forfeit + challenge window.
+7. **Tests → testnet.** Backend tests per the house rules (non-empty lists, real row types, DB isolation),
+   then the full flow on **testnet** — including the forfeit e2e (`e2e_v3.mjs`), which the core.js 60s
+   `withRpc` fn-timeout blocks in one mainnet process but which runs fine as separate short requests in
+   production (claim now, finalise hours later).
+
 ## Open items for part 2 (be honest)
 - **Deadline math ownership:** clients compute `deadlineDaa`; the opponent must re-derive and refuse to
   counter-sign a `C` whose deadline is wrong. Spec the exact formula (base + increment per move) so both
