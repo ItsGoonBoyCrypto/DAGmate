@@ -14,6 +14,7 @@ import { randomBytes } from 'node:crypto';
 import express from 'express';
 import * as escrow from './escrow.js';
 import * as escrowV2 from './escrow_v2.js';
+import * as escrowV3 from './escrow_v3.js';
 import * as core from './core.js';
 import * as auth from './auth.js';
 
@@ -73,6 +74,17 @@ app.post('/escrow/anchor', wrap((req) => escrow.anchor(req.body)));
 app.post('/escrow-v2/build', wrap((req) => escrowV2.buildEscrowV2(req.body)));
 app.post('/escrow-v2/oracle-sign', wrap((req) => escrowV2.oracleSignResult(req.body)));
 app.post('/escrow-v2/settle', wrap((req) => escrowV2.settleV2(req.body)));
+
+// ── covenant escrow v3 (roadmap #3a). Adds a TRUSTLESS forfeit path (co-signed
+// checkpoint + pending covenant) beside v2's oracle settle, in one combined redeem
+// (proven on mainnet — service/spikes_forfeit.mjs S12). Reclaim reuses /escrow/reclaim-*
+// with the v3 redeemHex (the innermost ELSE is byte-identical to v1/v2).
+app.post('/escrow-v3/build', wrap((req) => escrowV3.buildEscrowV3(req.body)));
+app.post('/escrow-v3/oracle-sign', wrap((req) => escrowV3.oracleSignResult(req.body)));
+app.post('/escrow-v3/settle', wrap((req) => escrowV3.settleV3(req.body)));
+app.post('/escrow-v3/forfeit-claim', wrap((req) => escrowV3.forfeitClaim(req.body)));
+app.post('/escrow-v3/forfeit-finalise', wrap((req) => escrowV3.forfeitFinalise(req.body)));
+app.post('/escrow-v3/forfeit-cancel', wrap((req) => escrowV3.forfeitCancel(req.body)));
 
 app.get('/escrow/daa', wrap(() => escrow.daaScore()));
 

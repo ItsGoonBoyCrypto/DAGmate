@@ -136,6 +136,65 @@ async def settle_v2(*, match_id: str, escrows: list[dict], outcome: str, pk_a: s
     })
 
 
+# ── covenant escrow v3 (roadmap #3a) — v2's oracle settle + a trustless forfeit path ──
+async def build_escrow_v3(*, match_id: str, pk_a: str, pk_b: str, side: str, reclaim_daa: int,
+                          sess_pk_a: str, sess_pk_b: str, w_daa: int) -> dict:
+    """Build one player's v3 escrow. Beyond v2's params it bakes the per-match SESSION
+    pubkeys (`sess_pk_a`/`sess_pk_b`, the move-channel checkpoint signers) and the
+    challenge window `w_daa` (DAA). Returns {address, redeemHex, checkpointTag} — the
+    tag is what both clients fold into every co-signed checkpoint."""
+    return await _post("/escrow-v3/build", {
+        "matchId": match_id, "pkA": pk_a, "pkB": pk_b, "side": side, "reclaimDaa": reclaim_daa,
+        "sessPkA": sess_pk_a, "sessPkB": sess_pk_b, "wDaa": w_daa,
+    })
+
+
+async def oracle_sign_result_v3(*, match_id: str, outcome: str) -> dict:
+    """Oracle verdict for a v3 SETTLE (checkmate/resign/draw) — identical scheme to v2."""
+    return await _post("/escrow-v3/oracle-sign", {"matchId": match_id, "outcome": outcome})
+
+
+async def settle_v3(*, escrows: list[dict], outcome: str, pk_a: str, pk_b: str,
+                    sig_a: str, sig_b: str) -> dict:
+    """Oracle-settle a decided v3 match — same shape as settle_v2 (no player sig)."""
+    return await _post("/escrow-v3/settle", {
+        "escrows": escrows, "outcome": outcome, "pkA": pk_a, "pkB": pk_b, "sigA": sig_a, "sigB": sig_b,
+    })
+
+
+async def forfeit_claim_v3(*, escrow: dict, match_id: str, pk_a: str, pk_b: str, sess_pk_a: str,
+                           sess_pk_b: str, w_daa: int, deadline_daa: int, ply: int, claimant: str,
+                           sig_a: str, sig_b: str) -> dict:
+    """Spend a v3 escrow into its pending-forfeit covenant on a co-signed checkpoint whose
+    deadline has lapsed. `claimant` 'A'|'B'; `sig_a`/`sig_b` are the two session co-signatures
+    over the checkpoint. Returns {txid, pendingAddress, pendingRedeem} — the pot now sits in
+    the challenge-window covenant, NOT yet paid."""
+    return await _post("/escrow-v3/forfeit-claim", {
+        "escrow": escrow, "matchId": match_id, "pkA": pk_a, "pkB": pk_b,
+        "sessPkA": sess_pk_a, "sessPkB": sess_pk_b, "wDaa": w_daa,
+        "deadlineDaa": deadline_daa, "ply": ply, "claimant": claimant, "sigA": sig_a, "sigB": sig_b,
+    })
+
+
+async def forfeit_finalise_v3(*, pending_redeem: str, pending_address: str, claimant: str,
+                              pk_a: str, pk_b: str, w_daa: int) -> dict:
+    """After the challenge window, pay the claimant from the pending covenant."""
+    return await _post("/escrow-v3/forfeit-finalise", {
+        "pendingRedeem": pending_redeem, "pendingAddress": pending_address,
+        "claimant": claimant, "pkA": pk_a, "pkB": pk_b, "wDaa": w_daa,
+    })
+
+
+async def forfeit_cancel_v3(*, pending_redeem: str, pending_address: str, canceller: str,
+                            pk_a: str, pk_b: str, new_ply: int, sig_a: str, sig_b: str) -> dict:
+    """Within the window, void a bogus forfeit with a NEWER co-signed checkpoint (ply' > claimed):
+    pays the wrongly-accused player."""
+    return await _post("/escrow-v3/forfeit-cancel", {
+        "pendingRedeem": pending_redeem, "pendingAddress": pending_address, "canceller": canceller,
+        "pkA": pk_a, "pkB": pk_b, "newPly": new_ply, "sigA": sig_a, "sigB": sig_b,
+    })
+
+
 async def extract_sigs(*, signed_tx_json: str, indexes: list[int]) -> dict:
     """Pull the raw player signatures back out of the given inputs of a
     wallet-signed tx. Returns {"sigs": {"<index>": "<hex>"}}."""
