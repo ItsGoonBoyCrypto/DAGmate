@@ -27,6 +27,7 @@ function outputSpkBytes(address) {
   const spk = k.payToAddressScript(address); const v = Number(spk.version) & 0xffff;
   return Uint8Array.from([(v >> 8) & 0xff, v & 0xff, ...Buffer.from(String(spk.script), 'hex')]);
 }
+function addressForXOnly(xoBytes) { return new k.PublicKey(Buffer.from(xoBytes).toString('hex')).toAddress(NET).toString(); }
 const oracleSchnorr = (sigHex) => { const b = Buffer.from(String(sigHex), 'hex'); return b.length === 66 ? b.subarray(1, 65) : b.length === 65 ? b.subarray(0, 64) : b; };
 const signHash = (hash32, key) => oracleSchnorr(k.signScriptHash(Buffer.from(hash32).toString('hex'), key));
 
@@ -604,6 +605,134 @@ async function s11n() {
   });
 }
 
+// ── S12: the COMBINED v3 covenant — v2 settle subtree + S11b forfeit + CLTV reclaim in ONE script ──
+// The v3 escrow must offer BOTH a normal oracle settle (checkmate/resign/draw) AND the trustless
+// forfeit, from one UTXO — so all legs live in one redeem, selected by nested IFs. The gating unknown
+// is compute-mass: the forfeit SPEND reveals the WHOLE ~1KB redeem, and S11b's forfeit-only leg was
+// already 641B. S12 proves the forfeit branch still clears mass, and that the settle branch still
+// works when wrapped (regression). Reclaim is byte-identical to proven v1/v2 (routing checked in sim).
+//
+// Witnesses (bottom→top): settle=[oracleSig64, winnerSel, isDraw, OP_TRUE];
+//   forfeit=[deadline, ply2, claimant, sigA, sigB, OP_TRUE, OP_FALSE]; reclaim=[sig, OP_FALSE, OP_FALSE].
+const DGMT_MAXFEE = 15_000_000n;
+function buildV3RedeemTokens({ matchId, sideByte, A, B, reclaimDaa, forfeitBody }) {
+  const { key: oracleKey } = core.deriveArbiter(matchId);
+  const pkOracle = Buffer.from(xOnly(oracleKey));
+  const tag = sha256(Buffer.concat([Buffer.from('DGMTv2'), Buffer.from(String(matchId)), Buffer.from([sideByte])]));
+  const msg = (won) => Buffer.from(sha256(Buffer.concat([tag, Buffer.from([won])])));
+  const spkA = Buffer.from(outputSpkBytes(A.address)), spkB = Buffer.from(outputSpkBytes(B.address));
+  const spkDep = sideByte === 0x00 ? spkA : spkB;
+  const pkDep = sideByte === 0x00 ? Buffer.from(xOnly(A.key)) : Buffer.from(xOnly(B.key));
+  const leg = (m, spk) => [
+    m, pkOracle, 'OpCheckSigFromStack', 'OpVerify',
+    'OpTxInputIndex', 'OpTxOutputSpk', spk, 'OpEqualVerify',
+    'OpTxInputIndex', 'OpTxOutputAmount', numToBytes(DGMT_MAXFEE), 'OpAdd', 'OpTxInputIndex', 'OpTxInputAmount', 'OpGreaterThanOrEqual',
+  ];
+  return [
+    'OpIf',                                   // settle (oracle-declared)
+      'OpIf', 'OpDrop', ...leg(msg(0x02), spkDep),      // isDraw → pay this escrow's depositor
+      'OpElse', 'OpIf', ...leg(msg(0x01), spkB), 'OpElse', ...leg(msg(0x00), spkA), 'OpEndIf',
+      'OpEndIf',
+    'OpElse',
+      'OpIf', ...forfeitBody,                 // forfeit → output into the pending covenant (S11b)
+      'OpElse', numToBytes(reclaimDaa), 'OpCheckLockTimeVerify', pkDep, 'OpCheckSig',   // 14-day reclaim
+      'OpEndIf',
+    'OpEndIf',
+  ];
+}
+
+async function s12() {
+  console.log('S12 — COMBINED v3 covenant (settle + forfeit + reclaim in one), mainnet dust');
+  let critical = false;
+  const expect = (label, r, want) => { const good = r.accepted === want; if (!good) critical = true; console.log(`   ${good ? 'ok ' : 'BAD'} ${label} → ${r.accepted ? 'ACCEPTED ' + (r.id || '') : 'rejected [' + r.err + ']'}`); };
+  await core.withRpc(async (rpc) => {
+    const A = newKey(), B = newKey();
+    const matchId = randomBytes(3).readUIntBE(0, 3); // valid BIP-32 index (< 2^31)
+    const matchTag = randomBytes(32), W = 30n, PLY = 40n, maxFee = DGMT_MAXFEE;
+    const base = { W, pkA: xOnly(A.key), pkB: xOnly(B.key), matchTag, maxFee };
+    // pending covenants for the forfeit body (two-direction, same as S11b)
+    const partsA = pendingFixedParts({ ...base, spkX: outputSpkBytes(A.address), spkY: outputSpkBytes(B.address) });
+    const partsB = pendingFixedParts({ ...base, spkX: outputSpkBytes(B.address), spkY: outputSpkBytes(A.address) });
+    const redeemA = buildScript([...partsA.prefix, plyFixed(PLY), ...partsA.suffix]);
+    const addrPA = p2shFor(redeemA);
+    const prefixA = Buffer.concat([drainBuf(partsA.prefix), Buffer.from([0x02])]), suffixA = drainBuf(partsA.suffix);
+    const prefixB = Buffer.concat([drainBuf(partsB.prefix), Buffer.from([0x02])]), suffixB = drainBuf(partsB.suffix);
+    const forfeitBody = forfeitLegS11b({ matchTag, pkA: base.pkA, pkB: base.pkB, prefixA, suffixA, prefixB, suffixB, maxFee });
+
+    // ONE combined redeem for side A's escrow.
+    const redeemHex = buildScript(buildV3RedeemTokens({ matchId, sideByte: 0x00, A, B, reclaimDaa: 0n, forfeitBody }));
+    const escrowAddr = p2shFor(redeemHex);
+    console.log(`   combined v3 redeem = ${redeemHex.length / 2}B  (S11b forfeit-only was 641B)`);
+    console.log(`   escrow: ${escrowAddr}`);
+
+    const info = await rpc.getBlockDagInfo(); const past = BigInt(info.virtualDaaScore) - 200n;
+
+    // fund TWO UTXOs (settle + forfeit)
+    const { address: opAddr, key: opKey } = core.operatingAddress();
+    const { entries: opE } = await rpc.getUtxosByAddresses({ addresses: [opAddr] });
+    const { transactions } = await k.createTransactions({ entries: opE, outputs: [{ address: escrowAddr, amount: DUST }, { address: escrowAddr, amount: DUST }], changeAddress: opAddr, priorityFee: 20_000_000n, networkId: NETWORK_ID });
+    for (const tx of transactions) { tx.sign([opKey]); await tx.submit(rpc); }
+    while ((await rpc.getUtxosByAddresses({ addresses: [escrowAddr] })).entries.length < 2) await new Promise((r) => setTimeout(r, 3000));
+    const eu = (await rpc.getUtxosByAddresses({ addresses: [escrowAddr] })).entries;
+    const u1 = [eu[0]], u2 = [eu[1]];
+
+    // ── (1) SETTLE branch: oracle declares A won → pays A in full (regression: v2 settle still works) ──
+    const { key: oracleKey } = core.deriveArbiter(matchId);
+    const tag = sha256(Buffer.concat([Buffer.from('DGMTv2'), Buffer.from(String(matchId)), Buffer.from([0x00])]));
+    const msgA = sha256(Buffer.concat([tag, Buffer.from([0x00])]));
+    const oracleSigA = signHash(msgA, oracleKey);
+    const trySettle = async (input) => {
+      const total = BigInt(input[0].amount), fee = 5_000_000n;
+      const tx = k.createTransaction(input, [{ address: A.address, amount: total - fee }], fee, undefined, 2);
+      const ins = tx.inputs;
+      ins[0].signatureScript = p2shSig(redeemHex, [oracleSigA, Buffer.alloc(0), Buffer.alloc(0), numToBytes(1)]); // [sig, winnerSel=F(A), isDraw=F, settle=T]
+      tx.inputs = ins;
+      try { const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false }); return { accepted: true, id: String(resp.transactionId ?? resp) }; }
+      catch (e) { return { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 300) }; }
+    };
+    expect('SETTLE (A won) pays A on the combined covenant', await trySettle(u1), true);
+
+    // ── (2) FORFEIT branch: co-signed checkpoint → outputs into PA (the mass-critical path) ──
+    const dl = Buffer.from(numToBytes(past));
+    const hC = sha256(Buffer.concat([Buffer.from(matchTag), dl, plyFixed(PLY), Buffer.from([0x01])]));
+    const sigA = signHash(hC, A.key), sigB = signHash(hC, B.key);
+    const hF = await trySpendS11bCombined(rpc, redeemHex, u2, addrPA, past, PLY, 0x01, sigA, sigB);
+    expect('FORFEIT lands in PA on the combined covenant (mass OK)', hF, true);
+    if (hF.accepted) {
+      await new Promise((r) => setTimeout(r, 4000));
+      const landed = await rpc.getUtxosByAddresses({ addresses: [addrPA] });
+      if (!landed.entries.length) critical = true;
+      console.log(`   ${landed.entries.length ? 'ok ' : 'BAD'} pot landed at PA (${landed.entries.length})`);
+      if (landed.entries.length) {
+        const u = landed.entries, inDaa = BigInt(u[0].blockDaaScore), MARGIN = 15n;
+        console.log(`   waiting for the ${W}-DAA window (+${MARGIN})...`);
+        for (;;) { const now = BigInt((await rpc.getBlockDagInfo()).virtualDaaScore); if (now >= inDaa + W + MARGIN) break; await new Promise((r) => setTimeout(r, 3000)); }
+        const total = BigInt(u[0].amount), fee = 5_000_000n;
+        const mkFin = () => { const tx = k.createTransaction(u, [{ address: A.address, amount: total - fee }], fee, undefined, 2); tx.lockTime = inDaa + W; const ins = tx.inputs; ins[0].sequence = 0n; ins[0].signatureScript = p2shSig(redeemA, [numToBytes(1)]); tx.inputs = ins; return tx; };
+        let fin = { accepted: false };
+        for (let i = 0; i < 4 && !fin.accepted; i++) { if (i) await new Promise((r) => setTimeout(r, 4000)); try { const resp = await rpc.submitTransaction({ transaction: mkFin(), allowOrphan: false }); fin = { accepted: true, id: String(resp.transactionId ?? resp) }; } catch (e) { fin = { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 200) }; } }
+        expect('finalise the PA pot to A', fin, true);
+      }
+    }
+    await new Promise((r) => setTimeout(r, 4000));
+    await sweepBack(rpc, A.address, A.key);
+    console.log(critical ? 'S12 FAILED.' : 'S12 PASSED — the combined v3 covenant settles AND forfeits from one script; the ~1KB forfeit spend clears compute-mass.');
+  });
+}
+// forfeit spend of the COMBINED covenant: same witness as S11b but with the outer/inner selectors
+// (OP_TRUE forfeit, OP_FALSE not-settle) appended on top.
+async function trySpendS11bCombined(rpc, redeemHex, input, payToAddr, deadlineDaa, ply, claimant, sigA, sigB) {
+  const total = BigInt(input[0].amount), fee = 5_000_000n;
+  const tx = k.createTransaction(input, [{ address: payToAddr, amount: total - fee }], fee, undefined, 5);
+  tx.lockTime = BigInt(deadlineDaa);
+  const dl = Buffer.from(numToBytes(BigInt(deadlineDaa)));
+  const ins = tx.inputs; ins[0].sequence = 0n;
+  ins[0].signatureScript = p2shSig(redeemHex, [dl, plyFixed(ply), Buffer.from([claimant]), sigA, sigB, numToBytes(1), Buffer.alloc(0)]);
+  tx.inputs = ins;
+  try { const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false }); return { accepted: true, id: String(resp.transactionId ?? resp) }; }
+  catch (e) { return { accepted: false, err: String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 400) }; }
+}
+
 const which = process.argv[2];
 if (which === 'S8') await s8();
 else if (which === 'S9') await s9();
@@ -611,5 +740,6 @@ else if (which === 'S10') await s10();
 else if (which === 'S11') await s11();
 else if (which === 'S11b') await s11b();
 else if (which === 'S11n') await s11n();
-else { console.error('usage: node spikes_forfeit.mjs [S8|S9|S10|S11|S11b|S11n]'); process.exit(1); }
+else if (which === 'S12') await s12();
+else { console.error('usage: node spikes_forfeit.mjs [S8|S9|S10|S11|S11b|S11n|S12]'); process.exit(1); }
 process.exit(0);
