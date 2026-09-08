@@ -774,6 +774,21 @@
       return;
     }
 
+    if (s.state === "forfeit_window") {
+      // v3 (roadmap #3a): a timeout was claimed TRUSTLESSLY — the pot sits in the pending covenant and
+      // pays out automatically once the challenge window passes (a safety delay so a game that actually
+      // continued can be defended). No signing either way.
+      const title = s.youWon ? "You won on time 🏆" : "Out of time";
+      const note = s.youWon
+        ? "Your opponent's clock ran out. The pot was claimed on chain and releases to you automatically "
+          + "after a short challenge window — no signing needed."
+        : "Your clock ran out. Your opponent is collecting the pot after the challenge window.";
+      const tx = s.forfeit && s.forfeit.claimTxid
+        ? `<div class="claim-note">Forfeit claim <code>${esc(s.forfeit.claimTxid)}</code>.</div>` : "";
+      el.innerHTML = `<div class="claim-title">${title}</div><div class="claim-note">${note}</div>${tx}`;
+      return;
+    }
+
     if (s.state === "broadcast") {
       // v2 (covenant) matches settle themselves — the loser polls too and sees payout 0, so the
       // wording is outcome-aware rather than a blanket "Paid out".

@@ -162,15 +162,16 @@ async def settle_v3(*, escrows: list[dict], outcome: str, pk_a: str, pk_b: str,
     })
 
 
-async def forfeit_claim_v3(*, escrow: dict, match_id: str, pk_a: str, pk_b: str, sess_pk_a: str,
+async def forfeit_claim_v3(*, escrows: list[dict], match_id: str, pk_a: str, pk_b: str, sess_pk_a: str,
                            sess_pk_b: str, w_daa: int, deadline_daa: int, ply: int, claimant: str,
                            sig_a: str, sig_b: str) -> dict:
-    """Spend a v3 escrow into its pending-forfeit covenant on a co-signed checkpoint whose
-    deadline has lapsed. `claimant` 'A'|'B'; `sig_a`/`sig_b` are the two session co-signatures
-    over the checkpoint. Returns {txid, pendingAddress, pendingRedeem} — the pot now sits in
-    the challenge-window covenant, NOT yet paid."""
+    """Spend the v3 escrow(s) into the pending-forfeit covenant on a co-signed checkpoint whose
+    deadline has lapsed. `escrows` is [{address, redeemHex}] for both stakes, spent atomically in one
+    tx. `claimant` 'A'|'B'; `sig_a`/`sig_b` are the two session co-signatures over the checkpoint.
+    Returns {txid, pendingAddress, pendingRedeem, inputs} — the pot now sits in the challenge-window
+    covenant, NOT yet paid."""
     return await _post("/escrow-v3/forfeit-claim", {
-        "escrow": escrow, "matchId": match_id, "pkA": pk_a, "pkB": pk_b,
+        "escrows": escrows, "matchId": match_id, "pkA": pk_a, "pkB": pk_b,
         "sessPkA": sess_pk_a, "sessPkB": sess_pk_b, "wDaa": w_daa,
         "deadlineDaa": deadline_daa, "ply": ply, "claimant": claimant, "sigA": sig_a, "sigB": sig_b,
     })

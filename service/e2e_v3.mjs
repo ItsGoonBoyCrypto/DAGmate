@@ -61,7 +61,7 @@ const sigA = Buffer.from(mc.signCheckpoint(cp, SA.privHex)).toString('hex');
 const sigB = Buffer.from(mc.signCheckpoint(cp, SB.privHex)).toString('hex');
 expect('checkpoint co-sigs verify off-chain', mc.verifyCheckpoint(cp, Buffer.from(sigA, 'hex'), SA.xonlyHex) && mc.verifyCheckpoint(cp, Buffer.from(sigB, 'hex'), SB.xonlyHex));
 let claim;
-try { claim = await v3.forfeitClaim({ escrow: { address: eF.address, redeemHex: eF.redeemHex }, matchId: mForfeit, pkA: A.xo, pkB: B.xo, sessPkA: SA.xonlyHex, sessPkB: SB.xonlyHex, wDaa, deadlineDaa: past, ply: PLY, claimant: 'A', sigA, sigB }); }
+try { claim = await v3.forfeitClaim({ escrows: [{ address: eF.address, redeemHex: eF.redeemHex }], matchId: mForfeit, pkA: A.xo, pkB: B.xo, sessPkA: SA.xonlyHex, sessPkB: SB.xonlyHex, wDaa, deadlineDaa: past, ply: PLY, claimant: 'A', sigA, sigB }); }
 catch (e) { console.log('   forfeitClaim err:', String(e.message).slice(0, 200)); }
 expect('forfeitClaim spends escrow into the pending covenant', !!claim?.txid, claim?.pendingAddress);
 

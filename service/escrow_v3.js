@@ -269,11 +269,14 @@ export async function settleV3({ escrows, outcome, pkA, pkB, sigA, sigB }) {
   });
 }
 
-/** POST /escrow-v3/forfeit-claim — spend a v3 escrow into its pending-forfeit covenant, presenting a
- *  co-signed checkpoint (deadline lapsed). `claimant` 'A'|'B'. Returns the pending address the pot lands
- *  at (so the caller can watch/finalise/cancel). No oracle involved. */
-export async function forfeitClaim({ escrow, matchId, pkA, pkB, sessPkA, sessPkB, wDaa, deadlineDaa, ply, claimant, sigA, sigB }) {
-  if (!escrow || !escrow.address || !escrow.redeemHex) throw new Error('escrow {address, redeemHex} required');
+/** POST /escrow-v3/forfeit-claim — spend the v3 escrow(s) into the pending-forfeit covenant on a
+ *  co-signed checkpoint whose deadline has lapsed. `escrows` is [{address, redeemHex}] (both stakes —
+ *  each side's escrow) spent in ONE tx so it's atomic: both stakes move into the pending covenant or
+ *  neither does (no partial state where the winner's prize is stranded). Both forfeit branches
+ *  reconstruct the SAME pending address (the forfeit body is identical across sides), so every input
+ *  pays its matching-index output there. `claimant` 'A'|'B'. No oracle involved. */
+export async function forfeitClaim({ escrows, matchId, pkA, pkB, sessPkA, sessPkB, wDaa, deadlineDaa, ply, claimant, sigA, sigB }) {
+  if (!Array.isArray(escrows) || !escrows.length) throw new Error('escrows [{address, redeemHex}] required');
   if (claimant !== 'A' && claimant !== 'B') throw new Error("claimant must be 'A' or 'B'");
   if (!sigA || !sigB) throw new Error('sigA and sigB (both session co-signatures over the checkpoint) required');
   const k = core.wasm();
@@ -285,19 +288,23 @@ export async function forfeitClaim({ escrow, matchId, pkA, pkB, sessPkA, sessPkB
     sessPkA: H(toXOnly(sessPkA)), sessPkB: H(toXOnly(sessPkB)), ckTag,
   });
   const pendingAddress = p2shAddress(pendingRedeem);
+  const byAddress = new Map(escrows.map((e) => [e.address, e]));
   return core.withRpc(async (rpc) => {
-    const { entries } = await rpc.getUtxosByAddresses({ addresses: [escrow.address] });
+    const { entries } = await rpc.getUtxosByAddresses({ addresses: escrows.map((e) => e.address) });
     if (!entries.length) throw new Error('no escrow UTXO to forfeit-claim — funded/already spent?');
-    const total = entries.reduce((s, e) => s + BigInt(e.amount), 0n);
-    const fee = SETTLE_V3_FEE_SOMPI_PER_INPUT;
-    const tx = k.createTransaction(entries, [{ address: pendingAddress, amount: total - fee }], fee, undefined, 5);
+    const fee = SETTLE_V3_FEE_SOMPI_PER_INPUT * BigInt(entries.length);
+    // one pending-address output per input, SAME index (the forfeit body binds output[i] to input[i]).
+    const perInput = entries.map((e) => { const esc = byAddress.get(String(e.address)); if (!esc) throw new Error(`claim input spends unknown escrow ${e.address}`); return { e, esc }; });
+    const outputs = perInput.map(({ e }) => ({ address: pendingAddress, amount: BigInt(e.amount) - SETTLE_V3_FEE_SOMPI_PER_INPUT }));
+    const tx = k.createTransaction(entries, outputs, fee, undefined, 5 * entries.length);
     tx.lockTime = BigInt(deadlineDaa);
     const dl = Buffer.from(numToBytes(BigInt(deadlineDaa)));
-    const ins = tx.inputs; ins[0].sequence = 0n;
-    ins[0].signatureScript = p2shSig(escrow.redeemHex, [dl, plyFixed(ply), Buffer.from([claimantByte]), H(sigA), H(sigB), numToBytes(1), Buffer.alloc(0)]);
+    const witness = [dl, plyFixed(ply), Buffer.from([claimantByte]), H(sigA), H(sigB), numToBytes(1), Buffer.alloc(0)];
+    const ins = tx.inputs;
+    perInput.forEach(({ esc }, i) => { ins[i].sequence = 0n; ins[i].signatureScript = p2shSig(esc.redeemHex, witness); });
     tx.inputs = ins;
     const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false });
-    return { txid: String(resp.transactionId ?? resp), pendingAddress, pendingRedeem };
+    return { txid: String(resp.transactionId ?? resp), pendingAddress, pendingRedeem, inputs: entries.length };
   });
 }
 
@@ -309,13 +316,19 @@ export async function forfeitFinalise({ pendingRedeem, pendingAddress, claimant,
   return core.withRpc(async (rpc) => {
     const { entries } = await rpc.getUtxosByAddresses({ addresses: [pendingAddress] });
     if (!entries.length) throw new Error('no pending-forfeit UTXO (already finalised/cancelled?)');
-    const u = entries; const inDaa = BigInt(u[0].blockDaaScore);
-    const total = BigInt(u[0].amount), fee = SETTLE_V3_FEE_SOMPI_PER_INPUT;
-    const tx = k.createTransaction(u, [{ address: payAddr, amount: total - fee }], fee, undefined, 2);
-    tx.lockTime = inDaa + BigInt(wDaa);
-    const ins = tx.inputs; ins[0].sequence = 0n; ins[0].signatureScript = p2shSig(pendingRedeem, [numToBytes(1)]); tx.inputs = ins;
+    // Both escrows forfeit into the SAME pending covenant (identical forfeit body), so there can be
+    // more than one UTXO here — sweep them ALL to the claimant in one tx. Each input's FINALIZE leg
+    // checks its OWN creation DAA + wDaa <= tx.lockTime, so lockTime must clear the LATEST one.
+    const total = entries.reduce((s, e) => s + BigInt(e.amount), 0n);
+    const maxInDaa = entries.reduce((mx, e) => { const d = BigInt(e.blockDaaScore); return d > mx ? d : mx; }, 0n);
+    const fee = SETTLE_V3_FEE_SOMPI_PER_INPUT * BigInt(entries.length);
+    const tx = k.createTransaction(entries, [{ address: payAddr, amount: total - fee }], fee, undefined, 2 * entries.length);
+    tx.lockTime = maxInDaa + BigInt(wDaa);
+    const ins = tx.inputs;
+    for (let i = 0; i < ins.length; i++) { ins[i].sequence = 0n; ins[i].signatureScript = p2shSig(pendingRedeem, [numToBytes(1)]); }
+    tx.inputs = ins;
     const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false });
-    return { txid: String(resp.transactionId ?? resp), paid: payAddr };
+    return { txid: String(resp.transactionId ?? resp), paid: payAddr, inputs: entries.length };
   });
 }
 
@@ -328,13 +341,17 @@ export async function forfeitCancel({ pendingRedeem, pendingAddress, canceller, 
   return core.withRpc(async (rpc) => {
     const { entries } = await rpc.getUtxosByAddresses({ addresses: [pendingAddress] });
     if (!entries.length) throw new Error('no pending-forfeit UTXO to cancel');
-    const total = BigInt(entries[0].amount), fee = SETTLE_V3_FEE_SOMPI_PER_INPUT;
-    const tx = k.createTransaction(entries, [{ address: payAddr, amount: total - fee }], fee, undefined, 4);
+    // Sweep every pending UTXO (both escrows) to the canceller; each input's CANCEL leg re-verifies
+    // the newer co-signed checkpoint independently, so they share the one witness.
+    const total = entries.reduce((s, e) => s + BigInt(e.amount), 0n);
+    const fee = SETTLE_V3_FEE_SOMPI_PER_INPUT * BigInt(entries.length);
+    const tx = k.createTransaction(entries, [{ address: payAddr, amount: total - fee }], fee, undefined, 4 * entries.length);
     const ins = tx.inputs;
-    ins[0].signatureScript = p2shSig(pendingRedeem, [H(sigA), H(sigB), plyFixed(newPly), Buffer.alloc(0)]);
+    const witness = [H(sigA), H(sigB), plyFixed(newPly), Buffer.alloc(0)];
+    for (let i = 0; i < ins.length; i++) ins[i].signatureScript = p2shSig(pendingRedeem, witness);
     tx.inputs = ins;
     const resp = await rpc.submitTransaction({ transaction: tx, allowOrphan: false });
-    return { txid: String(resp.transactionId ?? resp), paid: payAddr };
+    return { txid: String(resp.transactionId ?? resp), paid: payAddr, inputs: entries.length };
   });
 }
 
