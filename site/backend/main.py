@@ -32,6 +32,7 @@ faked:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -209,6 +210,7 @@ def _match_public(m: dict) -> dict:
     b = db.get_account(m["player_b_account_id"])
     return {
         "id": m["id"], "status": m["status"], "mode": m["mode"],
+        "challengeId": m["challenge_id"],  # so the creator can find their session key (stashed by it)
         "stakeKas": m["stake_sompi"] / config.SOMPI_PER_KAS,
         "isFree": m["stake_sompi"] == 0,  # free game — no escrow, no pot
         "fen": m["fen"], "turn": m["turn"], "result": m["result"],
@@ -246,6 +248,28 @@ def _match_public(m: dict) -> dict:
         # account ids, so colour is the whole answer without leaking one.
         "drawOffer": {"byColor": _color_of(m, m["draw_offer_by"])} if m["draw_offer_by"] else None,
         "clock": clocks.public(m),
+        # v3 move channel (roadmap #3a): the checkpoint the two clients co-sign so a timeout can be
+        # collected trustlessly. Present only on a live v3 match; None otherwise (v1/v2/free ignore it).
+        "checkpoint": _checkpoint_public(m),
+    }
+
+
+def _checkpoint_public(m: dict) -> dict | None:
+    """What each client needs to co-sign the current position's checkpoint: the domain tag + the
+    server-computed fields (so both sign identical bytes), and whether it's fully co-signed yet.
+    The client signs SHA256(tag ‖ deadlineDaa ‖ ply2 ‖ claimant) with its session key and posts it
+    to /checkpoint/sign. None unless this is a live v3 match with a pending checkpoint."""
+    if (m["escrow_version"] or "") != "v3" or m["status"] != "live" or not m["pending_cp_json"]:
+        return None
+    cp = json.loads(m["pending_cp_json"])
+    return {
+        "tag": m["checkpoint_tag"],
+        "deadlineDaa": cp["deadlineDaa"],
+        "ply": cp["ply"],
+        "claimant": cp["claimant"],           # 'A' wins if the side to move flags, or 'B'
+        "haveA": bool(cp["sigA"]),
+        "haveB": bool(cp["sigB"]),
+        "cosigned": bool(cp["sigA"] and cp["sigB"]),
     }
 
 
@@ -637,7 +661,6 @@ async def make_move(match_id: str, body: MoveBody, a: dict = Depends(require_acc
     if await clocks.forfeit_if_flagged(m, at_ms):
         raise HTTPException(400, "your clock ran out")
 
-    import json
     prior_moves = json.loads(m["moves_json"])
     try:
         # Pass the full move history so repetition draws (threefold/fivefold) are
@@ -667,12 +690,67 @@ async def make_move(match_id: str, body: MoveBody, a: dict = Depends(require_acc
 
     if status["game_over"]:
         await _settle_game_over(match_id, status["result"], status["winner_color"])
+    else:
+        # v3 move channel: pin a fresh checkpoint for the NEW position so a later timeout can be
+        # collected trustlessly. Best-effort — a failed DAA read must never undo a legal move; the
+        # match just won't get a fresh checkpoint (the forfeit then falls back to the oracle path).
+        await _refresh_v3_checkpoint(match_id, mover_is_a=is_a)
 
     m = db.get_match(match_id)
     out = _match_public(m)
     out["legalMoves"] = chess_logic.legal_uci_moves(m["fen"]) if m["status"] == "live" else []
     out["inCheck"] = status["in_check"]
     return out
+
+
+async def _refresh_v3_checkpoint(match_id: str, *, mover_is_a: bool):
+    """After a v3 move, compute the CURRENT position's checkpoint fields and store them for both
+    clients to co-sign. Server-authoritative so clients never dispute the deadline:
+      claimant  = the mover (they win if the side-to-move now flags),
+      deadlineDaa = now_daa + (side-to-move's remaining clock, in DAA) + margin.
+    Best-effort: swallow any error (a DAA-read failure leaves no fresh checkpoint, which just means a
+    timeout would fall back to the oracle settle — never a broken move)."""
+    try:
+        m = db.get_match(match_id)
+        if not m or (m["escrow_version"] or "") != "v3" or m["status"] != "live":
+            return
+        now_daa = await service_client.daa_score()
+        white_ms, black_ms = clocks.remaining_ms(m)
+        to_move_ms = white_ms if m["turn"] == "white" else black_ms
+        fields = {
+            "ply": len(json.loads(m["moves_json"])),
+            "claimant": "A" if mover_is_a else "B",
+            "deadlineDaa": daa_clock.deadline_daa(now_daa, to_move_ms / 1000.0),
+        }
+        db.set_pending_checkpoint(match_id, fields)
+    except Exception as e:
+        log.info(f"v3 checkpoint refresh skipped for {match_id}: {e}")
+
+
+class CheckpointSigBody(BaseModel):
+    sig: str  # 64-byte BIP340 schnorr over the checkpoint hash, x-only, hex
+
+
+@app.post("/api/matches/{match_id}/checkpoint/sign")
+async def sign_checkpoint(match_id: str, body: CheckpointSigBody, a: dict = Depends(require_account)):
+    """A player posts their co-signature over the current pending checkpoint (roadmap #3a). When both
+    are in, the server promotes it to the match's latest co-signed checkpoint — the state the forfeit
+    driver uses. The sig itself is validated on-chain by the covenant at claim time, so a bad one just
+    means that player's forfeit can't be collected trustlessly (it falls back to the oracle)."""
+    m = db.get_match(match_id)
+    if not m:
+        raise HTTPException(404, "match not found")
+    is_a = a["id"] == m["player_a_account_id"]
+    is_b = a["id"] == m["player_b_account_id"]
+    if not (is_a or is_b):
+        raise HTTPException(403, "you're not a player in this match")
+    if (m["escrow_version"] or "") != "v3":
+        raise HTTPException(400, "this match has no move channel")
+    sig = str(body.sig).strip().lower().replace("0x", "")
+    if len(sig) != 128 or any(ch not in "0123456789abcdef" for ch in sig):
+        raise HTTPException(400, "sig must be a 64-byte schnorr signature (128 hex chars)")
+    db.add_checkpoint_sig(match_id, "A" if is_a else "B", sig)
+    return _checkpoint_public(db.get_match(match_id)) or {"cosigned": False}
 
 
 @app.post("/api/matches/{match_id}/resign")

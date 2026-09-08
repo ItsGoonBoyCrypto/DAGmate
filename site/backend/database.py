@@ -215,6 +215,17 @@ def ensure_schema():
         _add_column(c, "matches", "forfeit_pending_redeem", "TEXT")
         _add_column(c, "matches", "forfeit_claim_txid", "TEXT")
         _add_column(c, "matches", "forfeit_claim_daa", "INTEGER")
+        # The per-match checkpoint domain tag (SHA256("DGMTv3ff"‖hd_index)); both clients fold it into
+        # every co-signed checkpoint. Returned by build_escrow_v3, stored so the API can hand it out.
+        _add_column(c, "matches", "checkpoint_tag", "TEXT")
+        # The move channel (roadmap #3a). `pending_cp_json` is the CURRENT position's checkpoint being
+        # collected: {deadlineDaa, ply, claimant, sigA, sigB} — the fields are server-computed (from the
+        # authoritative clock + a DAA read) so clients only SIGN, never dispute the deadline; sigA/sigB
+        # fill in as each player signs. `cosigned_cp_json` is the most recent FULLY co-signed checkpoint
+        # (promoted from pending when both sigs are in) — the one the forfeit driver actually uses, kept
+        # separate so a fresh unsigned pending can't erase the last usable co-signed state.
+        _add_column(c, "matches", "pending_cp_json", "TEXT")
+        _add_column(c, "matches", "cosigned_cp_json", "TEXT")
         # The creator's session pubkey, captured when the challenge is made (before
         # a match exists). Copied to matches.sess_pk_a at accept.
         _add_column(c, "challenges", "sess_pk", "TEXT")
@@ -694,10 +705,75 @@ def set_match_escrows(match_id: str, escrow_a: dict, escrow_b: dict, version: st
     with _lock, _conn() as c:
         c.execute("UPDATE matches SET escrow_a_address=?, escrow_a_redeem_hex=?, "
                    "escrow_b_address=?, escrow_b_redeem_hex=?, escrow_version=?, "
-                   "sess_pk_a=?, sess_pk_b=?, w_daa=? WHERE id=?",
+                   "sess_pk_a=?, sess_pk_b=?, w_daa=?, checkpoint_tag=? WHERE id=?",
                    (escrow_a.get("address"), escrow_a.get("redeemHex"),
                     escrow_b.get("address"), escrow_b.get("redeemHex"), version,
-                    sess_pk_a, sess_pk_b, w_daa, match_id))
+                    sess_pk_a, sess_pk_b, w_daa, escrow_a.get("checkpointTag"), match_id))
+
+
+def set_pending_checkpoint(match_id: str, fields: dict):
+    """Start collecting signatures for the CURRENT position's checkpoint (roadmap #3a). `fields` is the
+    server-computed {deadlineDaa, ply, claimant} — the sig slots start empty. Overwrites any earlier
+    pending (a new move supersedes an unfinished one); the last fully co-signed checkpoint is untouched."""
+    import json as _json
+    with _lock, _conn() as c:
+        cp = {"deadlineDaa": int(fields["deadlineDaa"]), "ply": int(fields["ply"]),
+              "claimant": fields["claimant"], "sigA": None, "sigB": None}
+        c.execute("UPDATE matches SET pending_cp_json=? WHERE id=?", (_json.dumps(cp), match_id))
+
+
+def add_checkpoint_sig(match_id: str, side: str, sig: str) -> dict | None:
+    """Record one player's signature over the pending checkpoint. When BOTH are in, promote the pending
+    checkpoint to `cosigned_cp_json` (the latest fully co-signed state the forfeit driver uses) and
+    return it; otherwise return None. Guarded read-modify-write under the lock so two near-simultaneous
+    signs can't lose one. `side` is 'A' or 'B'."""
+    import json as _json
+    with _lock, _conn() as c:
+        row = _row(c.execute("SELECT pending_cp_json FROM matches WHERE id=?", (match_id,)))
+        if not row or not row["pending_cp_json"]:
+            return None
+        cp = _json.loads(row["pending_cp_json"])
+        cp["sigA" if side == "A" else "sigB"] = sig
+        if cp["sigA"] and cp["sigB"]:
+            c.execute("UPDATE matches SET pending_cp_json=?, cosigned_cp_json=? WHERE id=?",
+                       (_json.dumps(cp), _json.dumps(cp), match_id))
+            return cp
+        c.execute("UPDATE matches SET pending_cp_json=? WHERE id=?", (_json.dumps(cp), match_id))
+        return None
+
+
+def mark_forfeit_claimed(match_id: str, claim_txid: str, claim_daa: int, pending_address: str,
+                         pending_redeem: str, winner_account_id: str, result: str = "timeout") -> bool:
+    """Record that clocks.py spent a v3 escrow into its pending-forfeit covenant (roadmap #3a) and mark
+    the match settled with the on-chain winner. Guarded on forfeit_claim_txid IS NULL so only the first
+    claim records — a re-trigger is a harmless no-op. The pot is not PAID yet (that's the finalise after
+    the window); settle_txid stays NULL until then, which is how the panel shows the challenge window."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET forfeit_claim_txid=?, forfeit_claim_daa=?, forfeit_pending_address=?, "
+            "forfeit_pending_redeem=?, status='settled', result=?, winner_account_id=?, settled_ts=? "
+            "WHERE id=? AND forfeit_claim_txid IS NULL AND status='live'",
+            (claim_txid, claim_daa, pending_address, pending_redeem, result, winner_account_id,
+             int(time.time()), match_id))
+        return cur.rowcount == 1
+
+
+def mark_forfeit_finalised(match_id: str, finalise_txid: str) -> bool:
+    """Record the finalise tx (pot paid to the claimant after the challenge window). Reuses settle_txid
+    so the existing 'broadcast' panel lights up. Guarded on settle_txid IS NULL."""
+    with _lock, _conn() as c:
+        cur = c.execute("UPDATE matches SET settle_txid=?, settle_broadcast_ts=? "
+                        "WHERE id=? AND settle_txid IS NULL",
+                        (finalise_txid, int(time.time()), match_id))
+        return cur.rowcount == 1
+
+
+def list_forfeit_pending() -> list[dict]:
+    """v3 matches that have been forfeit-claimed but not yet finalised — the clocks poller walks these
+    to finalise once each one's challenge window has passed."""
+    with _lock, _conn() as c:
+        return _rows(c.execute("SELECT * FROM matches WHERE escrow_version='v3' AND "
+                               "forfeit_claim_txid IS NOT NULL AND settle_txid IS NULL"))
 
 
 def mark_v2_settled(match_id: str, txid: str, verdict_json: str) -> bool:

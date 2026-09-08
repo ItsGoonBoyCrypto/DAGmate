@@ -546,6 +546,8 @@
     // New match on screen — the payout/reclaim panels must recompute for it.
     state.settleFor = null;
     state.reclaimFor = null;
+    state.lastSignedCp = null;
+    maybeCosignCheckpoint(m);
     renderMatchCard();
     document.getElementById("boardCard").style.display = "block";
     document.getElementById("boardCard").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -569,8 +571,31 @@
       if (state.currentMatch && state.currentMatch.fen !== m.fen) state.selectedSquare = null;
       state.currentMatch = m;
       state.clockRecvAt = Date.now();
+      maybeCosignCheckpoint(m);
       renderMatchCard();
     } catch (e) { /* keep last known state on transient error */ }
+  }
+
+  // v3 move channel: whenever a checkpoint is on the board and MY signature is missing, co-sign it
+  // with this match's session key (never sent — only the signature goes up). Fire-and-forget so it
+  // never blocks the board; deduped per checkpoint so a poll can't re-post the same signature.
+  async function maybeCosignCheckpoint(m) {
+    try {
+      const cp = m && m.checkpoint;
+      if (!cp || !window.DAGSession || !m.playerA || !m.playerB) return;
+      const mySide = m.playerA.address === state.address ? "A"
+                   : m.playerB.address === state.address ? "B" : null;
+      if (!mySide) return;                                   // spectator (shouldn't happen for a player match)
+      if (mySide === "A" ? cp.haveA : cp.haveB) return;      // already signed this one
+      const priv = window.DAGSession.privForMatch(m.id, m.challengeId);
+      if (!priv) return;                                     // no session key on this device — oracle fallback
+      const tagKey = `${m.id}:${cp.ply}:${cp.deadlineDaa}:${cp.claimant}`;
+      if (state.lastSignedCp === tagKey) return;             // dedupe across rapid polls
+      state.lastSignedCp = tagKey;
+      const sig = await window.DAGSession.signCheckpoint(
+        { matchTag: cp.tag, deadlineDaa: BigInt(cp.deadlineDaa), ply: cp.ply, claimant: cp.claimant }, priv);
+      await api("POST", `/api/matches/${m.id}/checkpoint/sign`, { sig });
+    } catch (e) { state.lastSignedCp = null; /* let a later poll retry */ }
   }
 
   function renderMatchCard() {
@@ -1151,6 +1176,7 @@
       state.pollSeq++;
       state.currentMatch = m;
       state.clockRecvAt = Date.now();
+      maybeCosignCheckpoint(m);   // v3: co-sign the checkpoint this move just pinned (I'm the claimant)
       renderMatchCard();
       refreshMatches();
     } catch (e) { toast(e.message); }
