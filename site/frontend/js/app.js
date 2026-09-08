@@ -406,7 +406,16 @@
       return;
     }
     try {
-      await api("POST", "/api/challenges", { toAddress, stakeKas, mode });
+      // v3 (roadmap #3a): a STAKED challenge mints a per-match session key; its x-only pubkey rides
+      // along so the covenant can bake it as a checkpoint signer, and the private half is stashed
+      // locally (never sent). Harmless if the match ends up v1/v2 — the server ignores sessPk then.
+      let sessPriv = null, sessPk = null;
+      if (stakeKas > 0 && window.DAGSession) {
+        try { const s = await window.DAGSession.mint(); sessPk = s.xonlyHex; sessPriv = s.privHex; }
+        catch (_) { /* no crypto → fall back to a keyless (v2/v1) match */ }
+      }
+      const ch = await api("POST", "/api/challenges", { toAddress, stakeKas, mode, sessPk });
+      if (sessPriv && ch && ch.id) window.DAGSession.stashForChallenge(ch.id, sessPriv);
       toast("Challenge created.");
       e.target.reset();
       document.getElementById("chStake").value = 1;
@@ -437,7 +446,7 @@
         const acceptBtn = document.createElement("button");
         acceptBtn.className = "btn btn-primary";
         acceptBtn.textContent = "Accept";
-        acceptBtn.addEventListener("click", (e) => acceptChallenge(ch.id, e.currentTarget));
+        acceptBtn.addEventListener("click", (e) => acceptChallenge(ch.id, e.currentTarget, ch.stakeKas > 0));
         actions.appendChild(acceptBtn);
       }
       const declineBtn = document.createElement("button");
@@ -449,7 +458,7 @@
     }
   }
 
-  async function acceptChallenge(id, btn) {
+  async function acceptChallenge(id, btn, staked) {
     if (state.profile && !state.profile.hasPubkey) {
       toast("This wallet has no pubkey on file — escrow can't be built. Use a demo wallet for local testing.");
     }
@@ -459,7 +468,14 @@
     // second match either — this is the fast local half of that guard.
     if (btn) btn.disabled = true;
     try {
-      const match = await api("POST", `/api/challenges/${id}/accept`);
+      // v3: the accepter mints their own session key for a staked match (same as the creator did).
+      let sessPriv = null, sessPk = null;
+      if (staked && window.DAGSession) {
+        try { const s = await window.DAGSession.mint(); sessPk = s.xonlyHex; sessPriv = s.privHex; }
+        catch (_) { /* keyless fallback */ }
+      }
+      const match = await api("POST", `/api/challenges/${id}/accept`, { sessPk });
+      if (sessPriv && match && match.id) window.DAGSession.stashForMatch(match.id, sessPriv);
       toast("Challenge accepted — match created.");
       refreshChallenges();
       refreshMatches();

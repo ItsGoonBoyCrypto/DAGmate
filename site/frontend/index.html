@@ -195,6 +195,9 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- v3 move-channel session keys (roadmap #3a). Module, so it's deferred and sets window.DAGSession
+     before any user action; app.js (classic, below) reads it lazily at challenge create/accept. -->
+<script type="module" src="js/dag_session.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>
