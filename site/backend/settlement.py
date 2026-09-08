@@ -141,6 +141,11 @@ async def prepare(match_id: str, address: str) -> dict:
     # round-trip, so the whole v1 build/sign machinery below is skipped.
     if (m["escrow_version"] or "v1") == "v2":
         return await _settle_v2(match_id, m, address, a, b)
+    # Roadmap #3a: a v3 match settles like v2 for a decided game (oracle verdict → covenant
+    # pays out); a TIMEOUT instead takes the trustless forfeit path, which clocks.py drives
+    # on-chain and records here, so by the time this runs a forfeit is already settle_txid'd.
+    if (m["escrow_version"] or "v1") == "v3":
+        return await _settle_v3(match_id, m, address, a, b)
     if m["settle_txid"]:
         return _public(m, address, a, b)
 
@@ -353,6 +358,11 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
     # that still POSTs one) just triggers or confirms the auto-settle, idempotently.
     if (m["escrow_version"] or "v1") == "v2":
         return await _settle_v2(match_id, m, address, a, b)
+    # Roadmap #3a: a v3 match settles like v2 for a decided game (oracle verdict → covenant
+    # pays out); a TIMEOUT instead takes the trustless forfeit path, which clocks.py drives
+    # on-chain and records here, so by the time this runs a forfeit is already settle_txid'd.
+    if (m["escrow_version"] or "v1") == "v3":
+        return await _settle_v3(match_id, m, address, a, b)
     if not m["settle_tx_json"]:
         raise SettlementError("nothing prepared to sign — reload and try again")
     if m["settle_txid"]:
@@ -574,6 +584,65 @@ def _public_v2(m: dict, address: str, a: dict, b: dict) -> dict:
         # DAGmate. Surfaced so the UI (or a determined player) can relay it if we ever don't.
         "verdict": verdict,
     }
+
+
+# ── covenant escrow v3 (roadmap #3a) — v2 oracle settle + a dormant trustless forfeit branch ──
+async def _settle_v3(match_id: str, m: dict, address: str, a: dict, b: dict) -> dict:
+    """Settle a decided v3 match. Structurally identical to _settle_v2 — the v3 covenant's SETTLE
+    branch is byte-for-byte v2's oracle-settle (proven S12) — it just calls the v3 sidecar routes.
+    A TIMEOUT ending is NOT settled here: clocks.py drives the trustless forfeit on-chain (claim →
+    challenge window → finalise) and records forfeit_claim_txid / settle_txid, so this reports that
+    state via _public_v3 rather than re-signing an oracle verdict."""
+    if m["settle_txid"] or m["forfeit_claim_txid"]:
+        return _public_v3(m, address, a, b)
+
+    pot = (m["funded_a_sompi"] or 0) + (m["funded_b_sompi"] or 0)
+    if pot and pot < 2 * config.SETTLE_V3_FEE_SOMPI_PER_INPUT:
+        raise SettlementError(
+            "this pot is smaller than the Kaspa network fee needed to release it, so there is "
+            "nothing to claim — the match still stands as an on-chain record")
+    if not m["escrow_a_address"] or not m["escrow_b_address"]:
+        raise SettlementError("this match has no escrow addresses — it was created while the "
+                              "Kaspa service was unreachable")
+
+    outcome = _outcome_of(m, a, b)
+    verdict = await service_client.oracle_sign_result_v3(match_id=m["hd_index"], outcome=outcome)
+    escrows = [
+        {"address": m["escrow_a_address"], "redeemHex": m["escrow_a_redeem_hex"], "side": "A"},
+        {"address": m["escrow_b_address"], "redeemHex": m["escrow_b_redeem_hex"], "side": "B"},
+    ]
+    try:
+        res = await service_client.settle_v3(
+            escrows=escrows, outcome=outcome,
+            pk_a=a["pubkey"], pk_b=b["pubkey"], sig_a=verdict["sigA"], sig_b=verdict["sigB"])
+    except service_client.ServiceError as e:
+        current = db.get_match(match_id)
+        if current["settle_txid"]:
+            return _public_v3(current, address, a, b)  # someone else settled first — success
+        raise SettlementError(str(e))
+    if not db.mark_v2_settled(match_id, res["txid"], json.dumps(verdict)):  # shared verdict column
+        log.info(f"v3 settle for {match_id} raced — keeping the first txid")
+    return _public_v3(db.get_match(match_id), address, a, b)
+
+
+def _public_v3(m: dict, address: str, a: dict, b: dict) -> dict:
+    """v3 payout panel. Same shape as _public_v2 (nothing to sign; the covenant pays out), tagged
+    'v3'. If the match ended by a trustless FORFEIT, surface the challenge-window state too so the
+    UI can show 'won on time — collectable after the window' before the finalise lands."""
+    d = _public_v2(m, address, a, b)
+    d["escrowVersion"] = "v3"
+    if m["forfeit_claim_txid"]:
+        d["forfeit"] = {
+            "claimTxid": m["forfeit_claim_txid"],
+            "claimDaa": m["forfeit_claim_daa"],
+            "windowDaa": m["w_daa"],
+            "pendingAddress": m["forfeit_pending_address"],
+            "finalised": bool(m["settle_txid"]),
+        }
+        # Until the window closes and finalise lands, the pot sits in the pending covenant.
+        if not m["settle_txid"]:
+            d["state"] = "forfeit_window"
+    return d
 
 
 # ── free games (no wager) ───────────────────────────────────────────────────

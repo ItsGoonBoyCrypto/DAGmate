@@ -195,9 +195,29 @@ def ensure_schema():
         # match creation and NEVER changed, so a match settles on the scheme it
         # was built with regardless of how the flag is toggled later.
         _add_column(c, "matches", "escrow_version", "TEXT")
-        # The oracle's published verdict for a v2 win (JSON: winner + sigA/sigB),
+        # The oracle's published verdict for a v2/v3 win (JSON: winner + sigA/sigB),
         # so the winner or anyone can relay the settle even if DAGmate won't.
         _add_column(c, "matches", "settle_v2_verdict_json", "TEXT")
+
+        # ── v3 (roadmap #3a): the per-match SESSION pubkeys (move_channel checkpoint
+        # signers, x-only hex) baked into the v3 covenant, and the challenge window
+        # (DAA) the forfeit legs use. Stored so the forfeit driver can rebuild the
+        # pending covenant later. NULL on v1/v2 matches. The creator's session key
+        # is captured on the challenge first (below) and copied here at build time.
+        _add_column(c, "matches", "sess_pk_a", "TEXT")
+        _add_column(c, "matches", "sess_pk_b", "TEXT")
+        _add_column(c, "matches", "w_daa", "INTEGER")
+        # Trustless-forfeit state (v3, filled by clocks.py's forfeit driver, Phase 2):
+        # the pending-forfeit covenant the pot was moved into, and the txids of the
+        # claim + finalise. Distinct from settle_txid so the panel can show the
+        # challenge window before the pot is finally paid.
+        _add_column(c, "matches", "forfeit_pending_address", "TEXT")
+        _add_column(c, "matches", "forfeit_pending_redeem", "TEXT")
+        _add_column(c, "matches", "forfeit_claim_txid", "TEXT")
+        _add_column(c, "matches", "forfeit_claim_daa", "INTEGER")
+        # The creator's session pubkey, captured when the challenge is made (before
+        # a match exists). Copied to matches.sess_pk_a at accept.
+        _add_column(c, "challenges", "sess_pk", "TEXT")
 
         # Draw offers. `draw_offer_by` is the standing offer (NULL = none);
         # `draw_offer_ply` is the move number it was made at and is NOT cleared
@@ -326,12 +346,16 @@ def set_accept_challenges(account_id: str, enabled: bool):
 
 
 # ── challenges ───────────────────────────────────────────────────────────
-def create_challenge(from_account_id: str, to_account_id: str | None, stake_sompi: int, mode: str, gas_only: bool) -> dict:
+def create_challenge(from_account_id: str, to_account_id: str | None, stake_sompi: int, mode: str,
+                     gas_only: bool, sess_pk: str | None = None) -> dict:
+    """`sess_pk` is the creator's per-match SESSION x-only pubkey (v3 move-channel
+    checkpoint signer), minted client-side. Optional — only v3 uses it, and only
+    when both players supply one; NULL is fine for v1/v2/free."""
     with _lock, _conn() as c:
         cid = str(uuid.uuid4())
-        c.execute("INSERT INTO challenges (id, from_account_id, to_account_id, stake_sompi, mode, gas_only, created_ts) "
-                   "VALUES (?,?,?,?,?,?,?)",
-                   (cid, from_account_id, to_account_id, stake_sompi, mode, 1 if gas_only else 0, int(time.time())))
+        c.execute("INSERT INTO challenges (id, from_account_id, to_account_id, stake_sompi, mode, gas_only, sess_pk, created_ts) "
+                   "VALUES (?,?,?,?,?,?,?,?)",
+                   (cid, from_account_id, to_account_id, stake_sompi, mode, 1 if gas_only else 0, sess_pk, int(time.time())))
         return _row(c.execute("SELECT * FROM challenges WHERE id=?", (cid,)))
 
 
@@ -659,15 +683,21 @@ def mark_reclaim_broadcast(match_id: str, side: str, txid: str) -> bool:
         return cur.rowcount == 1
 
 
-def set_match_escrows(match_id: str, escrow_a: dict, escrow_b: dict, version: str = "v1"):
+def set_match_escrows(match_id: str, escrow_a: dict, escrow_b: dict, version: str = "v1",
+                      sess_pk_a: str | None = None, sess_pk_b: str | None = None,
+                      w_daa: int | None = None):
     """Store both escrow addresses/redeems and pin the escrow scheme. `version`
     is written once at creation and never changed — a match settles on the
-    scheme it was built with (roadmap #2)."""
+    scheme it was built with (roadmap #2). For v3, also pin the two SESSION
+    pubkeys and the challenge window so the forfeit driver can rebuild the
+    pending covenant (roadmap #3a)."""
     with _lock, _conn() as c:
         c.execute("UPDATE matches SET escrow_a_address=?, escrow_a_redeem_hex=?, "
-                   "escrow_b_address=?, escrow_b_redeem_hex=?, escrow_version=? WHERE id=?",
+                   "escrow_b_address=?, escrow_b_redeem_hex=?, escrow_version=?, "
+                   "sess_pk_a=?, sess_pk_b=?, w_daa=? WHERE id=?",
                    (escrow_a.get("address"), escrow_a.get("redeemHex"),
-                    escrow_b.get("address"), escrow_b.get("redeemHex"), version, match_id))
+                    escrow_b.get("address"), escrow_b.get("redeemHex"), version,
+                    sess_pk_a, sess_pk_b, w_daa, match_id))
 
 
 def mark_v2_settled(match_id: str, txid: str, verdict_json: str) -> bool:

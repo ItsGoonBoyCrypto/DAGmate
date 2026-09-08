@@ -47,6 +47,7 @@ import bot_client
 import chess_logic
 import clocks
 import config
+import daa_clock
 import curriculum
 import database as db
 import deposits
@@ -358,6 +359,24 @@ class NewChallengeBody(BaseModel):
     toAddress: str | None = None
     stakeKas: float = 0
     mode: str = "rapid"
+    # v3 (roadmap #3a): the creator's per-match SESSION x-only pubkey (move-channel
+    # checkpoint signer), minted client-side. Optional — ignored unless the match is
+    # built v3 (ESCROW_V3 on + a real stake) and the opponent also supplies one.
+    sessPk: str | None = None
+
+
+def _clean_sess_pk(pk: str | None) -> str | None:
+    """Normalise a client-supplied session pubkey to bare x-only hex (64 chars), or
+    None. Rejects anything that isn't 32-byte hex rather than store junk that would
+    later fail the covenant build — a bad session key is caught here, not at accept."""
+    if not pk:
+        return None
+    s = str(pk).strip().lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    if len(s) != 64 or any(ch not in "0123456789abcdef" for ch in s):
+        raise HTTPException(400, "sessPk must be a 32-byte x-only public key (64 hex chars)")
+    return s
 
 
 @app.post("/api/challenges")
@@ -396,7 +415,8 @@ def new_challenge(body: NewChallengeBody, account: dict = Depends(require_accoun
             raise HTTPException(400, "that player isn't accepting challenges right now")
         to_id = to["id"]
     # `gas_only` doubles as the free-game flag now (a 0-stake, no-escrow match).
-    c = db.create_challenge(account["id"], to_id, stake_sompi, body.mode, is_free)
+    c = db.create_challenge(account["id"], to_id, stake_sompi, body.mode, is_free,
+                            sess_pk=_clean_sess_pk(body.sessPk))
     return _challenge_public(c)
 
 
@@ -405,8 +425,14 @@ def list_challenges(account: dict | None = Depends(optional_account)):
     return [_challenge_public(c) for c in db.list_open_challenges(account["id"] if account else None)]
 
 
+class AcceptChallengeBody(BaseModel):
+    # The accepter's per-match SESSION x-only pubkey (v3). Optional — see NewChallengeBody.
+    sessPk: str | None = None
+
+
 @app.post("/api/challenges/{challenge_id}/accept")
-async def accept_challenge(challenge_id: str, accepter: dict = Depends(require_account)):
+async def accept_challenge(challenge_id: str, body: AcceptChallengeBody | None = None,
+                           accepter: dict = Depends(require_account)):
     ch = db.get_challenge(challenge_id)
     if not ch or ch["status"] != "open":
         raise HTTPException(404, "challenge not found or no longer open")
@@ -431,7 +457,8 @@ async def accept_challenge(challenge_id: str, accepter: dict = Depends(require_a
         match = await _create_match_from_pair(
             challenge_id=challenge_id, tournament_id=None, round_no=None,
             player_a_id=creator["id"], player_b_id=accepter["id"],
-            pk_a=pk_a, pk_b=pk_b, stake_sompi=ch["stake_sompi"], mode=ch["mode"])
+            pk_a=pk_a, pk_b=pk_b, stake_sompi=ch["stake_sompi"], mode=ch["mode"],
+            sess_pk_a=ch["sess_pk"], sess_pk_b=_clean_sess_pk(body.sessPk if body else None))
     except ServiceError as e:
         # No escrow was built and no match survives (see _create_match_from_pair)
         # — hand the challenge back to 'open' so it can be accepted again once the
@@ -469,7 +496,7 @@ def decline_challenge(challenge_id: str, account: dict = Depends(require_account
 
 
 async def _create_match_from_pair(*, challenge_id, tournament_id, round_no, player_a_id, player_b_id,
-                                   pk_a, pk_b, stake_sompi, mode) -> dict:
+                                   pk_a, pk_b, stake_sompi, mode, sess_pk_a=None, sess_pk_b=None) -> dict:
     # Free game (0 stake): no escrow, no deposit, no settlement — it goes live the
     # instant it's accepted and never touches the Kaspa sidecar. The whole money
     # path below is skipped, which is also why free play keeps working when the
@@ -493,7 +520,21 @@ async def _create_match_from_pair(*, challenge_id, tournament_id, round_no, play
         stake_sompi=stake_sompi, mode=mode, fen=chess_logic.STARTING_FEN,
         escrow_a=None, escrow_b=None, reclaim_daa=reclaim_daa)
     try:
-        if config.ESCROW_V2_ENABLED:
+        if config.ESCROW_V3_ENABLED and sess_pk_a and sess_pk_b:
+            # Roadmap #3a: v3 covenant — v2's oracle settle PLUS a trustless forfeit
+            # path. Needs BOTH players' session pubkeys (the move-channel checkpoint
+            # signers), so a match with either missing (e.g. a tournament auto-pairing,
+            # which has no interactive client to mint one) falls through to v2/v1.
+            w_daa = daa_clock.challenge_window_daa()
+            escrow_a = await service_client.build_escrow_v3(
+                match_id=match["hd_index"], pk_a=pk_a, pk_b=pk_b, side="A", reclaim_daa=reclaim_daa,
+                sess_pk_a=sess_pk_a, sess_pk_b=sess_pk_b, w_daa=w_daa)
+            escrow_b = await service_client.build_escrow_v3(
+                match_id=match["hd_index"], pk_a=pk_a, pk_b=pk_b, side="B", reclaim_daa=reclaim_daa,
+                sess_pk_a=sess_pk_a, sess_pk_b=sess_pk_b, w_daa=w_daa)
+            db.set_match_escrows(match["id"], escrow_a, escrow_b, version="v3",
+                                 sess_pk_a=sess_pk_a, sess_pk_b=sess_pk_b, w_daa=w_daa)
+        elif config.ESCROW_V2_ENABLED:
             # Roadmap #2: KIP-10 covenant escrows. `side` (not depositor_is_a) picks
             # each escrow's domain tag + reclaim depositor; settlement is arbiter-free.
             escrow_a = await service_client.build_escrow_v2(
