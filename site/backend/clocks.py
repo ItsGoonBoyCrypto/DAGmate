@@ -120,12 +120,19 @@ async def forfeit_if_flagged(m: dict, at_ms: int | None = None) -> bool:
         winner_id = m["player_a_account_id"]
     elif winner_color == "black":
         winner_id = m["player_b_account_id"]
-    # Roadmap #3a: a v3 match tries the TRUSTLESS forfeit first — if the latest co-signed checkpoint
-    # authorises the winner, the pot is claimed into the pending covenant with NO oracle signature.
-    # It only takes when the co-signed state agrees the flagger lost; otherwise (a draw-timeout, no
-    # checkpoint, or the last co-signed state authorises the loser) we fall back to the oracle settle
-    # below — the same path v2 uses — so a match always resolves.
-    trustless = await _try_v3_forfeit(m, winner_color, winner_id)
+    # Roadmap #3a: a v3 match tries the TRUSTLESS forfeit first. Three outcomes:
+    #   'claimed'  — the co-signed checkpoint named the winner AND its DAA deadline has passed; the pot
+    #                is claimed into the pending covenant with NO oracle signature (match now settled).
+    #   'wait'     — the checkpoint names the winner but its on-chain DAA deadline hasn't passed yet.
+    #                The wall clock is intentionally generous-side of the DAA deadline, so a flag fires
+    #                ~a margin BEFORE the deadline; we must NOT settle yet (the flagger could still move
+    #                in time by the DAA clock). Leave the match live; a later poll claims once it passes.
+    #   'na'       — no trustless path (draw-timeout, no co-signed checkpoint, last state authorises the
+    #                loser, or an on-chain failure): fall back to the oracle settle, same as v2.
+    v3 = await _v3_forfeit_state(m, winner_color, winner_id)
+    if v3 == "wait":
+        return False  # not resolved this pass; retry when the DAA deadline is reached
+    trustless = v3 == "claimed"
     if not trustless:
         if not db.settle_match_if_live(m["id"], result=result, winner_account_id=winner_id):
             return False
@@ -147,21 +154,33 @@ async def forfeit_if_flagged(m: dict, at_ms: int | None = None) -> bool:
     return True
 
 
-async def _try_v3_forfeit(m: dict, winner_color: str | None, winner_id: str | None) -> bool:
-    """Attempt the trustless forfeit for a v3 match (roadmap #3a). Returns True only if the pot was
-    claimed on-chain into the pending covenant (and the match marked settled); False to fall back to
-    the oracle settle. Takes ONLY when the latest FULLY co-signed checkpoint names the winner as its
-    claimant — i.e. both players agreed the state where the flagger is the one to move. A draw-timeout,
-    a match with no co-signed checkpoint, or one whose last co-signed state authorises the loser (e.g.
-    the opponent stopped counter-signing before abandoning) all return False → oracle safety net."""
+async def _v3_forfeit_state(m: dict, winner_color: str | None, winner_id: str | None) -> str:
+    """Trustless-forfeit decision for a v3 flag (roadmap #3a). Returns:
+      'claimed' — pot claimed on-chain into the pending covenant, match settled;
+      'wait'    — the co-signed checkpoint names the winner but its DAA deadline hasn't passed (the wall
+                  clock flags a margin early); do nothing now and retry — do NOT oracle-settle;
+      'na'      — no trustless path (not v3 / draw / no co-signed checkpoint / last state authorises the
+                  loser / on-chain failure): fall back to the oracle settle.
+    Takes ONLY when the latest FULLY co-signed checkpoint names the winner as its claimant AND the chain
+    has reached its DAA deadline — the same condition the covenant's CLTV enforces on the claim tx."""
     if (m["escrow_version"] or "") != "v3" or winner_color is None or winner_id is None:
-        return False
+        return "na"
     if not m["cosigned_cp_json"] or not m["sess_pk_a"] or not m["sess_pk_b"]:
-        return False
+        return "na"
     cp = json.loads(m["cosigned_cp_json"])
     winner_side = "A" if winner_color == "white" else "B"
     if cp.get("claimant") != winner_side or not (cp.get("sigA") and cp.get("sigB")):
-        return False
+        return "na"
+    # The claim's CLTV requires tx.lockTime >= deadlineDaa AND the tx be final (virtual DAA >= lockTime).
+    # If the chain hasn't reached the deadline yet, a claim would be rejected as "not finalized" — so
+    # wait rather than burn the attempt or wrongly fall back to the oracle.
+    try:
+        now_daa = await service_client.daa_score()
+    except Exception as e:
+        log.info(f"match {m['id']}: DAA read failed for forfeit gate ({e}); will retry")
+        return "wait"
+    if now_daa < int(cp["deadlineDaa"]):
+        return "wait"
     a = db.get_account(m["player_a_account_id"])
     b = db.get_account(m["player_b_account_id"])
     escrows = []
@@ -170,21 +189,21 @@ async def _try_v3_forfeit(m: dict, winner_color: str | None, winner_id: str | No
     if m["escrow_b_address"]:
         escrows.append({"address": m["escrow_b_address"], "redeemHex": m["escrow_b_redeem_hex"]})
     if not escrows:
-        return False
+        return "na"
     try:
         res = await service_client.forfeit_claim_v3(
             escrows=escrows, match_id=m["hd_index"], pk_a=a["pubkey"], pk_b=b["pubkey"],
             sess_pk_a=m["sess_pk_a"], sess_pk_b=m["sess_pk_b"], w_daa=m["w_daa"],
             deadline_daa=cp["deadlineDaa"], ply=cp["ply"], claimant=winner_side,
             sig_a=cp["sigA"], sig_b=cp["sigB"])
-    except Exception as e:  # node down, sig the covenant rejects, escrow already spent — fall back
+    except Exception as e:  # node down, sig the covenant rejects, escrow already spent — oracle backstop
         log.warning(f"match {m['id']}: v3 trustless forfeit failed ({e}); falling back to oracle")
-        return False
-    ok = db.mark_forfeit_claimed(m["id"], res["txid"], cp["deadlineDaa"], res["pendingAddress"],
-                                 res["pendingRedeem"], winner_id, result="timeout")
-    if ok:
+        return "na"
+    if db.mark_forfeit_claimed(m["id"], res["txid"], cp["deadlineDaa"], res["pendingAddress"],
+                               res["pendingRedeem"], winner_id, result="timeout"):
         log.info(f"match {m['id']}: v3 trustless forfeit {res['txid']} -> pending {res['pendingAddress']}")
-    return ok
+        return "claimed"
+    return "na"
 
 
 async def finalise_due_forfeits() -> int:

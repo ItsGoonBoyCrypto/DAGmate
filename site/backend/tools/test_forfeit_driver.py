@@ -51,9 +51,16 @@ def check(name, got, want):
         _failures.append(name)
 
 
-def stub_sidecar(*, claim_error=None, finalise_error=None):
+NOW_DAA = 530_000_000  # the stubbed current chain DAA the driver gates the claim on
+
+
+def stub_sidecar(*, claim_error=None, finalise_error=None, now_daa=NOW_DAA):
     _calls.clear()
-    _calls.update({"claim": [], "finalise": []})
+    _calls.update({"claim": [], "finalise": [], "daa": 0})
+
+    async def _daa():
+        _calls["daa"] += 1
+        return now_daa
 
     async def _claim(*, escrows, match_id, pk_a, pk_b, sess_pk_a, sess_pk_b, w_daa, deadline_daa, ply, claimant, sig_a, sig_b):
         _calls["claim"].append({"escrows": escrows, "claimant": claimant, "ply": ply, "deadline_daa": deadline_daa})
@@ -69,11 +76,13 @@ def stub_sidecar(*, claim_error=None, finalise_error=None):
 
     service_client.forfeit_claim_v3 = _claim
     service_client.forfeit_finalise_v3 = _finalise
+    service_client.daa_score = _daa
 
 
-def flagged_v3_match(*, cosigned_claimant, stake=10 * 10**8):
+def flagged_v3_match(*, cosigned_claimant, stake=10 * 10**8, deadline_daa=NOW_DAA - 100):
     """A live v3 match whose white clock has run out, with a co-signed checkpoint naming
-    `cosigned_claimant` ('A'/'B'/None-for-no-checkpoint)."""
+    `cosigned_claimant` ('A'/'B'/None-for-no-checkpoint) and DAA deadline `deadline_daa`
+    (default in the PAST so the trustless claim is eligible; pass a future value to test 'wait')."""
     with db._lock, db._conn() as c:
         c.execute("DELETE FROM matches")
     a = db.get_or_create_account(f"kaspa:pA{time.time_ns()}", "pubA")
@@ -89,7 +98,7 @@ def flagged_v3_match(*, cosigned_claimant, stake=10 * 10**8):
     started = clocks.now_ms() - 60_000  # 60s ago
     cp_json = None
     if cosigned_claimant is not None:
-        cp_json = json.dumps({"deadlineDaa": 530_000_000, "ply": 12, "claimant": cosigned_claimant,
+        cp_json = json.dumps({"deadlineDaa": deadline_daa, "ply": 12, "claimant": cosigned_claimant,
                               "sigA": "aa" * 64, "sigB": "bb" * 64})
     with db._lock, db._conn() as c:
         # white to move, white clock exhausted (100ms bank, started 60s ago) -> flagged white
@@ -137,6 +146,22 @@ async def main() -> int:
     n2 = await clocks.finalise_due_forfeits()
     check("not finalised early", n2, 0)
     check("no finalise call", len(_calls["finalise"]), 0)
+
+    print("checkpoint names the winner but the DAA deadline HASN'T passed -> WAIT (no claim, no oracle)")
+    stub_sidecar()
+    m, a, b = flagged_v3_match(cosigned_claimant=winner_side, deadline_daa=NOW_DAA + 100_000)
+    did = await clocks.forfeit_if_flagged(m, clocks.now_ms())
+    check("not resolved yet (waiting for the DAA deadline)", did, False)
+    check("no claim attempted", len(_calls["claim"]), 0)
+    row = db.get_match(m["id"])
+    check("match left LIVE for a later poll", row["status"], "live")
+    check("not oracle-settled early", row["winner_account_id"], None)
+    # ...and once the chain reaches the deadline, the next flag claims it
+    stub_sidecar(now_daa=NOW_DAA + 200_000)
+    did2 = await clocks.forfeit_if_flagged(db.get_match(m["id"]), clocks.now_ms())
+    check("claimed once the deadline passes", did2, True)
+    check("claim now attempted", len(_calls["claim"]), 1)
+    check("settled via forfeit", db.get_match(m["id"])["forfeit_claim_txid"], "claimtx")
 
     print("co-signed checkpoint names the LOSER -> oracle fallback (no trustless claim)")
     stub_sidecar()

@@ -316,13 +316,14 @@ export async function forfeitFinalise({ pendingRedeem, pendingAddress, claimant,
   return core.withRpc(async (rpc) => {
     const { entries } = await rpc.getUtxosByAddresses({ addresses: [pendingAddress] });
     if (!entries.length) throw new Error('no pending-forfeit UTXO (already finalised/cancelled?)');
-    // Both escrows forfeit into the SAME pending covenant (identical forfeit body), so there can be
-    // more than one UTXO here — sweep them ALL to the claimant in one tx. Each input's FINALIZE leg
-    // checks its OWN creation DAA + wDaa <= tx.lockTime, so lockTime must clear the LATEST one.
-    const total = entries.reduce((s, e) => s + BigInt(e.amount), 0n);
+    // Both escrows forfeit into the SAME pending covenant, so there can be >1 UTXO here. The FINALIZE
+    // leg binds output[i] to input[i] (spk == claimant AND amount+maxFee >= input[i]), so we need ONE
+    // output per input — all paying the claimant — NOT a single combined output. Each input's leg also
+    // checks its OWN creation DAA + wDaa <= tx.lockTime, so lockTime must clear the LATEST input.
     const maxInDaa = entries.reduce((mx, e) => { const d = BigInt(e.blockDaaScore); return d > mx ? d : mx; }, 0n);
     const fee = SETTLE_V3_FEE_SOMPI_PER_INPUT * BigInt(entries.length);
-    const tx = k.createTransaction(entries, [{ address: payAddr, amount: total - fee }], fee, undefined, 2 * entries.length);
+    const outputs = entries.map((e) => ({ address: payAddr, amount: BigInt(e.amount) - SETTLE_V3_FEE_SOMPI_PER_INPUT }));
+    const tx = k.createTransaction(entries, outputs, fee, undefined, 2 * entries.length);
     tx.lockTime = maxInDaa + BigInt(wDaa);
     const ins = tx.inputs;
     for (let i = 0; i < ins.length; i++) { ins[i].sequence = 0n; ins[i].signatureScript = p2shSig(pendingRedeem, [numToBytes(1)]); }
@@ -341,11 +342,11 @@ export async function forfeitCancel({ pendingRedeem, pendingAddress, canceller, 
   return core.withRpc(async (rpc) => {
     const { entries } = await rpc.getUtxosByAddresses({ addresses: [pendingAddress] });
     if (!entries.length) throw new Error('no pending-forfeit UTXO to cancel');
-    // Sweep every pending UTXO (both escrows) to the canceller; each input's CANCEL leg re-verifies
-    // the newer co-signed checkpoint independently, so they share the one witness.
-    const total = entries.reduce((s, e) => s + BigInt(e.amount), 0n);
+    // One output per input (all to the canceller) — the CANCEL leg binds output[i] to input[i] too,
+    // and re-verifies the newer co-signed checkpoint independently per input.
     const fee = SETTLE_V3_FEE_SOMPI_PER_INPUT * BigInt(entries.length);
-    const tx = k.createTransaction(entries, [{ address: payAddr, amount: total - fee }], fee, undefined, 4 * entries.length);
+    const outputs = entries.map((e) => ({ address: payAddr, amount: BigInt(e.amount) - SETTLE_V3_FEE_SOMPI_PER_INPUT }));
+    const tx = k.createTransaction(entries, outputs, fee, undefined, 4 * entries.length);
     const ins = tx.inputs;
     const witness = [H(sigA), H(sigB), plyFixed(newPly), Buffer.alloc(0)];
     for (let i = 0; i < ins.length; i++) ins[i].signatureScript = p2shSig(pendingRedeem, witness);
