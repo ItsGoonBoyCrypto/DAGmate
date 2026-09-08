@@ -122,10 +122,27 @@ player's behalf as a *convenience* (not a trust dependency — the player can al
    directions land + finalise; cross-direction, flipped-claimant, early, forged all rejected. (This
    subsumed the originally-planned "S11 adversarial matrix" — the adversarial cases are proven across
    S8–S11b, and the real open problem turned out to be the *linkage*, now resolved.)
-5. **▶ NEXT — the off-chain channel** (sign/verify/exchange `C` & `M` in the game loop), the backend
-   settlement branch (a v3 escrow variant behind an `ESCROW_V3`/`DAA_FORFEIT` flag), a DAA clock in
-   `clocks.py` used for the on-chain deadlines (kept alongside the wall-clock UX display), frontend,
-   tests, then testnet full-flow, then mainnet — exactly the v2 rollout shape.
+5. ✅ **BUILT (2026-09-08) — the full v3 integration** (behind `ESCROW_V3`, default off):
+   - `daa_clock.py` (measured ~9.61 DAA/s), `escrow_v3.js` combined covenant + `/escrow-v3/*` routes +
+     `service_client` wrappers.
+   - Session keys: minted client-side (`dag_session.js`, vendored BIP340, byte-identical to
+     `move_channel.mjs`), x-only pubkeys threaded through challenge create/accept → `build_escrow_v3`.
+   - Move channel: each v3 move pins a server-computed checkpoint (claimant + DAA deadline from the
+     authoritative clock); both clients co-sign it (`/checkpoint/sign`); the latest co-signed state is
+     kept for the driver.
+   - Settlement: `_settle_v3` (oracle path == v2) + a `forfeit_window` state.
+   - Trustless forfeit driver in `clocks.py`: a v3 flag claims the pot into the pending covenant on the
+     co-signed checkpoint (atomic across both escrows), then a poller finalises after the window; falls
+     back to the oracle for a draw / no-checkpoint / loser-authorised / on-chain failure.
+   - Tests (stubbed sidecar, house rules): `test_settlement_v3`, `test_v3_creation`, `test_move_channel`,
+     `test_forfeit_driver`, `test_daa_clock`, browser `test_dag_session` — all green; v2/free/mutual
+     regression green.
+   **▶ REMAINING to activate:** deploy behind the flag, then a LIVE 2-player test (real abandonment →
+   trustless forfeit → finalise) — on testnet if a DAGmate testnet instance is stood up, else carefully
+   on mainnet dust-stakes — before flipping `ESCROW_V3` on. Known follow-up: the S9 unilateral-move (`M`)
+   path so the trustless forfeit also covers the "opponent stops co-signing then abandons" case (today
+   that edge falls back to the oracle); the covenant leg is already proven (S9), only the relay/driver
+   wiring remains.
 
 ### What the on-chain proofs settled (byte-exact facts for the builders)
 - **Checkpoint hash** = `SHA256(matchTag ‖ deadlineDaa ‖ ply2 ‖ claimant)`; deadline is the minimal

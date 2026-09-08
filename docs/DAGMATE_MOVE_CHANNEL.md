@@ -83,10 +83,10 @@ with margin (never tight enough that clock drift flips an in-time move into a fo
 `deadlineDaa`/`nextDeadlineDaa` the clients put into `C`/`M`. The wall-clock UX display stays as-is; the
 DAA figure is the authoritative one the covenant reads.
 
-## v3 integration checklist (the frontend-coupled build — TESTNET first)
-The covenant, the DAA clock, `escrow_v3.js`, and the sidecar `/escrow-v3/*` routes + `service_client`
-wrappers are DONE and proven. What remains is one coupled unit (backend + frontend), because the escrow
-can't be built until the clients have minted their session keys:
+## v3 integration checklist — ✅ BUILT 2026-09-08 (steps 1–6 done; step 7 = live test to activate)
+All the code below is written, unit-tested (stubbed sidecar, house rules), and committed behind the
+`ESCROW_V3` flag (default off). Step 7 — a live 2-player forfeit test — is what remains before flipping
+the flag on. The steps, for reference and for the S9-`M` follow-up:
 
 1. **Frontend — session key.** At challenge create/accept, mint `move_channel.newSessionKey()`; keep the
    private key in the match's client state; send the x-only `sessPk` alongside the wallet pubkey.
