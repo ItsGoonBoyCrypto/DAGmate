@@ -387,6 +387,8 @@
   }
 
   async function connectWallet() {
+    // Let Kaspa-Wallet-Standard wallets (e.g. Enclave) announce before we read the list.
+    if (window.DAGWallets && window.DAGWallets.ready) { try { await window.DAGWallets.ready(); } catch (_) {} }
     const installed = (window.DAGWallets ? window.DAGWallets.installed() : []);
     if (installed.length) {
       let adapter = installed[0];
