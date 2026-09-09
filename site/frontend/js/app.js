@@ -335,6 +335,57 @@
     throw new Error("reconnect your wallet to continue");
   }
 
+  // A phone (coarse pointer + touch, or a narrow viewport). Used only to decide what to show when NO
+  // wallet provider is injected — on a phone the answer isn't "install an extension", it's "open this
+  // page inside your wallet's built-in browser", where the same window provider injects and the normal
+  // adapters take over.
+  function isMobileDevice() {
+    try {
+      const mm = window.matchMedia;
+      const coarse = mm && mm("(pointer: coarse)").matches;
+      const touch = "ontouchstart" in window || (navigator.maxTouchPoints || 0) > 0;
+      const narrow = mm && mm("(max-width: 640px)").matches;
+      return (!!coarse && touch) || !!narrow;
+    } catch (_) { return false; }
+  }
+
+  // Shown on a phone when nothing is injected: connect by opening DAGmate inside a Kaspa wallet's own
+  // in-app browser. We don't hardcode per-wallet deep links (no wallet publishes a documented scheme —
+  // a wrong one would be a dead button), so this guides + hands over a copyable link instead.
+  function mobileConnectSheet() {
+    const link = location.origin + location.pathname;
+    const ov = document.createElement("div");
+    ov.className = "wallet-chooser-overlay";
+    const box = document.createElement("div");
+    box.className = "wallet-chooser wallet-sheet";
+    box.innerHTML = `
+      <div class="wallet-chooser-title">Connect on your phone</div>
+      <p class="wallet-sheet-text">Phone wallets connect through their own built-in browser. To play DAGmate on mobile:</p>
+      <ol class="wallet-sheet-steps">
+        <li>Open your Kaspa wallet app (Kastle, Kaspire or Kaspium).</li>
+        <li>Go to its <strong>Browser</strong> / <strong>dApps</strong> tab.</li>
+        <li>Load <strong>${esc(link)}</strong> there, then tap <em>Connect wallet</em>.</li>
+      </ol>
+      <p class="wallet-sheet-text muted">DAGmate never holds your keys — the wallet signs everything.</p>`;
+    const done = () => { if (ov.parentNode) document.body.removeChild(ov); };
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "btn btn-primary wallet-choice";
+    copyBtn.textContent = "Copy DAGmate link";
+    copyBtn.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(link); toast("Link copied — paste it in your wallet's browser."); }
+      catch (_) { toast(link); }
+    });
+    box.appendChild(copyBtn);
+    const close = document.createElement("button");
+    close.className = "btn wallet-choice";
+    close.textContent = "Close";
+    close.addEventListener("click", done);
+    box.appendChild(close);
+    ov.appendChild(box);
+    ov.addEventListener("click", (e) => { if (e.target === ov) done(); });
+    document.body.appendChild(ov);
+  }
+
   async function connectWallet() {
     const installed = (window.DAGWallets ? window.DAGWallets.installed() : []);
     if (installed.length) {
@@ -360,7 +411,8 @@
     // plainly rather than letting the request 404 and reporting it as a
     // failure, because "you need a wallet" is the actual answer.
     if (!state.meta || !state.meta.devRoutes) {
-      toast("No Kaspa wallet detected. Install Kasware, Kastle or Kaspire to play — DAGmate never holds your keys.");
+      if (isMobileDevice()) { mobileConnectSheet(); return; }
+      toast("No Kaspa wallet detected. Install Kasware, Kastle, Kaspire or Enclave to play — DAGmate never holds your keys.");
       return;
     }
     toast("No Kasware/Kastle extension detected — using a local demo wallet for testing.");

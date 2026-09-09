@@ -477,6 +477,11 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
 }
 .wallet-chooser-title { font-weight: 600; margin-bottom: 4px; }
 .wallet-choice { width: 100%; }
+/* Mobile connect sheet (no injected provider on a phone → guide to the wallet's in-app browser) */
+.wallet-sheet { max-width: 360px; }
+.wallet-sheet-text { font-size: 13.5px; line-height: 1.5; margin: 2px 0 8px; }
+.wallet-sheet-steps { margin: 0 0 10px; padding-left: 18px; font-size: 13px; line-height: 1.55; }
+.wallet-sheet-steps li { margin-bottom: 3px; }
 
 /* In-match chat (private, off-chain) */
 .chat-panel { margin-top: 16px; border-top: 1px solid var(--panel-border-soft); padding-top: 12px; }
