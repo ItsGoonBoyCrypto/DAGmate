@@ -21,6 +21,8 @@
   --board-dark: #6f9a58;
   --board-select: #f7f169;
   --board-legal: rgba(20, 20, 20, 0.28);
+  /* Board scales from one variable so mobile just shrinks it. Desktop = 8×52px. */
+  --board-size: 416px;
   --radius: 12px;
   --radius-sm: 8px;
   --shadow-card: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px -12px rgba(0,0,0,0.55);
@@ -100,11 +102,18 @@ body {
 main { max-width: 1120px; margin: 0 auto; padding: 28px 24px 80px; }
 
 @media (max-width: 640px) {
-  .topbar { gap: 10px; padding: 10px 14px; }
+  .topbar { gap: 8px; padding: 10px 12px; }
   .brand-name { display: none; }
-  .tabs { gap: 0; }
-  .tab { padding: 8px 8px 10px; font-size: 12.5px; }
+  .tabs { gap: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .tab { padding: 8px 8px 10px; font-size: 12.5px; white-space: nowrap; }
   .wallet-badge { font-size: 11px; padding: 6px 10px; max-width: 40vw; }
+  /* Play area: shrink the board to fit the phone and stack the side panel below it. */
+  main { padding: 16px 12px 60px; }
+  .card { padding: 16px 14px; }
+  :root { --board-size: min(416px, calc(100vw - 56px)); }
+  .board-wrap { gap: 16px; }
+  .board-side { min-width: 0; width: 100%; }
+  .board-header { gap: 10px; }
 }
 
 .tab-panel { display: none; }
@@ -227,23 +236,24 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
 
 .board {
   display: grid;
-  grid-template-columns: repeat(8, 52px);
-  grid-template-rows: repeat(8, 52px);
+  grid-template-columns: repeat(8, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+  width: var(--board-size);
+  height: var(--board-size);
   border-radius: var(--radius-sm);
   overflow: hidden;
   user-select: none;
   box-shadow: var(--shadow-card), 0 0 0 1px var(--panel-border-soft);
 }
 .sq {
-  width: 52px;
-  height: 52px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 34px;
+  font-size: calc(var(--board-size) / 8 * 0.62);
   cursor: pointer;
   position: relative;
   transition: background-color 0.1s;
+  touch-action: manipulation;   /* no 300ms tap delay / double-tap zoom on the board */
 }
 .sq.light { background: var(--board-light); }
 .sq.dark { background: var(--board-dark); }
@@ -251,8 +261,8 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
 .sq.legal::after {
   content: "";
   position: absolute;
-  width: 16px;
-  height: 16px;
+  width: calc(var(--board-size) / 8 * 0.3);
+  height: calc(var(--board-size) / 8 * 0.3);
   border-radius: 50%;
   background: var(--board-legal);
   pointer-events: none;
