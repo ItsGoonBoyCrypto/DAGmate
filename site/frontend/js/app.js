@@ -1,7 +1,7 @@
 /* DAGmate — frontend app (docs/DAGMATE_SPEC.md). Plain JS, no build step.
- * Wallet-connect uses the real window.kasware / window.kastle injected APIs
- * (requestAccounts()) when a browser extension is present. When none is
- * detected — e.g. this headless preview — it falls back to the backend's
+ * Wallet-connect goes through the adapters in wallets.js (Kasware / Kastle / Kaspire),
+ * normalising each extension's API behind one interface, with a picker when several are
+ * installed. When none is detected — e.g. this headless preview — it falls back to the backend's
  * dev-only demo wallet (POST /api/dev/demo-wallet), clearly labeled as such.
  * That fallback is NEVER part of the real signing/settlement path, and it
  * only appears when the server says the dev routes are on (GET /api/meta →
@@ -64,6 +64,7 @@
     address: null,
     knsName: null,
     isDemoWallet: false,
+    wallet: null,   // the connected wallet adapter (wallets.js) — used for signing + deposits
     // The proof, not the claim. Everything that changes state needs this.
     session: null,
     profile: null,
@@ -270,6 +271,7 @@
     state.session = null;
     state.address = null;
     state.isDemoWallet = false;
+    state.wallet = null;
     state.currentMatchId = null;
     state.currentMatch = null;
     state.settle = null;
@@ -289,25 +291,65 @@
   function disconnectWallet() {
     // Revoke server-side too, so a copied token doesn't outlive the click.
     api("POST", "/api/auth/logout").catch(() => {});
+    try { localStorage.removeItem("dagmate_wallet_id"); } catch (_) {}
+    state.wallet = null;
     forgetSession();
   }
 
+  // Small modal to pick among multiple installed wallets. Resolves to the chosen adapter, or null.
+  function chooseWallet(adapters) {
+    return new Promise((resolve) => {
+      const ov = document.createElement("div");
+      ov.className = "wallet-chooser-overlay";
+      const box = document.createElement("div");
+      box.className = "wallet-chooser";
+      box.innerHTML = `<div class="wallet-chooser-title">Choose a wallet</div>`;
+      const done = (a) => { if (ov.parentNode) document.body.removeChild(ov); resolve(a); };
+      adapters.forEach((a) => {
+        const b = document.createElement("button");
+        b.className = "btn btn-primary wallet-choice";
+        b.textContent = a.label;
+        b.addEventListener("click", () => done(a));
+        box.appendChild(b);
+      });
+      const cancel = document.createElement("button");
+      cancel.className = "btn wallet-choice";
+      cancel.textContent = "Cancel";
+      cancel.addEventListener("click", () => done(null));
+      box.appendChild(cancel);
+      ov.appendChild(box);
+      ov.addEventListener("click", (e) => { if (e.target === ov) done(null); });
+      document.body.appendChild(ov);
+    });
+  }
+
+  // The connected wallet adapter, re-linked after a reload from the stored id. Throws a clear message
+  // if there's no usable wallet (uninstalled, or never connected) rather than a cryptic provider error.
+  function requireWallet() {
+    if (state.wallet) return state.wallet;
+    let id = null;
+    try { id = localStorage.getItem("dagmate_wallet_id"); } catch (_) {}
+    const a = id && window.DAGWallets ? window.DAGWallets.byId(id) : null;
+    if (a && a.isInstalled()) { state.wallet = a; return a; }
+    throw new Error("reconnect your wallet to continue");
+  }
+
   async function connectWallet() {
-    const provider = window.kasware || window.kastle;
-    if (provider && typeof provider.requestAccounts === "function") {
+    const installed = (window.DAGWallets ? window.DAGWallets.installed() : []);
+    if (installed.length) {
+      let adapter = installed[0];
+      if (installed.length > 1) {
+        adapter = await chooseWallet(installed);
+        if (!adapter) return;   // chooser dismissed
+      }
       try {
-        const accounts = await provider.requestAccounts();
-        const address = accounts && accounts[0];
+        const { address, pubkey } = await adapter.connect();
         if (!address) throw new Error("no account returned");
-        if (typeof provider.getPublicKey !== "function") {
-          throw new Error("this wallet doesn't expose its public key, which DAGmate needs to build your escrow");
-        }
-        const pubkey = await provider.getPublicKey();
-        if (typeof provider.signMessage !== "function") {
-          throw new Error("this wallet can't sign messages, so it can't prove the address is yours");
-        }
-        await signIn(address, pubkey, false, (msg) => provider.signMessage(msg));
-        toast("Signed in.");
+        if (!pubkey) throw new Error(`${adapter.label} didn't return a public key, which DAGmate needs to build your escrow`);
+        state.wallet = adapter;
+        try { localStorage.setItem("dagmate_wallet_id", adapter.id); } catch (_) {}
+        await signIn(address, pubkey, false, (msg) => adapter.signMessage(msg));
+        toast(`Signed in with ${adapter.label}.`);
       } catch (e) {
         toast(`Sign-in failed: ${e.message}`);
       }
@@ -317,7 +359,7 @@
     // plainly rather than letting the request 404 and reporting it as a
     // failure, because "you need a wallet" is the actual answer.
     if (!state.meta || !state.meta.devRoutes) {
-      toast("No Kaspa wallet detected. Install Kasware or Kastle to play — DAGmate never holds your keys.");
+      toast("No Kaspa wallet detected. Install Kasware, Kastle or Kaspire to play — DAGmate never holds your keys.");
       return;
     }
     toast("No Kasware/Kastle extension detected — using a local demo wallet for testing.");
@@ -341,6 +383,12 @@
     if (!token) { renderWalletBadge(); return; }
     state.session = token;
     state.isDemoWallet = localStorage.getItem("dagmate_demo") === "1";
+    // Re-link the wallet adapter used last time so signing (deposit/settle) works after a reload
+    // without a fresh connect. Its address is re-fetched on demand (see the adapters).
+    try {
+      const wid = localStorage.getItem("dagmate_wallet_id");
+      if (wid && window.DAGWallets) { const a = window.DAGWallets.byId(wid); if (a && a.isInstalled()) state.wallet = a; }
+    } catch (_) {}
     try {
       // The session itself is the source of truth for who we are — the
       // address is read back from the server rather than trusted from
@@ -924,28 +972,10 @@
 
   async function signSettleInputs(txJson, indexes, ctx) {
     verifyOutputsTotal(txJson, ctx && ctx.expectedOutputSompi);
-    const provider = window.kasware || window.kastle;
-    if (!provider) throw new Error("connect Kasware or Kastle to release the pot");
-    console.log("[DAGmate] signing", { hasSignPskt: typeof provider.signPskt,
-      hasSignTx: typeof provider.signTx, indexes, txJsonPreview: String(txJson).slice(0, 160) });
-    const out = {};
-    if (typeof provider.signPskt === "function") {
-      // Kasware's real API: signPskt({ txJsonString, options: { signInputs:[{index,sighashType}] } })
-      // → returns the FULLY SIGNED tx JSON (not a per-input signature). We sign
-      // every one of our inputs in a single call and hand the signed tx back.
-      try {
-        const signed = await provider.signPskt({
-          txJsonString: txJson,
-          options: { signInputs: indexes.map((i) => ({ index: i, sighashType: 1 })) },
-        });
-        console.log("[DAGmate] signPskt returned:", String(signed).slice(0, 200));
-        return { signedTxJson: signed };
-      } catch (e) {
-        console.error("[DAGmate] signPskt failed:", e, "message:", e && e.message);
-        throw e;
-      }
-    }
-    throw new Error("this wallet doesn't expose the signPskt method DAGmate needs to release the pot");
+    // signPskt signs every one of our inputs in a single call and returns the FULLY SIGNED tx JSON
+    // (not per-input signatures). The adapter normalises each wallet's exact call shape.
+    const wallet = requireWallet();
+    return wallet.signSettle(txJson, indexes);
   }
 
   // ── reclaiming a stranded stake ──────────────────────────────────────
@@ -1135,19 +1165,18 @@
   }
 
   async function fundEscrow(address, stakeSompi, stakeKas, btn) {
-    const provider = window.kasware || window.kastle;
-    if (!provider || typeof provider.sendKaspa !== "function") {
-      toast(`This wallet has no one-tap send — send ${stakeKas} KAS to ${address} yourself.`);
+    let wallet;
+    try { wallet = requireWallet(); } catch (_) {
+      toast(`Connect your wallet, or send ${stakeKas} KAS to ${address} yourself.`);
       return;
     }
     const label = btn.textContent;
     btn.disabled = true;
     btn.textContent = "Waiting for your wallet…";
     try {
-      // Kasware/Kastle sendKaspa takes an integer sompi amount and pops its own
-      // confirmation. We pass the exact stake; the deposit watcher starts the
-      // match once it confirms on-chain (~15s) and the opponent has funded too.
-      await provider.sendKaspa(address, Number(stakeSompi));
+      // The adapter normalises each wallet's send call. We pass the exact stake in sompi; the deposit
+      // watcher starts the match once it confirms on-chain (~15s) and the opponent has funded too.
+      await wallet.sendKaspa(address, Number(stakeSompi));
       toast("Deposit sent — waiting for it to confirm on-chain.");
       // Flip the panel to the live "confirming…" spinner; the 4s poll clears it
       // once the deposit watcher marks this side funded.

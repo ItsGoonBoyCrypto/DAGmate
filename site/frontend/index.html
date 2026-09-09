@@ -195,6 +195,8 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- Wallet adapters (Kasware / Kastle / Kaspire) — classic script, defines window.DAGWallets before app.js. -->
+<script src="js/wallets.js"></script>
 <!-- v3 move-channel session keys (roadmap #3a). Module, so it's deferred and sets window.DAGSession
      before any user action; app.js (classic, below) reads it lazily at challenge create/accept. -->
 <script type="module" src="js/dag_session.js"></script>
