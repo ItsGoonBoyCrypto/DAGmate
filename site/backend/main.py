@@ -38,6 +38,7 @@ import math
 import os
 import random
 import threading
+import time
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -211,6 +212,7 @@ def _match_public(m: dict) -> dict:
     return {
         "id": m["id"], "status": m["status"], "mode": m["mode"],
         "challengeId": m["challenge_id"],  # so the creator can find their session key (stashed by it)
+        "chatEnabled": config.MATCH_CHAT_ENABLED,
         "stakeKas": m["stake_sompi"] / config.SOMPI_PER_KAS,
         "isFree": m["stake_sompi"] == 0,  # free game — no escrow, no pot
         "fen": m["fen"], "turn": m["turn"], "result": m["result"],
@@ -751,6 +753,54 @@ async def sign_checkpoint(match_id: str, body: CheckpointSigBody, a: dict = Depe
         raise HTTPException(400, "sig must be a 64-byte schnorr signature (128 hex chars)")
     db.add_checkpoint_sig(match_id, "A" if is_a else "B", sig)
     return _checkpoint_public(db.get_match(match_id)) or {"cosigned": False}
+
+
+# ── in-match chat ──────────────────────────────────────────────────────────
+class ChatBody(BaseModel):
+    text: str
+
+
+def _require_match_player(match_id: str, account: dict) -> tuple[dict, str]:
+    """Return (match, my_color) or raise. Chat is private to the two players — a spectator or a
+    stranger gets a 403, not a peek at the conversation."""
+    m = db.get_match(match_id)
+    if not m:
+        raise HTTPException(404, "match not found")
+    if account["id"] == m["player_a_account_id"]:
+        return m, "white"
+    if account["id"] == m["player_b_account_id"]:
+        return m, "black"
+    raise HTTPException(403, "you're not a player in this match")
+
+
+def _chat_public(msg: dict, account_id: str) -> dict:
+    return {"seq": msg["id"], "byColor": msg["color"], "mine": msg["sender_account_id"] == account_id,
+            "text": msg["text"], "ts": msg["ts"]}
+
+
+@app.post("/api/matches/{match_id}/chat")
+def post_chat(match_id: str, body: ChatBody, account: dict = Depends(require_account)):
+    if not config.MATCH_CHAT_ENABLED:
+        raise HTTPException(403, "chat is off right now")
+    m, color = _require_match_player(match_id, account)
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "empty message")
+    if len(text) > config.CHAT_MAX_LEN:
+        raise HTTPException(400, f"message too long (max {config.CHAT_MAX_LEN} characters)")
+    # Light per-player rate limit so the channel can't be flooded.
+    if db.count_recent_chat(match_id, account["id"], int(time.time()) - config.CHAT_RATE_SECS) >= config.CHAT_RATE_MAX:
+        raise HTTPException(429, "you're sending messages too fast — slow down a moment")
+    msg = db.add_chat_message(match_id, account["id"], color, text)
+    return _chat_public(msg, account["id"])
+
+
+@app.get("/api/matches/{match_id}/chat")
+def get_chat(match_id: str, after: int = 0, account: dict = Depends(require_account)):
+    m, _ = _require_match_player(match_id, account)
+    msgs = db.list_chat_after(match_id, after_id=after) if config.MATCH_CHAT_ENABLED else []
+    return {"messages": [_chat_public(x, account["id"]) for x in msgs],
+            "lastSeq": msgs[-1]["id"] if msgs else after}
 
 
 @app.post("/api/matches/{match_id}/resign")

@@ -153,6 +153,18 @@ def ensure_schema():
           primary_name TEXT,
           fetched_ts INTEGER NOT NULL)""")
 
+        # In-match chat (private to the two players). Off-chain + server-relayed on purpose: a chess
+        # game needs instant, free banter, not a Kaspa tx (gas + block latency) per line. `id` is the
+        # monotonic sequence the client pages on (fetch messages after the last id it holds).
+        c.execute("""CREATE TABLE IF NOT EXISTS match_chat (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          match_id TEXT NOT NULL,
+          sender_account_id TEXT NOT NULL,
+          color TEXT,
+          ts INTEGER NOT NULL,
+          text TEXT NOT NULL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_match_chat ON match_chat(match_id, id)")
+
         # Deposit-watcher state (deposits.py). Added by migration rather than
         # in the CREATE above so existing local/testnet DBs pick it up.
         _add_column(c, "matches", "funded_a_sompi", "INTEGER NOT NULL DEFAULT 0")
@@ -452,6 +464,29 @@ def create_match(*, challenge_id: str | None, tournament_id: str | None, round_n
 def get_match(match_id: str) -> dict | None:
     with _lock, _conn() as c:
         return _row(c.execute("SELECT * FROM matches WHERE id=?", (match_id,)))
+
+
+# ── in-match chat ──────────────────────────────────────────────────────────
+def add_chat_message(match_id: str, sender_account_id: str, color: str | None, text: str) -> dict:
+    """Append one chat line; returns the stored row (with its `id`, the sequence the client pages on)."""
+    with _lock, _conn() as c:
+        cur = c.execute("INSERT INTO match_chat (match_id, sender_account_id, color, ts, text) "
+                        "VALUES (?,?,?,?,?)", (match_id, sender_account_id, color, int(time.time()), text))
+        return _row(c.execute("SELECT * FROM match_chat WHERE id=?", (cur.lastrowid,)))
+
+
+def list_chat_after(match_id: str, after_id: int = 0, limit: int = 200) -> list[dict]:
+    """Messages for a match with id > after_id, oldest first (so the client appends in order)."""
+    with _lock, _conn() as c:
+        return _rows(c.execute("SELECT * FROM match_chat WHERE match_id=? AND id>? ORDER BY id ASC LIMIT ?",
+                               (match_id, after_id, limit)))
+
+
+def count_recent_chat(match_id: str, sender_account_id: str, since_ts: int) -> int:
+    """How many messages this sender posted to this match since `since_ts` — for a light rate limit."""
+    with _lock, _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM match_chat WHERE match_id=? AND sender_account_id=? AND ts>=?",
+                         (match_id, sender_account_id, since_ts)).fetchone()[0]
 
 
 def delete_match(match_id: str):

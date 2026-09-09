@@ -274,6 +274,15 @@ CLOCK_MODES = {
     "daily": {"label": "Daily 3d+12h", "initial_secs": 3 * 24 * 3600, "increment_secs": 12 * 3600},
 }
 CLOCK_POLL_SECS = int(os.getenv("DAGMATE_CLOCK_POLL_SECS", "5"))
+
+# ── in-match chat (private, off-chain, server-relayed) ──────────────────
+# On by default — a wagered game wants players to be able to talk. Off-chain on
+# purpose: instant + free, unlike a Kaspa message tx. Guarded server-side (only the
+# two players), length-capped, and lightly rate-limited so it can't be spammed.
+MATCH_CHAT_ENABLED = os.getenv("DAGMATE_MATCH_CHAT", "1") == "1"
+CHAT_MAX_LEN = int(os.getenv("DAGMATE_CHAT_MAX_LEN", "400"))
+CHAT_RATE_MAX = int(os.getenv("DAGMATE_CHAT_RATE_MAX", "15"))    # messages …
+CHAT_RATE_SECS = int(os.getenv("DAGMATE_CHAT_RATE_SECS", "10"))  # … per this many seconds, per player
 # Warn a player once when their remaining time drops below this fraction of
 # the mode's starting bank (the alerts bot's notify_clock_warning, which until
 # now was dead code nothing called).

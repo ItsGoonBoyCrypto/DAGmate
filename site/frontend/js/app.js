@@ -70,6 +70,7 @@
     profile: null,
     currentMatchId: null,
     currentMatch: null,
+    chatLastSeq: 0,   // highest chat message id shown for the current match
     // When the current match's clock snapshot arrived, by this device's own
     // Date.now(). Countdowns are driven off the ELAPSED time since then, never
     // off the device's absolute clock, so a machine set to the wrong date still
@@ -595,8 +596,13 @@
     state.settleFor = null;
     state.reclaimFor = null;
     state.lastSignedCp = null;
+    // Fresh chat for this match.
+    state.chatLastSeq = 0;
+    const clog = document.getElementById("chatLog");
+    if (clog) clog.innerHTML = "";
     maybeCosignCheckpoint(m);
     renderMatchCard();
+    pollChat();
     document.getElementById("boardCard").style.display = "block";
     document.getElementById("boardCard").scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -621,7 +627,38 @@
       state.clockRecvAt = Date.now();
       maybeCosignCheckpoint(m);
       renderMatchCard();
+      pollChat();
     } catch (e) { /* keep last known state on transient error */ }
+  }
+
+  // ── in-match chat (private, off-chain relay) ──────────────────────────
+  async function pollChat() {
+    const m = state.currentMatch;
+    if (!m || !m.chatEnabled || !state.session) return;
+    try {
+      const r = await api("GET", `/api/matches/${m.id}/chat?after=${state.chatLastSeq || 0}`);
+      if (r.messages && r.messages.length) { appendChat(r.messages); state.chatLastSeq = r.lastSeq; }
+    } catch (_) { /* transient — next poll retries */ }
+  }
+  function appendChat(msgs) {
+    const log = document.getElementById("chatLog");
+    if (!log) return;
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+    for (const msg of msgs) {
+      const d = document.createElement("div");
+      d.className = "chat-msg " + (msg.mine ? "mine" : "theirs");
+      d.textContent = msg.text;   // textContent, never innerHTML — the opponent's text is untrusted
+      log.appendChild(d);
+    }
+    if (atBottom) log.scrollTop = log.scrollHeight;   // follow the conversation unless they scrolled up
+  }
+  async function sendChat(text) {
+    const m = state.currentMatch;
+    if (!m || !text || !text.trim()) return;
+    try {
+      await api("POST", `/api/matches/${m.id}/chat`, { text: text.trim() });
+      await pollChat();   // pull it (and anything the opponent just said) back in order
+    } catch (e) { toast(e.message); }
   }
 
   // v3 move channel: whenever a checkpoint is on the board and MY signature is missing, co-sign it
@@ -649,6 +686,8 @@
   function renderMatchCard() {
     const m = state.currentMatch;
     if (!m) return;
+    const chatPanel = document.getElementById("chatPanel");
+    if (chatPanel) chatPanel.style.display = m.chatEnabled ? "block" : "none";
     document.getElementById("boardTitle").textContent =
       `${displayName(m.playerA)} (white) vs ${displayName(m.playerB)} (black)`;
     document.getElementById("boardMeta").textContent =
@@ -1226,6 +1265,14 @@
     } catch (e) { toast(e.message); }
     finally { state.moveInFlight = false; }
   }
+
+  document.getElementById("chatForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const inp = document.getElementById("chatInput");
+    const t = inp.value;
+    inp.value = "";
+    sendChat(t);
+  });
 
   document.getElementById("drawBtn").addEventListener("click",
     () => drawAction("offer", "Draw offered — your opponent has to agree."));

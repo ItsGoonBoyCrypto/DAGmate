@@ -477,3 +477,14 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
 }
 .wallet-chooser-title { font-weight: 600; margin-bottom: 4px; }
 .wallet-choice { width: 100%; }
+
+/* In-match chat (private, off-chain) */
+.chat-panel { margin-top: 16px; border-top: 1px solid var(--panel-border-soft); padding-top: 12px; }
+.chat-title { font-size: 11.5px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+.chat-log { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.chat-log:empty::after { content: "No messages yet — say hi."; color: var(--muted-2); font-size: 12.5px; }
+.chat-msg { padding: 6px 10px; border-radius: 10px; max-width: 85%; font-size: 13.5px; line-height: 1.4; word-break: break-word; }
+.chat-msg.mine { align-self: flex-end; background: var(--accent-dim); color: #eafff0; }
+.chat-msg.theirs { align-self: flex-start; background: var(--panel-2); border: 1px solid var(--panel-border-soft); }
+.chat-form { display: flex; gap: 8px; }
+.chat-form input { flex: 1; min-width: 0; }
