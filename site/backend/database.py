@@ -299,6 +299,11 @@ def ensure_schema():
         # A wallet banned for a confirmed cheat can't create or accept challenges. NULL = in good standing.
         _add_column(c, "accounts", "banned_ts", "INTEGER")
         _add_column(c, "accounts", "banned_reason", "TEXT")
+        # Per-wallet engine-cheat accrual (Phase 2B): every analysed game adds this wallet's own score, so a
+        # PATTERN across games can be judged, not just one game. count/sum/max → avg = sum/count.
+        _add_column(c, "accounts", "cheat_games", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(c, "accounts", "cheat_score_sum", "REAL NOT NULL DEFAULT 0")
+        _add_column(c, "accounts", "cheat_score_max", "REAL NOT NULL DEFAULT 0")
 
 
 def _add_column(c: sqlite3.Connection, table: str, column: str, decl: str):
@@ -736,6 +741,29 @@ def is_banned(account_id: str) -> bool:
     with _lock, _conn() as c:
         r = c.execute("SELECT banned_ts FROM accounts WHERE id=?", (account_id,)).fetchone()
         return bool(r and r[0])
+
+
+def accumulate_cheat_score(account_id: str, score: float) -> dict:
+    """Fold one analysed game's score into a wallet's running cheat aggregate. Returns the new
+    {games, avg, max} so the caller can apply the per-wallet hold trigger."""
+    with _lock, _conn() as c:
+        c.execute("UPDATE accounts SET cheat_games=cheat_games+1, cheat_score_sum=cheat_score_sum+?, "
+                  "cheat_score_max=MAX(cheat_score_max, ?) WHERE id=?", (score, score, account_id))
+        r = c.execute("SELECT cheat_games, cheat_score_sum, cheat_score_max FROM accounts WHERE id=?",
+                      (account_id,)).fetchone()
+        games = r[0] or 0
+        return {"games": games, "avg": (r[1] / games) if games else 0.0, "max": r[2] or 0.0}
+
+
+def cheat_aggregate(account_id: str) -> dict:
+    """A wallet's current cheat aggregate (for display in the review panel)."""
+    with _lock, _conn() as c:
+        r = c.execute("SELECT cheat_games, cheat_score_sum, cheat_score_max FROM accounts WHERE id=?",
+                      (account_id,)).fetchone()
+        if not r:
+            return {"games": 0, "avg": 0.0, "max": 0.0}
+        games = r[0] or 0
+        return {"games": games, "avg": round((r[1] / games), 4) if games else 0.0, "max": round(r[2] or 0.0, 4)}
 
 
 # ── draw offers ──────────────────────────────────────────────────────────

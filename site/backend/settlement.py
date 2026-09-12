@@ -55,6 +55,7 @@ import time
 import analysis
 import config
 import database as db
+import ratings
 import service_client
 
 log = logging.getLogger("dagmate.settlement")
@@ -573,6 +574,7 @@ async def admin_resolve(match_id: str, decision: str, note: str) -> dict:
     await _do_settle(victim_side)                     # forfeit the cheat's stake → pot to the victim
     db.resolve_match_review(match_id, "confirmed", note)
     db.ban_account(cheat_id, note or "confirmed engine assistance")
+    ratings.penalize_confirmed_cheat(cheat_id, victim_id)  # counter the ill-gotten rating gain, credit the victim
     return {"decision": "confirmed", "matchId": match_id, "note": note,
             "cheatAccountId": cheat_id, "victimAccountId": victim_id,
             "playerAId": a["id"], "playerBId": b["id"]}

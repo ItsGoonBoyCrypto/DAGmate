@@ -323,6 +323,11 @@ ANALYSIS_WINDOW_SECS = int(os.getenv("DAGMATE_ANALYSIS_WINDOW_SECS", "90"))
 # A "hard" ply the mover answered faster than this (ms) is a timing tell (engine users play only-moves as
 # fast as recaptures). 0 disables the timing term.
 ANALYSIS_FAST_MOVE_MS = int(os.getenv("DAGMATE_ANALYSIS_FAST_MOVE_MS", "2000"))
+# Per-wallet accrual (the statistically sound unit — one brilliant game is weak, a pattern is not). A win
+# is ALSO held if the winner's AVERAGE score over at least CHEAT_AGG_MIN_GAMES analysed games crosses
+# CHEAT_AGG_THRESHOLD — catches steady, moderate assistance that no single game trips.
+CHEAT_AGG_MIN_GAMES = int(os.getenv("DAGMATE_CHEAT_AGG_MIN_GAMES", "5"))
+CHEAT_AGG_THRESHOLD = float(os.getenv("DAGMATE_CHEAT_AGG_THRESHOLD", "0.80"))
 # Warn a player once when their remaining time drops below this fraction of
 # the mode's starting bank (the alerts bot's notify_clock_warning, which until
 # now was dead code nothing called).

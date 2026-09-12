@@ -104,6 +104,29 @@ def main_():
     r2 = analysis.analyze_game(mock_evaluate_factory(short, cheat_color=chess.WHITE), short, None)
     ck("short game white score is None", r2["white"]["score"], None)
 
+    print("run_and_record (injected engine): a blatant winner is HELD and both wallets accrue their score")
+    ev_full = mock_evaluate_factory(moves, cheat_color=chess.WHITE)
+    mid_h, ah, bh = new_match(winner="a", moves=moves)   # white wins and 'cheats'
+    analysis.run_and_record(mid_h, evaluate=ev_full)
+    mh = db.get_match(mid_h)
+    ck("blatant winning game is held", mh["review_status"], "held")
+    ck("winner's high score stored", mh["cheat_score"] >= config.CHEAT_HOLD_THRESHOLD)
+    ck("white wallet accrued one game", db.cheat_aggregate(ah["id"])["games"], 1)
+    ck("black wallet accrued one game", db.cheat_aggregate(bh["id"])["games"], 1)
+
+    print("aggregate trigger: a sustained per-wallet pattern holds even when no single game trips the bar")
+    config.CHEAT_HOLD_THRESHOLD = 0.999      # single-game trigger effectively off
+    config.CHEAT_AGG_MIN_GAMES = 5
+    config.CHEAT_AGG_THRESHOLD = 0.80
+    mid_a, aa, ba = new_match(winner="a", moves=moves)
+    for _ in range(4):
+        db.accumulate_cheat_score(aa["id"], 0.85)   # a prior pattern, none individually damning
+    analysis.run_and_record(mid_a, evaluate=mock_evaluate_factory(moves, cheat_color=chess.WHITE))
+    ma = db.get_match(mid_a)
+    ck("held on the per-wallet pattern", ma["review_status"], "held")
+    ck("hold reason is aggregate, not single", json.loads(ma["analysis_json"]).get("_holdReason"), "aggregate")
+    config.CHEAT_HOLD_THRESHOLD = 0.90       # restore
+
     print("run_and_record FAILS OPEN when Stockfish is missing")
     config.ANALYSIS_ENABLED = True
     config.STOCKFISH_PATH = os.path.join(tempfile.gettempdir(), "no_such_stockfish_binary_xyz")

@@ -83,16 +83,21 @@
     for (const rv of rows) reviews.appendChild(card(rv));
   }
 
-  function sideLine(label, s, isWinner) {
+  function aggText(agg) {
+    if (!agg || !agg.games) return "";
+    const hi = agg.games >= 5 && agg.avg >= 0.8;
+    return ` · <span class="${hi ? "flag" : "k"}">wallet avg ${agg.avg} over ${agg.games} (max ${agg.max})</span>`;
+  }
+  function sideLine(label, s, isWinner, agg) {
     const div = document.createElement("div");
     if (!s || s.score == null) {
-      div.innerHTML = `<span class="k">${label}${isWinner ? " (winner)" : ""}:</span> not enough moves to score`;
+      div.innerHTML = `<span class="k">${label}${isWinner ? " (winner)" : ""}:</span> not enough moves to score` + aggText(agg);
       return div;
     }
     const hi = s.score >= 0.9;
     div.innerHTML = `<span class="k">${label}${isWinner ? " (winner)" : ""}:</span> `
       + `<span class="${hi ? "flag" : ""}">score ${s.score}</span> · top-1 ${pct(s.top1Rate)} · `
-      + `avg loss ${s.avgWpLoss} · fast-hard ${pct(s.fastHard)} · ${s.decisionPlies} plies`;
+      + `avg loss ${s.avgWpLoss} · fast-hard ${pct(s.fastHard)} · ${s.decisionPlies} plies` + aggText(agg);
     return div;
   }
   const pct = (x) => x == null ? "—" : Math.round(x * 100) + "%";
@@ -116,8 +121,8 @@
     el.appendChild(who);
 
     const grid = document.createElement("div"); grid.className = "rev-grid";
-    grid.appendChild(sideLine("White", a.white, rv.winner === "A"));
-    grid.appendChild(sideLine("Black", a.black, rv.winner === "B"));
+    grid.appendChild(sideLine("White", a.white, rv.winner === "A", rv.playerAAgg));
+    grid.appendChild(sideLine("Black", a.black, rv.winner === "B", rv.playerBAgg));
     el.appendChild(grid);
 
     const moves = document.createElement("div"); moves.className = "rev-moves";

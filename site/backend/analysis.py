@@ -137,32 +137,53 @@ def _stockfish_evaluate(engine):
     return evaluate
 
 
-def run_and_record(match_id: str) -> None:
-    """Analyse a finished staked match with Stockfish and store the result, HOLDING the pot if the winner's
-    score crosses the threshold. Best-effort + fail-open: on ANY error the match is still stamped analysed
-    (hold=False) so its payout proceeds normally. Blocking — call in a background thread."""
-    import chess.engine  # local import: only the runner needs the engine, not the pure scorer
+def run_and_record(match_id: str, evaluate=None) -> None:
+    """Analyse a finished staked match and store the result, HOLDING the pot if the winner's per-game score
+    crosses the threshold OR their per-wallet average does. Best-effort + fail-open: on ANY error the match
+    is still stamped analysed (hold=False) so its payout proceeds normally. Blocking — call in a background
+    thread. `evaluate` is injectable for tests; None builds the real Stockfish."""
     try:
         m = db.get_match(match_id)
         if not m or m["analyzed_ts"] or (m["stake_sompi"] or 0) <= 0:
             return
         moves = json.loads(m["moves_json"] or "[]")
         times = json.loads(m["move_times_json"] or "[]")
-        engine = chess.engine.SimpleEngine.popen_uci(config.STOCKFISH_PATH)
-        try:
-            res = analyze_game(_stockfish_evaluate(engine), moves, times)
-        finally:
-            engine.quit()
+        if evaluate is None:
+            import chess.engine  # local import: only the real runner needs the engine, not the pure scorer
+            engine = chess.engine.SimpleEngine.popen_uci(config.STOCKFISH_PATH)
+            try:
+                res = analyze_game(_stockfish_evaluate(engine), moves, times)
+            finally:
+                engine.quit()
+        else:
+            res = analyze_game(evaluate, moves, times)
+
+        # Accrue each player's OWN score into their wallet aggregate (the pattern-over-games signal), and
+        # keep the per-wallet result so it can be a second, softer hold trigger.
+        acct_by_color = {"white": m["player_a_account_id"], "black": m["player_b_account_id"]}
+        aggs = {}
+        for color in ("white", "black"):
+            s = res[color]["score"]
+            if s is not None:
+                aggs[color] = db.accumulate_cheat_score(acct_by_color[color], s)
 
         wc = _winner_color(m)
         if wc:                                  # a cheating winner is what takes the pot
             score = res[wc]["score"]
+            agg = aggs.get(wc)
         else:                                   # a draw — either side crossing the bar is worth a look
-            scores = [res[c]["score"] for c in ("white", "black") if res[c]["score"] is not None]
-            score = max(scores) if scores else None
-        hold = score is not None and score >= config.CHEAT_HOLD_THRESHOLD
+            cand = [(res[c]["score"], aggs.get(c)) for c in ("white", "black") if res[c]["score"] is not None]
+            score, agg = max(cand, key=lambda x: x[0]) if cand else (None, None)
+
+        # Hold on a HIGH single game, OR on a sustained per-wallet average (a pattern no single game trips).
+        hold_single = score is not None and score >= config.CHEAT_HOLD_THRESHOLD
+        hold_agg = bool(agg and agg["games"] >= config.CHEAT_AGG_MIN_GAMES and agg["avg"] >= config.CHEAT_AGG_THRESHOLD)
+        hold = hold_single or hold_agg
+        res["_holdReason"] = "single" if hold_single else ("aggregate" if hold_agg else None)
+        res["_winnerAgg"] = agg
         held = db.record_analysis(match_id, score if score is not None else -1.0, json.dumps(res), hold=hold)
-        log.info("analysed %s: score=%s hold=%s(%s)", match_id, score, hold, held)
+        log.info("analysed %s: score=%s hold=%s(%s) reason=%s agg=%s",
+                 match_id, score, hold, held, res["_holdReason"], agg)
     except Exception as e:
         # Fail OPEN — never let an analysis failure brick a payout. Stamp it analysed so the gate releases.
         log.warning("analysis failed for %s, failing open: %s", match_id, e)

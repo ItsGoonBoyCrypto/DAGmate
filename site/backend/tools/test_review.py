@@ -98,6 +98,8 @@ async def main():
     ck("victim B is NOT banned", db.is_banned(b2["id"]), False)
     ck("review_status confirmed", db.get_match(mid2)["review_status"], "confirmed")
     ck("cheat/victim ids reported", (r2["cheatAccountId"], r2["victimAccountId"]), (a2["id"], b2["id"]))
+    ck("cheat's rating was penalised (below the 1500 seed)", db.get_account(a2["id"])["rating"] < 1500)
+    ck("victim's rating was credited (above the seed)", db.get_account(b2["id"])["rating"] > 1500)
 
     print("a held DRAW can't be confirmed (no victim to award)")
     stub_sidecar()

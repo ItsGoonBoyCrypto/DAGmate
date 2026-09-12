@@ -49,39 +49,52 @@ def _idle_periods(last_ts: int | None, now_ts: int) -> int:
     return max(0, int((now_ts - last_ts) // config.RATING_PERIOD_SECS) - 1)
 
 
+def _state(acct: dict, ts: int):
+    """Pre-game (r, rd, vol) for an account — defaults for any pre-migration row, rd inflated for idle."""
+    vol = float(acct["vol"] if acct["vol"] is not None else glicko2.DEFAULT_VOL)
+    rd = glicko2.inflate(float(acct["rd"] if acct["rd"] is not None else glicko2.DEFAULT_RD),
+                         vol, _idle_periods(acct["last_rating_ts"], ts))
+    return float(acct["rating"] if acct["rating"] is not None else glicko2.DEFAULT_R), rd, vol
+
+
+def _apply_pair(a: dict, b: dict, score_a: float, ts: int) -> None:
+    """Apply one rated game between two accounts (score_a from a's perspective), each rated against the
+    other's pre-game inflated rating. Skips demo wallets."""
+    if not a or not b or a["is_demo_wallet"] or b["is_demo_wallet"]:
+        return
+    ra, rda, vola = _state(a, ts)
+    rb, rdb, volb = _state(b, ts)
+    na = glicko2.rate(ra, rda, vola, [(rb, rdb, score_a)], tau=config.GLICKO_TAU)
+    nb = glicko2.rate(rb, rdb, volb, [(ra, rda, 1.0 - score_a)], tau=config.GLICKO_TAU)
+    db.update_account_rating(a["id"], na[0], na[1], na[2], ts)
+    db.update_account_rating(b["id"], nb[0], nb[1], nb[2], ts)
+
+
 def _rate_one(match: dict) -> None:
     """Fold a single rateable match into both players' ratings. Assumes it hasn't been rated yet."""
     a = db.get_account(match["player_a_account_id"])
     b = db.get_account(match["player_b_account_id"])
     ts = match["settled_ts"] or int(time.time())
-    if not a or not b or a["is_demo_wallet"] or b["is_demo_wallet"]:
-        return  # caller still stamps rated_ts so we don't rescan it
-
-    # Pre-game state (defaults cover any pre-migration row), rd inflated for idle periods.
-    ra = float(a["rating"] if a["rating"] is not None else glicko2.DEFAULT_R)
-    rda = glicko2.inflate(float(a["rd"] if a["rd"] is not None else glicko2.DEFAULT_RD),
-                          float(a["vol"] if a["vol"] is not None else glicko2.DEFAULT_VOL),
-                          _idle_periods(a["last_rating_ts"], ts))
-    vola = float(a["vol"] if a["vol"] is not None else glicko2.DEFAULT_VOL)
-    rb = float(b["rating"] if b["rating"] is not None else glicko2.DEFAULT_R)
-    rdb = glicko2.inflate(float(b["rd"] if b["rd"] is not None else glicko2.DEFAULT_RD),
-                          float(b["vol"] if b["vol"] is not None else glicko2.DEFAULT_VOL),
-                          _idle_periods(b["last_rating_ts"], ts))
-    volb = float(b["vol"] if b["vol"] is not None else glicko2.DEFAULT_VOL)
-
-    # Score from A's (white's) perspective.
+    if not a or not b:
+        return
     if match["winner_account_id"] == a["id"]:
         score_a = 1.0
     elif match["winner_account_id"] == b["id"]:
         score_a = 0.0
     else:
         score_a = 0.5
+    _apply_pair(a, b, score_a, ts)
 
-    # Each player is rated against the OTHER's pre-game (inflated) rating.
-    na = glicko2.rate(ra, rda, vola, [(rb, rdb, score_a)], tau=config.GLICKO_TAU)
-    nb = glicko2.rate(rb, rdb, volb, [(ra, rda, 1.0 - score_a)], tau=config.GLICKO_TAU)
-    db.update_account_rating(a["id"], na[0], na[1], na[2], ts)
-    db.update_account_rating(b["id"], nb[0], nb[1], nb[2], ts)
+
+def penalize_confirmed_cheat(cheat_id: str, victim_id: str) -> None:
+    """Correct the ratings after a CONFIRMED cheat: apply a rated result in which the victim beats the
+    cheat, at current ratings. The cheat's ill-gotten win is countered (rating down) and the victim is
+    compensated (rating up). A deliberate corrective penalty for a proven violation — not an exact replay of
+    history (an exact undo would need per-game rating snapshots); intentional, since the win was fraudulent."""
+    cheat = db.get_account(cheat_id)
+    victim = db.get_account(victim_id)
+    if cheat and victim:
+        _apply_pair(cheat, victim, 0.0, int(time.time()))   # cheat (as 'a') scores 0 = loses to the victim
 
 
 def flush_unrated() -> int:

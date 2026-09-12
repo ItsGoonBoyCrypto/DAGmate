@@ -1068,6 +1068,9 @@ def admin_list_reviews(_: bool = Depends(require_admin)):
             "analysis": json.loads(m["analysis_json"]) if m["analysis_json"] else None,
             "playerAShort": _short(a["address"]) if a else None,
             "playerBShort": _short(b["address"]) if b else None,
+            # Per-wallet accrual across all analysed games — the pattern behind the single flag.
+            "playerAAgg": db.cheat_aggregate(a["id"]) if a else None,
+            "playerBAgg": db.cheat_aggregate(b["id"]) if b else None,
             "movesJson": m["moves_json"], "moveTimesJson": m["move_times_json"],
             "settledTs": m["settled_ts"],
         })
