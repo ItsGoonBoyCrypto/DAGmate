@@ -303,6 +303,26 @@ LEADERBOARD_SIZE = int(os.getenv("DAGMATE_LEADERBOARD_SIZE", "100"))
 # header. UNSET (empty) = the admin API is DISABLED (returns 403), which is the safe default — set
 # DAGMATE_ADMIN_KEY in the box env to turn it on. Never accepted in a URL/query (keys don't belong in logs).
 ADMIN_KEY = os.getenv("DAGMATE_ADMIN_KEY", "")
+
+# ── engine-cheat analysis (integrity Phase 2 Part B) ─────────────────────
+# OFF by default. When on, a finished STAKED game is analysed with Stockfish and given a per-player FLAG
+# score; a high score HOLDS the pot for owner review (it is a trigger, never a verdict — a human decides).
+# The single game is only a flag; the real signal accrues per wallet over many games. See DAGMATE_INTEGRITY.
+ANALYSIS_ENABLED = os.getenv("DAGMATE_ANALYSIS", "0") == "1"
+STOCKFISH_PATH = os.getenv("DAGMATE_STOCKFISH_PATH", "stockfish")   # binary on PATH, or an absolute path
+ANALYSIS_NODES = int(os.getenv("DAGMATE_ANALYSIS_NODES", "400000"))  # fixed nodes/position = reproducible
+ANALYSIS_MULTIPV = int(os.getenv("DAGMATE_ANALYSIS_MULTIPV", "3"))
+ANALYSIS_SKIP_OPENING_PLIES = int(os.getenv("DAGMATE_ANALYSIS_SKIP_OPENING", "16"))  # book moves carry no signal
+ANALYSIS_MIN_DECISION_PLIES = int(os.getenv("DAGMATE_ANALYSIS_MIN_PLIES", "12"))     # too few = no verdict
+# Per-game FLAG threshold in [0,1]. HIGH on purpose — a hold pauses real money for review, so bias to few
+# false holds; the human review + per-wallet accrual catch the subtler cases.
+CHEAT_HOLD_THRESHOLD = float(os.getenv("DAGMATE_CHEAT_HOLD_THRESHOLD", "0.90"))
+# How long the winner's payout waits for analysis to finish before failing OPEN (settling normally). An
+# analysis error or timeout must never brick a payout — availability beats catching every game.
+ANALYSIS_WINDOW_SECS = int(os.getenv("DAGMATE_ANALYSIS_WINDOW_SECS", "90"))
+# A "hard" ply the mover answered faster than this (ms) is a timing tell (engine users play only-moves as
+# fast as recaptures). 0 disables the timing term.
+ANALYSIS_FAST_MOVE_MS = int(os.getenv("DAGMATE_ANALYSIS_FAST_MOVE_MS", "2000"))
 # Warn a player once when their remaining time drops below this fraction of
 # the mode's starting bank (the alerts bot's notify_clock_warning, which until
 # now was dead code nothing called).

@@ -52,6 +52,7 @@ import json
 import logging
 import time
 
+import analysis
 import config
 import database as db
 import service_client
@@ -137,6 +138,12 @@ async def prepare(match_id: str, address: str) -> dict:
     # payout until the owner clears it. Dormant unless the analyser flagged this game (review_status='held').
     if m["review_status"] == "held":
         return _public_held(m, address, a, b)
+    # Engine-cheat analysis (Phase 2B): dormant unless DAGMATE_ANALYSIS=1. Hold the payout for the few
+    # seconds the analysis takes, so a flag can land BEFORE the winner claims — then it's either held (above,
+    # next poll) or settles normally. maybe_kick starts it; is_awaiting fails OPEN after the window.
+    analysis.maybe_kick(m["id"], m)
+    if analysis.is_awaiting_analysis(m):
+        return _public_analyzing(m)
     # Free game (0 stake): no escrow, no pot, nothing to settle — just report the result.
     if m["stake_sompi"] == 0:
         return _public_free(m, address, a, b)
@@ -358,6 +365,9 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
         raise SettlementError("you're not a player in this match")
     if m["review_status"] == "held":   # under fair-play review — pot stays escrowed (Phase 2)
         return _public_held(m, address, a, b)
+    analysis.maybe_kick(m["id"], m)
+    if analysis.is_awaiting_analysis(m):   # payout waits for engine analysis, then holds or settles
+        return _public_analyzing(m)
     if m["stake_sompi"] == 0:  # free game — no signature, no settlement
         return _public_free(m, address, a, b)
     # A v2 match has nothing for a player to sign — it self-settles. A stray submit (a client
@@ -510,6 +520,17 @@ def _public_held(m: dict, address: str, a: dict, b: dict) -> dict:
         "autoSettled": False,
         "reviewMessage": ("This match is under a fair-play review. Your stake is untouched in escrow and "
                           "hasn't moved — you'll be notified with the outcome."),
+    }
+
+
+def _public_analyzing(m: dict) -> dict:
+    """Brief holding state while a finished staked game is being checked for fair play before payout."""
+    return {
+        "state": "analyzing",
+        "escrowVersion": m["escrow_version"] or "v1",
+        "mySignatureInputs": [],
+        "autoSettled": False,
+        "reviewMessage": "Running a quick fair-play check on this game before releasing the pot…",
     }
 
 

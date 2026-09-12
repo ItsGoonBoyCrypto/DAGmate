@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DAGmate — fair-play review</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="stylesheet" href="css/style.css">
+<style>
+  /* Standalone owner page. The whole file is public (it's static), but every byte of data comes from the
+     X-Admin-Key API, so it's inert without the key. */
+  .admin-wrap { max-width: 920px; margin: 0 auto; padding: 24px 16px 60px; }
+  .admin-key-row { display: flex; gap: 8px; margin: 14px 0 22px; }
+  .admin-key-row input { flex: 1; min-width: 0; }
+  .rev { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius);
+         padding: 16px; margin-bottom: 16px; }
+  .rev-head { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: baseline; margin-bottom: 10px; }
+  .rev-score { font-weight: 800; font-size: 20px; }
+  .rev-score.hi { color: #ff6b6b; } .rev-score.mid { color: #f0b429; }
+  .rev-meta { color: var(--muted); font-size: 13px; }
+  .rev-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; font-size: 13px; margin: 8px 0; }
+  .rev-grid .k { color: var(--muted); }
+  .rev-grid .flag { color: #ff6b6b; }
+  .rev-moves { font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--muted);
+               max-height: 96px; overflow-y: auto; background: var(--bg); padding: 8px; border-radius: 8px;
+               word-break: break-word; margin: 8px 0; }
+  .rev-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; align-items: center; }
+  .rev-actions input { flex: 1; min-width: 160px; }
+  .empty { color: var(--muted); }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><img class="brand-mark" src="/assets/dagmate-knight.png" alt="DAGmate"><span class="brand-name">DAGmate · Fair-play review</span></div>
+</header>
+
+<main class="admin-wrap">
+  <p class="muted">Owner-only. Games flagged by the engine-cheat analyser wait here with the pot held in
+    escrow. <strong>Clear</strong> releases the pot to the winner; <strong>Confirm</strong> forfeits the
+    cheat's stake to the opponent and suspends their wallet. Both players are always DMd the reason. A single
+    game is a flag, not proof — weigh it against the player's history before confirming.</p>
+
+  <div class="admin-key-row">
+    <input id="adminKey" type="password" placeholder="Admin key (X-Admin-Key)" autocomplete="off">
+    <button class="btn btn-primary" id="loadBtn">Load</button>
+  </div>
+
+  <div id="reviews"><p class="empty">Enter the admin key and press Load.</p></div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const keyInput = $("adminKey"), reviews = $("reviews");
+  try { keyInput.value = localStorage.getItem("dagmate_admin_key") || ""; } catch (_) {}
+
+  function toast(msg) {
+    const t = $("toast"); t.textContent = msg; t.classList.add("show");
+    setTimeout(() => t.classList.remove("show"), 3500);
+  }
+  function headers() { return { "X-Admin-Key": keyInput.value.trim(), "Content-Type": "application/json" }; }
+
+  async function load() {
+    const key = keyInput.value.trim();
+    if (!key) { toast("Enter the admin key first."); return; }
+    try { localStorage.setItem("dagmate_admin_key", key); } catch (_) {}
+    reviews.innerHTML = `<p class="empty">Loading…</p>`;
+    let data;
+    try {
+      const r = await fetch("/api/admin/reviews", { headers: headers() });
+      if (r.status === 403) { reviews.innerHTML = `<p class="empty">Wrong or missing admin key.</p>`; return; }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      data = await r.json();
+    } catch (e) { reviews.innerHTML = `<p class="empty">Failed to load: ${e.message}</p>`; return; }
+    render(data.reviews || []);
+  }
+
+  function render(rows) {
+    reviews.innerHTML = "";
+    if (!rows.length) { reviews.innerHTML = `<p class="empty">No games are awaiting review. 🎉</p>`; return; }
+    for (const rv of rows) reviews.appendChild(card(rv));
+  }
+
+  function sideLine(label, s, isWinner) {
+    const div = document.createElement("div");
+    if (!s || s.score == null) {
+      div.innerHTML = `<span class="k">${label}${isWinner ? " (winner)" : ""}:</span> not enough moves to score`;
+      return div;
+    }
+    const hi = s.score >= 0.9;
+    div.innerHTML = `<span class="k">${label}${isWinner ? " (winner)" : ""}:</span> `
+      + `<span class="${hi ? "flag" : ""}">score ${s.score}</span> · top-1 ${pct(s.top1Rate)} · `
+      + `avg loss ${s.avgWpLoss} · fast-hard ${pct(s.fastHard)} · ${s.decisionPlies} plies`;
+    return div;
+  }
+  const pct = (x) => x == null ? "—" : Math.round(x * 100) + "%";
+
+  function card(rv) {
+    const el = document.createElement("div");
+    el.className = "rev";
+    const a = rv.analysis || {};
+    const scoreVal = typeof rv.cheatScore === "number" ? rv.cheatScore.toFixed(2) : "—";
+    const cls = rv.cheatScore >= 0.9 ? "hi" : (rv.cheatScore >= 0.75 ? "mid" : "");
+
+    const head = document.createElement("div"); head.className = "rev-head";
+    const sc = document.createElement("span"); sc.className = "rev-score " + cls; sc.textContent = "⚑ " + scoreVal;
+    const meta = document.createElement("span"); meta.className = "rev-meta";
+    meta.textContent = `${rv.stakeKas} KAS · ${rv.result} · winner: ${rv.winner}`;
+    head.appendChild(sc); head.appendChild(meta);
+    el.appendChild(head);
+
+    const who = document.createElement("div"); who.className = "rev-meta";
+    who.textContent = `White ${rv.playerAShort || "?"}   vs   Black ${rv.playerBShort || "?"}`;
+    el.appendChild(who);
+
+    const grid = document.createElement("div"); grid.className = "rev-grid";
+    grid.appendChild(sideLine("White", a.white, rv.winner === "A"));
+    grid.appendChild(sideLine("Black", a.black, rv.winner === "B"));
+    el.appendChild(grid);
+
+    const moves = document.createElement("div"); moves.className = "rev-moves";
+    try { moves.textContent = (JSON.parse(rv.movesJson || "[]")).join(" "); } catch (_) { moves.textContent = ""; }
+    el.appendChild(moves);
+
+    const actions = document.createElement("div"); actions.className = "rev-actions";
+    const note = document.createElement("input");
+    note.type = "text"; note.placeholder = "Note (sent to both players)"; note.maxLength = 300;
+    const clearB = document.createElement("button"); clearB.className = "btn"; clearB.textContent = "Clear (pay winner)";
+    const confB = document.createElement("button"); confB.className = "btn btn-danger"; confB.textContent = "Confirm cheat (pay victim)";
+    clearB.addEventListener("click", () => resolve(rv.matchId, "clear", note.value, el));
+    confB.addEventListener("click", () => {
+      if (!confirm("Confirm ENGINE CHEATING? This forfeits the winner's stake to the opponent and bans the wallet.")) return;
+      resolve(rv.matchId, "confirm", note.value, el);
+    });
+    actions.appendChild(note); actions.appendChild(clearB); actions.appendChild(confB);
+    el.appendChild(actions);
+    return el;
+  }
+
+  async function resolve(matchId, decision, note, el) {
+    try {
+      const r = await fetch(`/api/admin/reviews/${encodeURIComponent(matchId)}/resolve`, {
+        method: "POST", headers: headers(), body: JSON.stringify({ decision, note: (note || "").trim() }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.detail || ("HTTP " + r.status));
+      toast(decision === "confirm" ? "Confirmed — pot forfeited to the opponent, wallet suspended." : "Cleared — pot released to the winner.");
+      el.remove();
+      if (!reviews.querySelector(".rev")) reviews.innerHTML = `<p class="empty">No games are awaiting review. 🎉</p>`;
+    } catch (e) { toast("Failed: " + e.message); }
+  }
+
+  $("loadBtn").addEventListener("click", load);
+  keyInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+})();
+</script>
+</body>
+</html>

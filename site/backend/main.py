@@ -47,6 +47,7 @@ from pydantic import BaseModel
 
 import auth
 import bot_client
+import analysis
 import chess_logic
 import clocks
 import config
@@ -933,6 +934,11 @@ async def _settle_game_over(match_id: str, result: str, winner_color: str | None
         ratings.flush_unrated()
     except Exception as e:
         log.info(f"rating flush skipped for {match_id}: {e}")
+    # Kick engine-cheat analysis (Phase 2B) for a staked game — dormant unless DAGMATE_ANALYSIS=1. Gives it
+    # a head start before the winner opens the settle panel; prepare() also kicks it (covers clock/forfeit
+    # endings that don't pass through here), and holds the payout until it lands or the window lapses.
+    if m["stake_sompi"] > 0:
+        analysis.maybe_kick(match_id)
     summary = f"{result}" + (" — you won" if winner_id else " — draw")
     for pid in (m["player_a_account_id"], m["player_b_account_id"]):
         await bot_client.notify_settled(pid, match_id, summary)
