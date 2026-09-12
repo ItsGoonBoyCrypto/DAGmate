@@ -284,6 +284,22 @@ def ensure_schema():
         # only keeps each side's CURRENT remaining, not this history. See docs/DAGMATE_INTEGRITY.md.
         _add_column(c, "matches", "move_times_json", "TEXT NOT NULL DEFAULT '[]'")
 
+        # ── fair-play review (integrity Phase 2) ──────────────────────────
+        # DORMANT by default: review_status NULL on every match = normal instant settle. Only the (future)
+        # Stockfish analyser sets it. `held` = a high-confidence engine-cheat flag → the settle path won't
+        # sign the winner's payout, so the pot stays in escrow until a human (owner) reviews it and marks it
+        # `cleared` (release to the real winner) or `confirmed` (forfeit the cheat's stake to the victim).
+        # NEVER auto-refunds, NEVER player-triggered. See docs/DAGMATE_INTEGRITY.md.
+        _add_column(c, "matches", "review_status", "TEXT")     # NULL | held | cleared | confirmed
+        _add_column(c, "matches", "cheat_score", "REAL")       # per-game suspicion 0..1 (analyser output)
+        _add_column(c, "matches", "analysis_json", "TEXT")     # per-move analysis detail, for the admin panel
+        _add_column(c, "matches", "analyzed_ts", "INTEGER")
+        _add_column(c, "matches", "review_note", "TEXT")       # the owner's explanation, echoed to players
+        _add_column(c, "matches", "reviewed_ts", "INTEGER")
+        # A wallet banned for a confirmed cheat can't create or accept challenges. NULL = in good standing.
+        _add_column(c, "accounts", "banned_ts", "INTEGER")
+        _add_column(c, "accounts", "banned_reason", "TEXT")
+
 
 def _add_column(c: sqlite3.Connection, table: str, column: str, decl: str):
     """Idempotent ALTER TABLE ADD COLUMN (SQLite has no IF NOT EXISTS here)."""
@@ -674,6 +690,52 @@ def primary_names_for(addresses: list[str]) -> dict:
     with _lock, _conn() as c:
         q = "SELECT address, primary_name FROM kns_cache WHERE address IN (%s)" % ",".join("?" * len(addresses))
         return {r["address"]: r["primary_name"] for r in _rows(c.execute(q, addresses)) if r["primary_name"]}
+
+
+# ── fair-play review (integrity Phase 2) ───────────────────────────────────
+def record_analysis(match_id: str, score: float, analysis_json: str, *, hold: bool) -> bool:
+    """Store an analyser result. If `hold`, also flag the match for review — but ONLY while its pot is
+    still in escrow (settle_txid NULL) and it isn't already under/through review. Returns whether a HOLD
+    was placed (so the caller knows to notify + skip the auto-settle)."""
+    with _lock, _conn() as c:
+        c.execute("UPDATE matches SET cheat_score=?, analysis_json=?, analyzed_ts=? WHERE id=?",
+                  (score, analysis_json, int(time.time()), match_id))
+        if not hold:
+            return False
+        cur = c.execute(
+            "UPDATE matches SET review_status='held' "
+            "WHERE id=? AND review_status IS NULL AND settle_txid IS NULL AND status='settled'",
+            (match_id,))
+        return cur.rowcount == 1
+
+
+def resolve_match_review(match_id: str, status: str, note: str) -> bool:
+    """Owner decision on a held match: 'cleared' or 'confirmed'. Guarded so a match is resolved once."""
+    assert status in ("cleared", "confirmed")
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE matches SET review_status=?, review_note=?, reviewed_ts=? WHERE id=? AND review_status='held'",
+            (status, note, int(time.time()), match_id))
+        return cur.rowcount == 1
+
+
+def held_reviews() -> list[dict]:
+    """Matches awaiting an owner fair-play decision, most suspicious first."""
+    with _lock, _conn() as c:
+        return _rows(c.execute(
+            "SELECT * FROM matches WHERE review_status='held' ORDER BY cheat_score DESC, settled_ts ASC"))
+
+
+def ban_account(account_id: str, reason: str) -> None:
+    with _lock, _conn() as c:
+        c.execute("UPDATE accounts SET banned_ts=?, banned_reason=? WHERE id=? AND banned_ts IS NULL",
+                  (int(time.time()), reason, account_id))
+
+
+def is_banned(account_id: str) -> bool:
+    with _lock, _conn() as c:
+        r = c.execute("SELECT banned_ts FROM accounts WHERE id=?", (account_id,)).fetchone()
+        return bool(r and r[0])
 
 
 # ── draw offers ──────────────────────────────────────────────────────────

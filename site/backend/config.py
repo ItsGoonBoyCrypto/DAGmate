@@ -297,6 +297,12 @@ RATING_PROVISIONAL_RD = float(os.getenv("DAGMATE_PROVISIONAL_RD", "110"))   # rd
 # lucky/smurf newcomer topping the board. Raise as volume grows (research suggests 20–30).
 LEADERBOARD_MIN_GAMES = int(os.getenv("DAGMATE_LEADERBOARD_MIN_GAMES", "10"))
 LEADERBOARD_SIZE = int(os.getenv("DAGMATE_LEADERBOARD_SIZE", "100"))
+
+# ── fair-play review admin (integrity Phase 2) ───────────────────────────
+# The owner-only review endpoints (list held games, clear/confirm) require this key in an X-Admin-Key
+# header. UNSET (empty) = the admin API is DISABLED (returns 403), which is the safe default — set
+# DAGMATE_ADMIN_KEY in the box env to turn it on. Never accepted in a URL/query (keys don't belong in logs).
+ADMIN_KEY = os.getenv("DAGMATE_ADMIN_KEY", "")
 # Warn a player once when their remaining time drops below this fraction of
 # the mode's starting bank (the alerts bot's notify_clock_warning, which until
 # now was dead code nothing called).

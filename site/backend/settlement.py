@@ -133,6 +133,10 @@ async def prepare(match_id: str, address: str) -> dict:
     a, b = _players(m)
     if address not in (a["address"], b["address"]):
         raise SettlementError("you're not a player in this match")
+    # Fair-play review (integrity Phase 2): a held match's pot stays in escrow — the oracle won't sign the
+    # payout until the owner clears it. Dormant unless the analyser flagged this game (review_status='held').
+    if m["review_status"] == "held":
+        return _public_held(m, address, a, b)
     # Free game (0 stake): no escrow, no pot, nothing to settle — just report the result.
     if m["stake_sompi"] == 0:
         return _public_free(m, address, a, b)
@@ -352,6 +356,8 @@ async def submit(match_id: str, address: str, signed_tx_json: str) -> dict:
     a, b = _players(m)
     if address not in (a["address"], b["address"]):
         raise SettlementError("you're not a player in this match")
+    if m["review_status"] == "held":   # under fair-play review — pot stays escrowed (Phase 2)
+        return _public_held(m, address, a, b)
     if m["stake_sompi"] == 0:  # free game — no signature, no settlement
         return _public_free(m, address, a, b)
     # A v2 match has nothing for a player to sign — it self-settles. A stray submit (a client
@@ -494,6 +500,63 @@ def _public(m: dict, address: str, a: dict, b: dict) -> dict:
 # collected — settle is a single server-side action, idempotent and safe to call from either
 # player's poll. Proven end-to-end on mainnet dust (service/spikes_covenant.mjs + test_escrow_v2.mjs).
 
+def _public_held(m: dict, address: str, a: dict, b: dict) -> dict:
+    """What a player sees while their match is under fair-play review: the pot is untouched in escrow and
+    nothing to sign. The authoritative explanation reaches them by DM when the owner resolves it."""
+    return {
+        "state": "held_review",
+        "escrowVersion": m["escrow_version"] or "v1",
+        "mySignatureInputs": [],
+        "autoSettled": False,
+        "reviewMessage": ("This match is under a fair-play review. Your stake is untouched in escrow and "
+                          "hasn't moved — you'll be notified with the outcome."),
+    }
+
+
+async def admin_resolve(match_id: str, decision: str, note: str) -> dict:
+    """Owner decision on a HELD match. 'clear' → release the pot to the real winner; 'confirm' → the win is
+    a proven cheat, so release the pot to the VICTIM (the honest opponent) and ban the cheat. The pot only
+    ever moves through the same oracle-settle covenant; review_status is stamped AFTER the payout lands, so a
+    failed settle leaves the match still 'held' to retry (never half-resolved). Returns the details the
+    caller uses to DM both players — every integrity action explains itself (Liam's standing rule)."""
+    if decision not in ("clear", "confirm"):
+        raise SettlementError("decision must be 'clear' or 'confirm'")
+    m = db.get_match(match_id)
+    if not m:
+        raise SettlementError("match not found")
+    if m["review_status"] != "held":
+        raise SettlementError("this match isn't awaiting review")
+    a, b = _players(m)
+    ev = m["escrow_version"] or "v1"
+    if ev not in ("v2", "v3"):
+        raise SettlementError("only covenant (v2/v3) matches can be resolved automatically")
+
+    async def _do_settle(override):
+        if ev == "v3":
+            return await _settle_v3(match_id, m, a["address"], a, b, outcome_override=override)
+        return await _settle_v2(match_id, m, a["address"], a, b, outcome_override=override)
+
+    if decision == "clear":
+        await _do_settle(None)                       # pays the recorded winner (or splits a draw)
+        db.resolve_match_review(match_id, "cleared", note)
+        return {"decision": "cleared", "matchId": match_id, "note": note,
+                "winnerAccountId": m["winner_account_id"],
+                "playerAId": a["id"], "playerBId": b["id"]}
+
+    # confirm — needs a decisive game so there's a victim to award.
+    if not m["winner_account_id"]:
+        raise SettlementError("a drawn game has no victim to award — clear it instead")
+    cheat_id = m["winner_account_id"]
+    victim_id = b["id"] if cheat_id == a["id"] else a["id"]
+    victim_side = "B" if cheat_id == a["id"] else "A"
+    await _do_settle(victim_side)                     # forfeit the cheat's stake → pot to the victim
+    db.resolve_match_review(match_id, "confirmed", note)
+    db.ban_account(cheat_id, note or "confirmed engine assistance")
+    return {"decision": "confirmed", "matchId": match_id, "note": note,
+            "cheatAccountId": cheat_id, "victimAccountId": victim_id,
+            "playerAId": a["id"], "playerBId": b["id"]}
+
+
 def _outcome_of(m: dict, a: dict, b: dict) -> str:
     """'A' | 'B' | 'draw' from the recorded result. A = player_a wins, B = player_b, draw =
     no winner (agreed draw, or a FIDE insufficient-material flag)."""
@@ -503,7 +566,8 @@ def _outcome_of(m: dict, a: dict, b: dict) -> str:
     return "A" if wid == a["id"] else "B"
 
 
-async def _settle_v2(match_id: str, m: dict, address: str, a: dict, b: dict) -> dict:
+async def _settle_v2(match_id: str, m: dict, address: str, a: dict, b: dict,
+                     outcome_override: str | None = None) -> dict:
     """Sign the verdict and release a v2 match. Returns the public payout state either way.
 
     Idempotent: if a txid already landed (this player or the other polled first), it reports the
@@ -521,7 +585,7 @@ async def _settle_v2(match_id: str, m: dict, address: str, a: dict, b: dict) -> 
         raise SettlementError("this match has no escrow addresses — it was created while the "
                               "Kaspa service was unreachable")
 
-    outcome = _outcome_of(m, a, b)
+    outcome = outcome_override or _outcome_of(m, a, b)
     # The verdict is the ONLY thing DAGmate signs. Kept and published (settle_v2_verdict_json) so
     # the winner or anyone can relay the settle even if DAGmate never does — the v2 escape hatch.
     verdict = await service_client.oracle_sign_result(match_id=m["hd_index"], outcome=outcome)
@@ -587,7 +651,8 @@ def _public_v2(m: dict, address: str, a: dict, b: dict) -> dict:
 
 
 # ── covenant escrow v3 (roadmap #3a) — v2 oracle settle + a dormant trustless forfeit branch ──
-async def _settle_v3(match_id: str, m: dict, address: str, a: dict, b: dict) -> dict:
+async def _settle_v3(match_id: str, m: dict, address: str, a: dict, b: dict,
+                     outcome_override: str | None = None) -> dict:
     """Settle a decided v3 match. Structurally identical to _settle_v2 — the v3 covenant's SETTLE
     branch is byte-for-byte v2's oracle-settle (proven S12) — it just calls the v3 sidecar routes.
     A TIMEOUT ending is NOT settled here: clocks.py drives the trustless forfeit on-chain (claim →
@@ -605,7 +670,8 @@ async def _settle_v3(match_id: str, m: dict, address: str, a: dict, b: dict) -> 
         raise SettlementError("this match has no escrow addresses — it was created while the "
                               "Kaspa service was unreachable")
 
-    outcome = _outcome_of(m, a, b)
+    # Normally the recorded game result; on a CONFIRMED cheat the owner overrides it to pay the victim.
+    outcome = outcome_override or _outcome_of(m, a, b)
     verdict = await service_client.oracle_sign_result_v3(match_id=m["hd_index"], outcome=outcome)
     escrows = [
         {"address": m["escrow_a_address"], "redeemHex": m["escrow_a_redeem_hex"], "side": "A"},

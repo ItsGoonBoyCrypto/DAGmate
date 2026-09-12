@@ -37,6 +37,7 @@ import logging
 import math
 import os
 import random
+import secrets
 import threading
 import time
 
@@ -409,6 +410,8 @@ def _clean_sess_pk(pk: str | None) -> str | None:
 
 @app.post("/api/challenges")
 def new_challenge(body: NewChallengeBody, account: dict = Depends(require_account)):
+    if db.is_banned(account["id"]):
+        raise HTTPException(403, "this wallet is suspended from staked play for a confirmed fair-play violation")
     if body.mode not in ("rapid", "daily"):
         raise HTTPException(400, "mode must be 'rapid' or 'daily'")
     # stakeKas is a float off the wire — NaN/inf survive JSON and beat a `<= 0`
@@ -461,6 +464,8 @@ class AcceptChallengeBody(BaseModel):
 @app.post("/api/challenges/{challenge_id}/accept")
 async def accept_challenge(challenge_id: str, body: AcceptChallengeBody | None = None,
                            accepter: dict = Depends(require_account)):
+    if db.is_banned(accepter["id"]):
+        raise HTTPException(403, "this wallet is suspended from staked play for a confirmed fair-play violation")
     ch = db.get_challenge(challenge_id)
     if not ch or ch["status"] != "open":
         raise HTTPException(404, "challenge not found or no longer open")
@@ -1030,6 +1035,68 @@ def get_leaderboard():
         "minGames": config.LEADERBOARD_MIN_GAMES,
         "rows": ratings.leaderboard(),
     }
+
+
+# ── owner-only fair-play review (integrity Phase 2) ──────────────────────────
+def require_admin(x_admin_key: str = Header(None)):
+    """Gate for the review panel. Requires the X-Admin-Key header to equal config.ADMIN_KEY (compared in
+    constant time). If ADMIN_KEY is unset the whole admin API is off. Header, never a URL param — a key
+    doesn't belong in a log or referrer."""
+    if not config.ADMIN_KEY or not x_admin_key or not secrets.compare_digest(x_admin_key, config.ADMIN_KEY):
+        raise HTTPException(403, "admin only")
+    return True
+
+
+@app.get("/api/admin/reviews")
+def admin_list_reviews(_: bool = Depends(require_admin)):
+    """Every match held for a fair-play decision, most suspicious first, with the game + analysis so the
+    owner can judge it."""
+    out = []
+    for m in db.held_reviews():
+        a = db.get_account(m["player_a_account_id"])
+        b = db.get_account(m["player_b_account_id"])
+        winner = ("A" if m["winner_account_id"] == m["player_a_account_id"] else "B") if m["winner_account_id"] else "draw"
+        out.append({
+            "matchId": m["id"], "stakeKas": m["stake_sompi"] / config.SOMPI_PER_KAS,
+            "cheatScore": m["cheat_score"], "result": m["result"], "winner": winner,
+            "analysis": json.loads(m["analysis_json"]) if m["analysis_json"] else None,
+            "playerAShort": _short(a["address"]) if a else None,
+            "playerBShort": _short(b["address"]) if b else None,
+            "movesJson": m["moves_json"], "moveTimesJson": m["move_times_json"],
+            "settledTs": m["settled_ts"],
+        })
+    return {"reviews": out}
+
+
+class ReviewResolveBody(BaseModel):
+    decision: str       # 'clear' | 'confirm'
+    note: str = ""
+
+
+@app.post("/api/admin/reviews/{match_id}/resolve")
+async def admin_resolve_review(match_id: str, body: ReviewResolveBody, _: bool = Depends(require_admin)):
+    try:
+        res = await settlement.admin_resolve(match_id, body.decision, body.note)
+    except settlement.SettlementError as e:
+        raise HTTPException(400, str(e))
+    # Every integrity action explains itself to BOTH players (Liam's standing rule).
+    note = (body.note or "").strip()
+    if res["decision"] == "cleared":
+        msg = ("Fair-play review complete — no issue found. The pot has been released to the winner."
+               + (f" Note: {note}" if note else ""))
+        for pid in (res["playerAId"], res["playerBId"]):
+            await bot_client.notify_settled(pid, match_id, msg)
+    else:
+        why = note or "engine assistance was confirmed"
+        await bot_client.notify_settled(
+            res["cheatAccountId"], match_id,
+            f"Fair-play review: {why}. Your stake for this match has been forfeited to your opponent, "
+            "and your wallet is suspended from staked play.")
+        await bot_client.notify_settled(
+            res["victimAccountId"], match_id,
+            "Fair-play review: your opponent was found to have been assisted, so this match's pot has been "
+            "awarded to you." + (f" Note: {note}" if note else ""))
+    return {"ok": True, **res}
 
 
 @app.get("/api/tournaments")
