@@ -283,6 +283,20 @@ MATCH_CHAT_ENABLED = os.getenv("DAGMATE_MATCH_CHAT", "1") == "1"
 CHAT_MAX_LEN = int(os.getenv("DAGMATE_CHAT_MAX_LEN", "400"))
 CHAT_RATE_MAX = int(os.getenv("DAGMATE_CHAT_RATE_MAX", "15"))    # messages …
 CHAT_RATE_SECS = int(os.getenv("DAGMATE_CHAT_RATE_SECS", "10"))  # … per this many seconds, per player
+
+# ── ratings + leaderboard (Glicko-2) ────────────────────────────────────
+# Only STAKED, played games between two real wallets are rated — a free game or a no-show never moves a
+# rating, which is also the first line of anti-Sybil defence (a fake rating costs real staked games).
+# See docs/DAGMATE_INTEGRITY.md.
+LEADERBOARD_ENABLED = os.getenv("DAGMATE_LEADERBOARD", "1") == "1"
+GLICKO_TAU = float(os.getenv("DAGMATE_GLICKO_TAU", "0.4"))         # steadier = money-safe
+RATING_PERIOD_SECS = int(os.getenv("DAGMATE_RATING_PERIOD_SECS", "86400"))  # idle-RD growth unit (1 day)
+RATING_PROVISIONAL_RD = float(os.getenv("DAGMATE_PROVISIONAL_RD", "110"))   # rd above this → shown as "?"
+# Games a wallet must have played before it appears on the public leaderboard. Ranked by the CONSERVATIVE
+# estimate rating − 2·RD (a wallet must be both highly rated AND well-established) — this is what stops a
+# lucky/smurf newcomer topping the board. Raise as volume grows (research suggests 20–30).
+LEADERBOARD_MIN_GAMES = int(os.getenv("DAGMATE_LEADERBOARD_MIN_GAMES", "10"))
+LEADERBOARD_SIZE = int(os.getenv("DAGMATE_LEADERBOARD_SIZE", "100"))
 # Warn a player once when their remaining time drops below this fraction of
 # the mode's starting bank (the alerts bot's notify_clock_warning, which until
 # now was dead code nothing called).

@@ -55,6 +55,7 @@ import database as db
 import deposits
 import engine
 import kns
+import ratings
 import reclaim
 import service_client
 import settlement
@@ -200,6 +201,7 @@ def _challenge_public(ch: dict) -> dict:
         "fromAccountId": ch["from_account_id"], "toAccountId": ch["to_account_id"],
         "fromAddress": frm["address"] if frm else None, "fromShort": _short(frm["address"]) if frm else None,
         "fromKns": kns.cached_name(frm["address"]) if frm else None,
+        "fromRating": ratings.account_rating_public(frm) if frm else None,  # so open challenges show opponent strength
         "toAddress": to["address"] if to else None, "toShort": _short(to["address"]) if to else None,
         "toKns": kns.cached_name(to["address"]) if to else None,
         "createdTs": ch["created_ts"],
@@ -217,9 +219,9 @@ def _match_public(m: dict) -> dict:
         "isFree": m["stake_sompi"] == 0,  # free game — no escrow, no pot
         "fen": m["fen"], "turn": m["turn"], "result": m["result"],
         "playerA": {"address": a["address"], "shortAddress": _short(a["address"]),
-                    "knsName": kns.cached_name(a["address"])} if a else None,
+                    "knsName": kns.cached_name(a["address"]), "rating": ratings.account_rating_public(a)} if a else None,
         "playerB": {"address": b["address"], "shortAddress": _short(b["address"]),
-                    "knsName": kns.cached_name(b["address"])} if b else None,
+                    "knsName": kns.cached_name(b["address"]), "rating": ratings.account_rating_public(b)} if b else None,
         "winnerAccountId": m["winner_account_id"],
         "escrowA": m["escrow_a_address"], "escrowB": m["escrow_b_address"],
         # Published on purpose: with the redeem script and the timelock, a
@@ -672,9 +674,12 @@ async def make_move(match_id: str, body: MoveBody, a: dict = Depends(require_acc
         raise HTTPException(400, str(e))
 
     moves = prior_moves + [body.uci]
+    # Elapsed time for THIS ply = since it became the mover's turn. Captured for later timing cheat-analysis
+    # (Phase 0); the clock alone only keeps each side's current remaining, not this per-move history.
+    move_ms = max(0, at_ms - (m["clock_turn_started_ms"] or at_ms))
     if not db.apply_move_with_clock(
             match_id, status["fen"], moves, status["turn"], mover_color=my_color,
-            mover_remaining_ms=clocks.charge_move(m, my_color, at_ms), now_ms=at_ms):
+            mover_remaining_ms=clocks.charge_move(m, my_color, at_ms), now_ms=at_ms, move_ms=move_ms):
         # The guarded UPDATE didn't match, so the position moved under us —
         # a duplicate submission, or the clock loop settled the match first.
         raise HTTPException(409, "the match moved on — reload the board")
@@ -917,6 +922,12 @@ async def _settle_game_over(match_id: str, result: str, winner_color: str | None
         return
     if not db.settle_match_if_live(match_id, result=result, winner_account_id=winner_id):
         return
+    # Fold this result into the Glicko-2 ratings (best-effort; the leaderboard re-flushes on read, so a
+    # miss here is self-healing and never blocks ending the game).
+    try:
+        ratings.flush_unrated()
+    except Exception as e:
+        log.info(f"rating flush skipped for {match_id}: {e}")
     summary = f"{result}" + (" — you won" if winner_id else " — draw")
     for pid in (m["player_a_account_id"], m["player_b_account_id"]):
         await bot_client.notify_settled(pid, match_id, summary)
@@ -1008,6 +1019,19 @@ async def reclaim_submit(match_id: str, body: ReclaimSubmitBody,
 
 
 # ── tournaments ──────────────────────────────────────────────────────────
+@app.get("/api/leaderboard")
+def get_leaderboard():
+    """Public ranked board (Glicko-2), ranked by the conservative estimate rating − 2·RD and gated on a
+    minimum number of rated games. No auth — it's public standings. See docs/DAGMATE_INTEGRITY.md."""
+    if not config.LEADERBOARD_ENABLED:
+        return {"enabled": False, "rows": []}
+    return {
+        "enabled": True,
+        "minGames": config.LEADERBOARD_MIN_GAMES,
+        "rows": ratings.leaderboard(),
+    }
+
+
 @app.get("/api/tournaments")
 def list_tournaments():
     # Winnings roll up, so each round's stake doubles. Publish the per-round

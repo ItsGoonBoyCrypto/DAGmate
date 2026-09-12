@@ -472,6 +472,18 @@ label.checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(-
 }
 .wallet-chooser-title { font-weight: 600; margin-bottom: 4px; }
 .wallet-choice { width: 100%; }
+/* Leaderboard */
+.leaderboard { width: 100%; border-collapse: collapse; font-size: 14px; }
+.leaderboard th, .leaderboard td { padding: 9px 10px; text-align: right; border-bottom: 1px solid var(--panel-border-soft); }
+.leaderboard th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+.leaderboard th:nth-child(1), .leaderboard td:nth-child(1) { text-align: center; width: 42px; color: var(--muted); }
+.leaderboard th:nth-child(2), .leaderboard td.who { text-align: left; }
+.leaderboard td.who { font-weight: 600; }
+.leaderboard td:nth-child(3) { font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+.leaderboard tbody tr:hover { background: var(--bg-elev); }
+.leaderboard tr.me { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.leaderboard tr.me td.who::after { content: " (you)"; color: var(--muted); font-weight: 400; font-size: 12px; }
+
 /* Mobile connect sheet (no injected provider on a phone → guide to the wallet's in-app browser) */
 .wallet-sheet { max-width: 360px; }
 .wallet-sheet-text { font-size: 13.5px; line-height: 1.5; margin: 2px 0 8px; }

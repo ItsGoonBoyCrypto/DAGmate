@@ -267,6 +267,23 @@ def ensure_schema():
         # stakes until decisive). 0/NULL for every normal match.
         _add_column(c, "matches", "replay_count", "INTEGER NOT NULL DEFAULT 0")
 
+        # ── ratings + leaderboard (Glicko-2, ratings.py) ──────────────────
+        # Per-wallet rating state. Defaults are the Glicko-2 seeds; a wallet that has never played a rated
+        # game carries the seed with rated_games=0 (and is kept off the leaderboard).
+        _add_column(c, "accounts", "rating", "REAL NOT NULL DEFAULT 1500")
+        _add_column(c, "accounts", "rd", "REAL NOT NULL DEFAULT 350")
+        _add_column(c, "accounts", "vol", "REAL NOT NULL DEFAULT 0.06")
+        _add_column(c, "accounts", "rated_games", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(c, "accounts", "last_rating_ts", "INTEGER")
+        # When a settled match was folded into the ratings. NULL = not yet processed; the rater walks these
+        # in settled_ts order (Glicko-2 is sequential) and is idempotent — a match is rated exactly once.
+        # Non-rateable settled matches (free games, no-shows) are stamped too, so the scan stays small.
+        _add_column(c, "matches", "rated_ts", "INTEGER")
+        # Per-ply elapsed time in ms, parallel to moves_json (Phase 0 instrumentation for later engine/
+        # timing cheat-analysis — captured now because the data is unrecoverable after the fact). The clock
+        # only keeps each side's CURRENT remaining, not this history. See docs/DAGMATE_INTEGRITY.md.
+        _add_column(c, "matches", "move_times_json", "TEXT NOT NULL DEFAULT '[]'")
+
 
 def _add_column(c: sqlite3.Connection, table: str, column: str, decl: str):
     """Idempotent ALTER TABLE ADD COLUMN (SQLite has no IF NOT EXISTS here)."""
@@ -556,7 +573,8 @@ def list_live_matches() -> list[dict]:
 
 
 def apply_move_with_clock(match_id: str, fen: str, moves: list[str], turn: str,
-                          *, mover_color: str, mover_remaining_ms: int, now_ms: int) -> bool:
+                          *, mover_color: str, mover_remaining_ms: int, now_ms: int,
+                          move_ms: int | None = None) -> bool:
     """Commit a move and the mover's new clock in one guarded statement.
 
     The `turn` guard is what makes this safe under concurrent requests: two
@@ -570,11 +588,22 @@ def apply_move_with_clock(match_id: str, fen: str, moves: list[str], turn: str,
     turned out to be losing."""
     col = "clock_white_ms" if mover_color == "white" else "clock_black_ms"
     with _lock, _conn() as c:
+        # Append this ply's elapsed time to the parallel move-times list, under the same lock+guard as the
+        # move so the two lists never diverge. Read-then-write is safe: we hold _lock for the whole txn, and
+        # if the guard rejects the move (rowcount 0) the times write is rolled back with it.
+        times_json = "[]"
+        if move_ms is not None:
+            row = c.execute("SELECT move_times_json FROM matches WHERE id=?", (match_id,)).fetchone()
+            prior = json.loads(row[0]) if row and row[0] else []
+            prior.append(int(move_ms))
+            times_json = json.dumps(prior)
         cur = c.execute(
             f"UPDATE matches SET fen=?, moves_json=?, turn=?, {col}=?, clock_turn_started_ms=?, "
-            "draw_offer_by=NULL "
+            "draw_offer_by=NULL" + (", move_times_json=?" if move_ms is not None else "") + " "
             "WHERE id=? AND status='live' AND turn=?",
-            (fen, json.dumps(moves), turn, mover_remaining_ms, now_ms, match_id, mover_color))
+            ((fen, json.dumps(moves), turn, mover_remaining_ms, now_ms, times_json, match_id, mover_color)
+             if move_ms is not None else
+             (fen, json.dumps(moves), turn, mover_remaining_ms, now_ms, match_id, mover_color)))
         return cur.rowcount == 1
 
 
@@ -596,6 +625,55 @@ def settle_match_if_live(match_id: str, *, result: str, winner_account_id: str |
             "WHERE id=? AND status='live'",
             (result, winner_account_id, int(time.time()), match_id))
         return cur.rowcount == 1
+
+
+# ── ratings (Glicko-2, driven by ratings.py) ───────────────────────────────
+def unrated_settled_matches() -> list[dict]:
+    """Every settled match not yet folded into the ratings, oldest first. Glicko-2 is sequential, so the
+    rater applies these in settled_ts order; it marks each (rateable or not) so the scan stays small."""
+    with _lock, _conn() as c:
+        return _rows(c.execute(
+            "SELECT * FROM matches WHERE status='settled' AND rated_ts IS NULL "
+            "ORDER BY settled_ts ASC, created_ts ASC"))
+
+
+def mark_match_rated(match_id: str, ts: int) -> None:
+    with _lock, _conn() as c:
+        c.execute("UPDATE matches SET rated_ts=? WHERE id=?", (ts, match_id))
+
+
+def update_account_rating(account_id: str, rating: float, rd: float, vol: float, ts: int) -> None:
+    """Write a wallet's new Glicko-2 state and bump its rated-game count. Called once per rated game."""
+    with _lock, _conn() as c:
+        c.execute(
+            "UPDATE accounts SET rating=?, rd=?, vol=?, rated_games=rated_games+1, last_rating_ts=? "
+            "WHERE id=?",
+            (rating, rd, vol, ts, account_id))
+
+
+def list_rated_accounts(min_games: int) -> list[dict]:
+    """Real (non-demo) wallets eligible for the leaderboard — at least `min_games` rated games."""
+    with _lock, _conn() as c:
+        return _rows(c.execute(
+            "SELECT id, address, rating, rd, vol, rated_games FROM accounts "
+            "WHERE is_demo_wallet=0 AND rated_games>=?", (min_games,)))
+
+
+def rated_match_results() -> list[dict]:
+    """The (winner, players, result) of every rated staked match — for leaderboard W/L/D tallies."""
+    with _lock, _conn() as c:
+        return _rows(c.execute(
+            "SELECT player_a_account_id, player_b_account_id, winner_account_id, result "
+            "FROM matches WHERE status='settled' AND rated_ts IS NOT NULL AND stake_sompi>0"))
+
+
+def primary_names_for(addresses: list[str]) -> dict:
+    """address -> KNS primary name, for any in the cache. Best-effort display sugar for the leaderboard."""
+    if not addresses:
+        return {}
+    with _lock, _conn() as c:
+        q = "SELECT address, primary_name FROM kns_cache WHERE address IN (%s)" % ",".join("?" * len(addresses))
+        return {r["address"]: r["primary_name"] for r in _rows(c.execute(q, addresses)) if r["primary_name"]}
 
 
 # ── draw offers ──────────────────────────────────────────────────────────

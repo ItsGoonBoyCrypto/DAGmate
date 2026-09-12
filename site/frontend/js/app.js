@@ -223,6 +223,7 @@
     document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
     document.getElementById(`panel-${btn.dataset.tab}`).classList.add("active");
     if (btn.dataset.tab === "tournaments") refreshTournaments();
+    if (btn.dataset.tab === "leaderboard") refreshLeaderboard();
     if (btn.dataset.tab === "learn") refreshLearn();
   });
 
@@ -541,8 +542,9 @@
       const fromLabel = esc(ch.fromKns || ch.fromShort);
       const toLabel = esc(ch.toKns || ch.toShort);
       const label = ch.toAddress ? `${fromLabel} → ${toLabel}` : `${fromLabel} (open challenge)`;
+      const ratingBit = ch.fromRating ? ` · ${esc(ratingText(ch.fromRating))} Elo` : "";
       div.innerHTML = `<div><div>${label}</div>
-        <div class="meta">${esc(ch.stakeKas)} KAS · ${esc(ch.mode)}</div></div>
+        <div class="meta">${esc(ch.stakeKas)} KAS · ${esc(ch.mode)}${ratingBit}</div></div>
         <div class="actions"></div>`;
       const actions = div.querySelector(".actions");
       if (!mine) {
@@ -1362,6 +1364,49 @@
   });
 
   // ── tournaments ──────────────────────────────────────────────────────
+  // A short rating label for a player: "1523" or "1500?" while the rating is still provisional (few games).
+  function ratingText(r) {
+    if (!r) return "";
+    return r.rating + (r.provisional ? "?" : "");
+  }
+
+  async function refreshLeaderboard() {
+    const el = document.getElementById("leaderboardList");
+    if (!el) return;
+    let data;
+    try { data = await api("GET", "/api/leaderboard"); }
+    catch (e) { el.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
+    if (!data.enabled) { el.innerHTML = `<p class="muted">The leaderboard is off right now.</p>`; return; }
+    const rows = data.rows || [];
+    if (!rows.length) {
+      el.innerHTML = `<p class="muted">No ranked players yet — play ${esc(data.minGames)}+ staked games to appear here.</p>`;
+      return;
+    }
+    const table = document.createElement("table");
+    table.className = "leaderboard";
+    const head = document.createElement("thead");
+    head.innerHTML = "<tr><th>#</th><th>Player</th><th>Rating</th><th>W</th><th>L</th><th>D</th><th>Win%</th></tr>";
+    table.appendChild(head);
+    const tb = document.createElement("tbody");
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      if (r.address === state.address) tr.className = "me";
+      const name = r.name || (r.address.slice(0, 8) + "…" + r.address.slice(-6));
+      const cells = [String(r.rank), name, r.rating + (r.provisional ? "?" : ""),
+                     String(r.wins), String(r.losses), String(r.draws), r.winRate + "%"];
+      cells.forEach((val, i) => {
+        const td = document.createElement("td");
+        td.textContent = val;              // textContent — a KNS name / address is untrusted
+        if (i === 1) td.className = "who";
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    }
+    table.appendChild(tb);
+    el.innerHTML = "";
+    el.appendChild(table);
+  }
+
   async function refreshTournaments() {
     const el = document.getElementById("tournamentList");
     let list;
@@ -1561,6 +1606,7 @@
     refreshChallenges();
     refreshMatches();
     if (document.getElementById("panel-tournaments").classList.contains("active")) refreshTournaments();
+    if (document.getElementById("panel-leaderboard").classList.contains("active")) refreshLeaderboard();
     if (document.getElementById("panel-learn").classList.contains("active")) refreshLearn();
   }
 

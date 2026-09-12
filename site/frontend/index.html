@@ -23,6 +23,7 @@
   <nav class="tabs" id="tabs">
     <button class="tab active" data-tab="play">Play</button>
     <button class="tab" data-tab="tournaments">Tournaments</button>
+    <button class="tab" data-tab="leaderboard">Leaderboard</button>
     <button class="tab" data-tab="learn">Learn</button>
     <button class="tab" data-tab="more">More games</button>
   </nav>
@@ -148,6 +149,17 @@
       <h2>Tournaments</h2>
       <p class="muted">Seeded 1v1 pairings — once a tier reaches its minimum entrants, players are paired and each pair plays a normal match for their own two stakes.</p>
       <div id="tournamentList" class="list"></div>
+    </div>
+  </section>
+
+  <!-- LEADERBOARD TAB -->
+  <section class="tab-panel" id="panel-leaderboard">
+    <div class="card">
+      <h2>Leaderboard</h2>
+      <p class="muted">Ranked by a <strong>conservative rating</strong> (your rating minus its uncertainty) —
+        so topping the board takes proven results over many staked games, not one lucky win. Only staked
+        games are rated; free games and no-shows don't count.</p>
+      <div id="leaderboardList" class="list"><p class="muted">Loading…</p></div>
     </div>
   </section>
 
